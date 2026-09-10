@@ -1,4 +1,4 @@
-"""Train/evaluate the standalone SDT + COLD variants on IEMOCAP or MELD."""
+"""Train/evaluate SDT with optional COLD, OOF reliability, or TiCAL."""
 
 import argparse
 import csv
@@ -30,6 +30,22 @@ def build_parser():
                         help="sdt-preserving initializes mu=H' and variance small")
     parser.add_argument("--initial-logvar", type=float, default=-6.0,
                         help="initial constant log-variance for sdt-preserving mode")
+    parser.add_argument("--use-tical", action="store_true",
+                        help="enable TiCAL on the deterministic SDT path (incompatible with COLD variants)")
+    parser.add_argument("--tical-mode", choices=("observe", "kd", "hyp", "fusion", "full"),
+                        default="kd", help="incremental TiCAL ablation")
+    parser.add_argument("--tical-warmup-epochs", type=int, default=5)
+    parser.add_argument("--anchor-size", type=int, default=2048)
+    parser.add_argument("--anchor-conf-threshold", type=float, default=0.8)
+    parser.add_argument("--hyperbolic-dim", type=int, default=128)
+    parser.add_argument("--hyp-eps", type=float, default=1e-5)
+    parser.add_argument("--typicality-eps", type=float, default=1e-8)
+    parser.add_argument("--consistency-t", type=float, default=0.2)
+    parser.add_argument("--consistency-k", type=float, default=0.5)
+    parser.add_argument("--no-detach-tau", action="store_true")
+    parser.add_argument("--no-detach-kappa", action="store_true")
+    parser.add_argument("--beta-gate", type=float, default=1.0)
+    parser.add_argument("--lambda-hyp", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=1024)
@@ -104,7 +120,18 @@ def make_model_config(args, dataset):
             "dropout": args.dropout, "fusion_variant": args.fusion_variant,
             "logvar_min": args.logvar_min, "logvar_max": args.logvar_max,
             "cold_eps": args.cold_eps, "distribution_init": args.distribution_init,
-            "initial_logvar": args.initial_logvar}
+            "initial_logvar": args.initial_logvar, "use_tical": args.use_tical,
+            "tical_mode": args.tical_mode,
+            "tical_warmup_epochs": args.tical_warmup_epochs,
+            "anchor_size": args.anchor_size,
+            "anchor_conf_threshold": args.anchor_conf_threshold,
+            "hyperbolic_dim": args.hyperbolic_dim, "hyp_eps": args.hyp_eps,
+            "typicality_eps": args.typicality_eps,
+            "consistency_t": args.consistency_t,
+            "consistency_k": args.consistency_k,
+            "detach_tau": not args.no_detach_tau,
+            "detach_kappa": not args.no_detach_kappa,
+            "beta_gate": args.beta_gate}
 
 
 def make_criterion(args, device):
@@ -114,15 +141,91 @@ def make_criterion(args, device):
                                                0.160585, 0.127711, 0.252668)], device=device)
     return SDTCOLDLoss(weights, args.gamma_1, args.gamma_2, args.gamma_3,
                        args.lambda_co, args.lambda_reg, not args.no_detach_errors,
-                       args.lambda_reliability).to(device)
+                       args.lambda_reliability,
+                       args.tical_mode if args.use_tical else None,
+                       args.lambda_hyp).to(device)
+
+
+def _collect_tical_batch(storage, output, labels, prediction, valid):
+    tical = output.get("tical")
+    if tical is None or not tical["ready"]:
+        return
+    for name in MODALITIES:
+        storage["tau_" + name].append(tical["tau"][name].detach().cpu())
+        storage["pseudo_" + name].append(tical["pseudo_labels"][name].detach().cpu())
+    storage["kappa"].append(tical["kappa"].detach().cpu())
+    storage["correct"].append(prediction[valid].eq(labels[valid]).detach().cpu())
+
+
+def _tical_epoch_metrics(storage, model, utterance_count):
+    if not getattr(model, "use_tical", False):
+        return {}
+    result = {"tical_ready_rate": 0.0, "anchors_added": float(storage["anchors_added"]),
+              "agreement_ta": 0.0, "agreement_tv": 0.0,
+              "agreement_av": 0.0, "agreement_tav": 0.0,
+              "kappa_mean": 0.0, "kappa_std": 0.0,
+              "kappa_q05": 0.0, "kappa_q50": 0.0, "kappa_q95": 0.0}
+    for name in MODALITIES:
+        for statistic in ("mean", "std", "q05", "q50", "q95"):
+            result["tau_{}_{}".format(name, statistic)] = 0.0
+    for group in ("low", "medium", "high"):
+        result["kappa_{}_frac".format(group)] = 0.0
+        result["kappa_{}_accuracy".format(group)] = 0.0
+    summary = model.tical_anchor_summary()
+    for name in MODALITIES:
+        result["anchor_{}_size".format(name)] = float(summary[name]["size"])
+        for class_index, count in enumerate(summary[name]["class_counts"]):
+            result["anchor_{}_class_{}".format(name, class_index)] = float(count)
+    if not storage["kappa"]:
+        return result
+    values = {key: torch.cat(chunks) for key, chunks in storage.items()
+              if isinstance(chunks, list) and chunks}
+    n_ready = int(values["kappa"].numel())
+    result["tical_ready_rate"] = n_ready / max(1, utterance_count)
+    for name in MODALITIES:
+        tau = values["tau_" + name].float()
+        result.update({
+            "tau_{}_mean".format(name): tau.mean().item(),
+            "tau_{}_std".format(name): tau.std(unbiased=False).item(),
+            "tau_{}_q05".format(name): torch.quantile(tau, 0.05).item(),
+            "tau_{}_q50".format(name): torch.quantile(tau, 0.50).item(),
+            "tau_{}_q95".format(name): torch.quantile(tau, 0.95).item(),
+        })
+    pseudo_t, pseudo_a, pseudo_v = (values["pseudo_" + name] for name in MODALITIES)
+    result.update({
+        "agreement_ta": pseudo_t.eq(pseudo_a).float().mean().item(),
+        "agreement_tv": pseudo_t.eq(pseudo_v).float().mean().item(),
+        "agreement_av": pseudo_a.eq(pseudo_v).float().mean().item(),
+        "agreement_tav": (pseudo_t.eq(pseudo_a) & pseudo_t.eq(pseudo_v)).float().mean().item(),
+    })
+    kappa, correct = values["kappa"].float(), values["correct"].float()
+    result.update({
+        "kappa_mean": kappa.mean().item(),
+        "kappa_std": kappa.std(unbiased=False).item(),
+        "kappa_q05": torch.quantile(kappa, 0.05).item(),
+        "kappa_q50": torch.quantile(kappa, 0.50).item(),
+        "kappa_q95": torch.quantile(kappa, 0.95).item(),
+    })
+    groups = {"low": kappa < 0.3,
+              "medium": (kappa >= 0.3) & (kappa < 0.7),
+              "high": kappa >= 0.7}
+    for group, selected in groups.items():
+        result["kappa_{}_frac".format(group)] = selected.float().mean().item()
+        result["kappa_{}_accuracy".format(group)] = (
+            correct[selected].mean().item() if selected.any() else 0.0)
+    return result
 
 
 def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
               grad_clip=0.0, collect_predictions=False,
-              reliability_table=None):
+              reliability_table=None, epoch=0):
     training = optimizer is not None
     model.train(training)
+    model.set_tical_epoch(epoch)
     totals, true, predicted, rows = {}, [], [], []
+    tical_storage = {"tau_" + name: [] for name in MODALITIES}
+    tical_storage.update({"pseudo_" + name: [] for name in MODALITIES})
+    tical_storage.update({"kappa": [], "correct": [], "anchors_added": 0})
     count = 0
     with torch.set_grad_enabled(training):
         for batch_index, batch in enumerate(loader):
@@ -148,11 +251,16 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                # Query happened in forward against OLD banks. Insert the
+                # current detached batch only after the parameter update.
+                tical_storage["anchors_added"] += model.update_tical_anchors(
+                    output, labels, valid)
             n_valid = int(valid.sum().item())
             count += n_valid
             for name, value in parts.items():
                 totals[name] = totals.get(name, 0.0) + value.detach().item() * n_valid
             prediction = output["logits"].argmax(dim=-1)
+            _collect_tical_batch(tical_storage, output, labels, prediction, valid)
             true.extend(labels[valid].cpu().tolist())
             predicted.extend(prediction[valid].cpu().tolist())
             if collect_predictions:
@@ -163,6 +271,7 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     metrics.update({"accuracy": 100.0 * accuracy_score(true, predicted),
                     "weighted_f1": 100.0 * f1_score(true, predicted, average="weighted", zero_division=0),
                     "utterances": count})
+    metrics.update(_tical_epoch_metrics(tical_storage, model, count))
     return metrics, rows, true, predicted
 
 
@@ -178,16 +287,31 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
         variance_norm = variance_norm.detach().cpu()
     students = {m: output["student_logits"][m].detach().argmax(dim=-1).cpu() for m in MODALITIES}
     errors = {m: value.detach().cpu() for m, value in errors.items()}
+    tical = output.get("tical")
+    tical_ready = bool(tical is not None and tical["ready"])
+    if tical_ready:
+        tical = {
+            "kappa": tical["kappa"].detach().cpu(),
+            "label_discrepancy": tical["label_discrepancy"].detach().cpu(),
+            "tau": {m: tical["tau"][m].detach().cpu() for m in MODALITIES},
+            "pseudo": {m: tical["pseudo_labels"][m].detach().cpu() for m in MODALITIES},
+        }
     offset = 0
     rows = []
     for batch_index, (dialogue_id, length) in enumerate(zip(dialogue_ids, lengths)):
         for index in range(length):
             row = {"dialogue_id": dialogue_id, "utterance_index": index,
                    "label": int(labels[batch_index, index]), "prediction": int(prediction[batch_index, index])}
+            if tical_ready:
+                row["kappa"] = float(tical["kappa"][offset])
+                row["label_discrepancy"] = float(tical["label_discrepancy"][offset])
             row.update({"prob_{}".format(c): float(p) for c, p in enumerate(probabilities[batch_index, index])})
             for modal_index, name in enumerate(MODALITIES):
                 row[name + "_prediction"] = int(students[name][batch_index, index])
                 row[name + "_gate_mean"] = float(gate[batch_index, index, modal_index])
+                if tical_ready:
+                    row[name + "_tau"] = float(tical["tau"][name][offset])
+                    row[name + "_pseudo_label"] = int(tical["pseudo"][name][offset])
                 if reliability is not None:
                     row[name + "_reliability"] = float(reliability[batch_index, index, modal_index])
                 if variance_norm is not None:
@@ -233,6 +357,13 @@ def main(argv=None):
         raise ValueError("lr must be positive; l2 and grad_clip must be nonnegative")
     if args.lambda_reliability < 0 or args.disagreement_weight < 0:
         raise ValueError("reliability/disagreement weights must be nonnegative")
+    if (args.tical_warmup_epochs < 0 or args.anchor_size < 1
+            or args.hyperbolic_dim < 1 or args.lambda_hyp < 0
+            or args.beta_gate < 0 or args.consistency_t < 0
+            or args.consistency_k < 0):
+        raise ValueError("invalid nonnegative TiCAL setting")
+    if not 0 <= args.anchor_conf_threshold <= 1:
+        raise ValueError("--anchor-conf-threshold must be in [0,1]")
     for name in ("modality_prune_quantile", "sample_prune_quantile"):
         if not 0 <= getattr(args, name) < 1:
             raise ValueError("{} must be in [0, 1)".format(name))
@@ -240,6 +371,8 @@ def main(argv=None):
         raise ValueError("--fusion-variant oof-guided requires --oof-reliability-targets")
     if args.fusion_variant != "oof-guided" and args.oof_reliability_targets:
         raise ValueError("--oof-reliability-targets requires --fusion-variant oof-guided")
+    if args.use_tical and args.fusion_variant != "sdt":
+        raise ValueError("--use-tical requires --fusion-variant sdt (COLD is disabled)")
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
     seed_everything(args.seed)
@@ -250,14 +383,18 @@ def main(argv=None):
         args.dataset = checkpoint["model_config"]["dataset"]
         for name in ("temp", "n_head", "hidden_dim", "dropout", "fusion_variant",
                      "logvar_min", "logvar_max", "cold_eps", "distribution_init",
-                     "initial_logvar"):
+                     "initial_logvar", "use_tical", "tical_mode",
+                     "tical_warmup_epochs", "anchor_size", "anchor_conf_threshold",
+                     "hyperbolic_dim", "hyp_eps", "typicality_eps",
+                     "consistency_t", "consistency_k", "beta_gate"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
                      "no_detach_errors", "no_class_weight", "selection_protocol", "valid_ratio",
                      "lambda_reliability", "modality_prune_quantile",
                      "sample_prune_quantile", "disagreement_weight", "sample_prune_any",
-                     "oof_reliability_targets"):
+                     "oof_reliability_targets", "tical_mode", "lambda_hyp",
+                     "no_detach_tau", "no_detach_kappa"):
             if name in checkpoint["args"]:
                 setattr(args, name, checkpoint["args"][name])
         if args.feature_path is None:
@@ -285,8 +422,10 @@ def main(argv=None):
         init_tag = model_config.get("distribution_init", "random").replace("-", "_")
     else:
         init_tag = "no_distribution"
+    method_tag = ("tical_" + model_config["tical_mode"]
+                  if model_config.get("use_tical") else model_config["fusion_variant"])
     run_name = "{}_{}_{}_seed{}_{}".format(
-        args.dataset.lower(), model_config["fusion_variant"], init_tag, args.seed,
+        args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     run_dir = Path(args.output_dir).resolve() / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -296,15 +435,17 @@ def main(argv=None):
                                                                 if reliability_table else None),
                                         "smoke_test": args.max_batches > 0})
     write_json(run_dir / "split_ids.json", split_ids)
-    print("Device: {}; variant: {}; distribution init: {}; selection: {}; output: {}".format(
-        device, model_config["fusion_variant"], init_tag,
+    print("Device: {}; method: {}; distribution init: {}; selection: {}; output: {}".format(
+        device, method_tag, init_tag,
         args.selection_protocol, run_dir), flush=True)
     print("Dialogues: {}; parameters: {:,}".format(
         {name: len(ids) for name, ids in split_ids.items()}, sum(p.numel() for p in model.parameters())), flush=True)
     if checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
+        model.set_tical_epoch(checkpoint.get("epoch", 0))
         metrics, rows, true, predicted = run_epoch(model, criterion, loaders["test"], device,
-                                                  max_batches=args.max_batches, collect_predictions=True)
+                                                  max_batches=args.max_batches, collect_predictions=True,
+                                                  epoch=checkpoint.get("epoch", 0))
         save_test_outputs(run_dir, metrics, rows, true, predicted, dataset.n_classes)
         print(json.dumps(metrics, indent=2))
         return run_dir
@@ -317,9 +458,9 @@ def main(argv=None):
         started = time.time()
         train_metrics, _, _, _ = run_epoch(model, criterion, loaders["train"], device, optimizer,
                                            args.max_batches, args.grad_clip,
-                                           reliability_table=reliability_table)
+                                           reliability_table=reliability_table, epoch=epoch)
         selected_metrics, _, _, _ = run_epoch(model, criterion, loaders[selection_split], device,
-                                              max_batches=args.max_batches)
+                                              max_batches=args.max_batches, epoch=epoch)
         row = {"epoch": epoch, "seconds": time.time() - started}
         row.update({"train_" + k: v for k, v in train_metrics.items()})
         row.update({selection_split + "_" + k: v for k, v in selected_metrics.items()})
@@ -331,19 +472,32 @@ def main(argv=None):
                         "args": vars(args), "epoch": epoch, "selection_metrics": selected_metrics,
                         "split_ids": split_ids, "feature_path": str(dataset.feature_path)},
                        run_dir / "best_checkpoint.pt")
-        print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
-              "COLD={:.4f} (weighted={:.4f}) reg={:.4f} (weighted={:.4f}) "
-              "reliability={:.4f} (weighted={:.4f}) keep(sample/modality)={:.3f}/{:.3f} ({:.1f}s)".format(
-            epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
-            selected_metrics["weighted_f1"], train_metrics["cold"],
-            train_metrics["weighted_cold"], train_metrics["reg"],
-            train_metrics["weighted_reg"], train_metrics["reliability_loss"],
-            train_metrics["weighted_reliability"], train_metrics["sample_keep_rate"],
-            train_metrics["modality_keep_rate"], row["seconds"]), flush=True)
+        if args.use_tical:
+            print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
+                  "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
+                  "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
+                epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
+                selected_metrics["weighted_f1"], train_metrics["original_distillation"],
+                train_metrics["ca_distillation"], train_metrics["weighted_hyp"],
+                train_metrics.get("kappa_mean", 0.0), train_metrics["tical_ready_rate"],
+                train_metrics["anchor_t_size"], train_metrics["anchor_a_size"],
+                train_metrics["anchor_v_size"], row["seconds"]), flush=True)
+        else:
+            print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
+                  "COLD={:.4f} (weighted={:.4f}) reg={:.4f} (weighted={:.4f}) "
+                  "reliability={:.4f} (weighted={:.4f}) keep(sample/modality)={:.3f}/{:.3f} ({:.1f}s)".format(
+                epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
+                selected_metrics["weighted_f1"], train_metrics["cold"],
+                train_metrics["weighted_cold"], train_metrics["reg"],
+                train_metrics["weighted_reg"], train_metrics["reliability_loss"],
+                train_metrics["weighted_reliability"], train_metrics["sample_keep_rate"],
+                train_metrics["modality_keep_rate"], row["seconds"]), flush=True)
     checkpoint = torch.load(run_dir / "best_checkpoint.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
+    model.set_tical_epoch(checkpoint.get("epoch", best_epoch))
     metrics, rows, true, predicted = run_epoch(model, criterion, loaders["test"], device,
-                                              max_batches=args.max_batches, collect_predictions=True)
+                                              max_batches=args.max_batches, collect_predictions=True,
+                                              epoch=checkpoint.get("epoch", best_epoch))
     save_test_outputs(run_dir, metrics, rows, true, predicted, dataset.n_classes)
     write_json(run_dir / "summary.json", {"best_epoch": best_epoch, "selection_protocol": args.selection_protocol,
                                          "selection_weighted_f1": best_score, "test": metrics,

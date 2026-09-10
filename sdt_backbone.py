@@ -282,8 +282,14 @@ class SDTBackbone(nn.Module):
             )
         self.all_output_layer = nn.Linear(hidden_dim, n_classes)
 
-    def encode_modalities(self, textf, visuf, acouf, u_mask, qmask, dia_len):
-        """Return enhanced representations H'_T, H'_A, H'_V, each [B,L,D]."""
+    def encode_modalities(self, textf, visuf, acouf, u_mask, qmask, dia_len,
+                          return_pure=False):
+        """Return enhanced H'_T/H'_A/H'_V and optionally pure H_TT/H_AA/H_VV.
+
+        The default return value and computation are kept compatible with the
+        original SDT path.  TiCAL requests the intra-modal representations
+        before they are passed through the SDT unimodal gates.
+        """
         spk_idx = torch.argmax(qmask, -1)
         origin_spk_idx = spk_idx
         if self.n_speakers == 2:
@@ -320,6 +326,9 @@ class SDTBackbone(nn.Module):
         t_v_transformer_out = self.t_v(textf, visuf, u_mask, spk_embeddings)
         a_v_transformer_out = self.a_v(acouf, visuf, u_mask, spk_embeddings)
 
+        pure = (t_t_transformer_out, a_a_transformer_out,
+                v_v_transformer_out)
+
         # Unimodal-level Gated Fusion
         t_t_transformer_out = self.t_t_gate(t_t_transformer_out)
         a_t_transformer_out = self.a_t_gate(a_t_transformer_out)
@@ -337,4 +346,5 @@ class SDTBackbone(nn.Module):
         a_transformer_out = self.features_reduce_a(torch.cat([a_a_transformer_out, t_a_transformer_out, v_a_transformer_out], dim=-1))
         v_transformer_out = self.features_reduce_v(torch.cat([v_v_transformer_out, t_v_transformer_out, a_v_transformer_out], dim=-1))
 
-        return t_transformer_out, a_transformer_out, v_transformer_out
+        enhanced = (t_transformer_out, a_transformer_out, v_transformer_out)
+        return (enhanced, pure) if return_pure else enhanced

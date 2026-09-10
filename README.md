@@ -1,4 +1,64 @@
-# SDT_new: SDT + TAV COLD
+# SDT_new: SDT + COLD + TiCAL
+
+## Chạy SDT + TiCAL (không dùng COLD)
+
+Script riêng:
+
+```bash
+bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+```
+
+Mặc định script chạy **SDT + TiCAL consistency-aware KD** (`tical-mode=kd`).
+Nó luôn dùng `fusion-variant=sdt`, không tạo Gaussian distribution head, không
+sampling, không đọc OOF reliability, đồng thời đặt `lambda-co=0`, `lambda-reg=0`
+và `lambda-reliability=0`. Code cũng báo lỗi nếu cố bật TiCAL cùng `guided`,
+`replace` hoặc `oof-guided`.
+
+Các ablation theo guideline:
+
+```bash
+# E1: chỉ đo và log TiCAL, loss/prediction vẫn là SDT
+TICAL_MODE=observe bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+
+# E2 (mặc định): consistency-aware self-distillation
+TICAL_MODE=kd bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+
+# E3: E2 + HypCPCC
+TICAL_MODE=hyp bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+
+# E4: E2 + consistency-aware fusion
+TICAL_MODE=fusion bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+
+# E5: E2 + HypCPCC + consistency-aware fusion
+TICAL_MODE=full bash SDT_new/exec_iemocap_tical.sh --device cuda --gpu-id 0
+```
+
+TiCAL lấy `H_tt`, `H_aa`, `H_vv` ngay sau ba intra-modal Transformer và trước
+unimodal gate/cross-modal fusion. Ba `HyperbolicProjector` đưa feature vào
+Poincare ball. Mỗi modality có một FIFO HASL riêng. Trong train, batch hiện tại
+luôn query bank cũ trong forward; chỉ sau `optimizer.step()` mới thêm các mẫu mà
+fused teacher dự đoán đúng và có confidence lớn hơn `anchor-conf-threshold`.
+Validation/test chỉ query bank đã học từ train và tuyệt đối không update bank.
+
+Warm-up mặc định là 5 epoch. Epoch 1--5 dùng đúng loss SDT và chỉ xây HASL;
+TiCAL bắt đầu query từ epoch 6. Các thiết lập chính có thể override ở cuối lệnh:
+
+```bash
+bash SDT_new/exec_iemocap_tical.sh \
+  --tical-warmup-epochs 5 \
+  --anchor-size 2048 --anchor-conf-threshold 0.8 \
+  --hyperbolic-dim 128 \
+  --consistency-t 0.2 --consistency-k 0.5
+```
+
+Mỗi epoch ghi đầy đủ vào `epoch_metrics.csv`: kích thước và số anchor mỗi class,
+agreement T/A/T/V/A/V/T=A=V, mean/std/q05/q50/q95 của từng `tau`, phân phối
+`kappa`, tỷ lệ ba nhóm consistency, accuracy từng nhóm, original KL,
+consistency-aware KL và HypCPCC. `test_predictions.csv` có thêm pseudo-label,
+`tau`, `label_discrepancy` và `kappa` cho từng utterance.
+
+Script vẫn giữ protocol hiện tại của dự án: dùng test F1 để chọn checkpoint.
+Muốn tách validation từ train, truyền `--selection-protocol validation`.
 
 Triển khai theo hướng dẫn được cung cấp: giữ encoder SDT, thêm Gaussian distribution
 head sau mỗi enhanced representation, dùng lại ba student classifier, và đưa

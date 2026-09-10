@@ -1,4 +1,4 @@
-"""SDT with distribution heads and the requested T/A/V COLD fusion."""
+"""SDT with optional COLD variants or an isolated TiCAL integration."""
 
 import math
 
@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sdt_backbone import SDTBackbone
+from tical import MODALITIES as TICAL_MODALITIES, TiCALModule
 
 
 MODALITIES = ("t", "a", "v")
@@ -71,7 +72,12 @@ class Transformer_Based_Model(SDTBackbone):
                  n_classes, hidden_dim, n_speakers, dropout,
                  fusion_variant="guided", logvar_min=-8.0, logvar_max=8.0,
                  cold_eps=1e-8, distribution_init="random",
-                 initial_logvar=-6.0):
+                 initial_logvar=-6.0, use_tical=False, tical_mode="kd",
+                 tical_warmup_epochs=5, anchor_size=2048,
+                 anchor_conf_threshold=0.8, hyperbolic_dim=128,
+                 hyp_eps=1e-5, typicality_eps=1e-8,
+                 consistency_t=0.2, consistency_k=0.5,
+                 detach_tau=True, detach_kappa=True, beta_gate=1.0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -80,12 +86,30 @@ class Transformer_Based_Model(SDTBackbone):
             raise ValueError("cold_eps must be finite and positive")
         if hidden_dim < 2 or hidden_dim % 2 or n_head < 1 or hidden_dim % n_head:
             raise ValueError("hidden_dim must be positive, even, and divisible by n_head")
+        if tical_mode not in ("observe", "kd", "hyp", "fusion", "full"):
+            raise ValueError("unknown tical_mode: {}".format(tical_mode))
+        if use_tical and fusion_variant != "sdt":
+            raise ValueError("TiCAL must use --fusion-variant sdt; COLD cannot run with TiCAL")
+        if tical_warmup_epochs < 0 or not math.isfinite(beta_gate) or beta_gate < 0:
+            raise ValueError("TiCAL warmup and beta_gate must be nonnegative")
+        if TICAL_MODALITIES != MODALITIES:
+            raise RuntimeError("TiCAL modality order differs from SDT")
         super().__init__(dataset, temp, D_text, D_visual, D_audio, n_head,
                          n_classes, hidden_dim, n_speakers, dropout)
         self.fusion_variant = fusion_variant
         self.cold_eps = cold_eps
         self.distribution_init = distribution_init
         self.initial_logvar = initial_logvar
+        self.use_tical = use_tical
+        self.tical_mode = tical_mode
+        self.tical_warmup_epochs = tical_warmup_epochs
+        self.beta_gate = beta_gate
+        self.tical_epoch = 0
+        if use_tical:
+            self.tical = TiCALModule(
+                hidden_dim, hyperbolic_dim, n_classes, anchor_size,
+                anchor_conf_threshold, hyp_eps, typicality_eps,
+                consistency_t, consistency_k, detach_tau, detach_kappa)
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(
@@ -107,14 +131,37 @@ class Transformer_Based_Model(SDTBackbone):
 
     def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len):
         """Label-free forward. qmask is [B,L,S]; inputs are [L,B,D_m]."""
-        enhanced = self.encode_modalities(textf, visuf, acouf, u_mask, qmask, dia_len)
+        if self.use_tical:
+            enhanced, pure = self.encode_modalities(
+                textf, visuf, acouf, u_mask, qmask, dia_len, return_pure=True)
+        else:
+            enhanced = self.encode_modalities(textf, visuf, acouf, u_mask, qmask, dia_len)
+            pure = None
         features = torch.stack(enhanced, dim=-2)
         distributions = {}
         variance_norm = confidence = reliability_logits = reliability = None
+        tical_output = None
         if self.fusion_variant == "sdt":
             latents = features
             sdt_weights = torch.softmax(self.last_gate.fc(features), dim=-2)
             fusion_weights = sdt_weights
+            if self.use_tical:
+                tical_output = self.tical(
+                    pure, u_mask.bool(),
+                    query_enabled=self.tical_epoch > self.tical_warmup_epochs)
+                if self.tical_mode in ("fusion", "full") and tical_output["ready"]:
+                    valid = u_mask.bool()
+                    tau_full = features.new_ones(*u_mask.shape, len(MODALITIES))
+                    kappa_full = features.new_ones(*u_mask.shape)
+                    tau_full[valid] = torch.stack(
+                        [tical_output["tau"][name] for name in MODALITIES], dim=-1)
+                    kappa_full[valid] = tical_output["kappa"]
+                    strength = self.beta_gate * (1.0 - kappa_full)
+                    factor = (tau_full + self.tical.typicality_eps).pow(
+                        strength.unsqueeze(-1)).unsqueeze(-1)
+                    fusion_weights = sdt_weights * factor
+                    fusion_weights = fusion_weights / fusion_weights.sum(
+                        dim=-2, keepdim=True).clamp_min(self.tical.typicality_eps)
             fused = (fusion_weights * features).sum(dim=-2)
         elif self.fusion_variant == "oof-guided":
             # No Gaussian bottleneck and no sampling: classifiers and fusion
@@ -163,6 +210,7 @@ class Transformer_Based_Model(SDTBackbone):
             "student_kl_log_prob": {m: F.log_softmax(student_logits[m] / self.temp, dim=-1) for m in MODALITIES},
             "teacher_kl_prob": F.softmax(logits / self.temp, dim=-1),
             "enhanced": features,
+            "pure": (torch.stack(pure, dim=-2) if pure is not None else None),
             "distributions": distributions,
             "latents": latents,
             "variance_norm": variance_norm,
@@ -175,4 +223,21 @@ class Transformer_Based_Model(SDTBackbone):
             "sdt_weights": sdt_weights,
             "fusion_weights": fusion_weights,
             "fused": fused,
+            "tical": tical_output,
         }
+
+    def set_tical_epoch(self, epoch):
+        self.tical_epoch = int(epoch)
+
+    @torch.no_grad()
+    def update_tical_anchors(self, outputs, labels, valid_mask):
+        """Update after optimizer.step(); never call this during validation/test."""
+        if not self.use_tical or outputs["tical"] is None:
+            return 0
+        if not self.training:
+            raise RuntimeError("cannot update TiCAL anchors outside training")
+        return self.tical.update(outputs["tical"]["projected"], outputs["logits"],
+                                 labels, valid_mask)
+
+    def tical_anchor_summary(self):
+        return self.tical.summary() if self.use_tical else None

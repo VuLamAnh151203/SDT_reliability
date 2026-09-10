@@ -65,6 +65,7 @@ trong khoảng `logvar_min..logvar_max`.
 | --- | --- |
 | `replace` — A | `h = sum_m r_m * z_m`; không dùng learned multimodal gate |
 | `guided` — B, mặc định | `g = softmax_m(W * H'_m)`, `g_bar = normalize_m(g * r)`, `h = sum_m g_bar_m * z_m` |
+| `oof-guided` | Học reliability từ OOF target, giữ classifier/fusion trên `H'`, không Gaussian bottleneck hay sampling |
 | `sdt` — đối chứng | SDT deterministic: classifier và learned gate nhận `H'`; không tạo distribution head, COLD/reg bằng 0 |
 
 Gate trong SDT nguồn có trọng số **theo từng chiều feature**, shape
@@ -130,6 +131,101 @@ theo công thức bạn gửi. `--no-class-weight` tắt class weights của SDT
 Self-distillation giữ hành vi code SDT nguồn: teacher probability **không
 detach**, và KL **không nhân thêm temperature²**. Việc detach CE target COLD
 không thay đổi gradient này.
+
+## OOF reliability và pruning
+
+`oof-guided` là pipeline riêng để reliability không được tạo bởi model đã nhìn
+thấy chính training sample đó:
+
+```text
+trainVid --K-fold theo dialogue--> K baseline SDT
+       --predict holdout--> CE_T, CE_A, CE_V
+       --softmax(-CE / tau)--> OOF reliability target
+       --train reliability heads--> predicted reliability
+       --guided SDT gate--> emotion prediction
+```
+
+Mỗi dialogue chỉ xuất hiện trong holdout của đúng một fold. Các fold OOF không
+dùng `testVid` và train đúng số epoch cố định, không chọn epoch bằng holdout.
+Model cuối vẫn mặc định chọn checkpoint bằng test giống SDT theo yêu cầu hiện
+tại.
+
+Tạo OOF targets (5 baseline folds, 50 epoch/fold):
+
+```bash
+bash SDT_new/exec_iemocap_build_oof_reliability.sh \
+  --device cuda --gpu-id 0
+```
+
+File mặc định là
+`SDT_new/reliability_targets/iemocap_oof_seed2024.csv`; JSON cùng tên lưu cấu
+hình, fold IDs và xác nhận test không tham gia. Nếu muốn baseline OOF hội tụ kỹ
+hơn có thể ghi đè budget khi tạo file mới:
+
+```bash
+OOF_TARGETS=SDT_new/reliability_targets/iemocap_oof_150ep_seed2024.csv \
+bash SDT_new/exec_iemocap_build_oof_reliability.sh \
+  --device cuda --gpu-id 0 --epochs 150
+```
+
+Train model cuối:
+
+```bash
+bash SDT_new/exec_iemocap_oof_guided.sh \
+  --device cuda --gpu-id 0
+```
+
+Nếu dùng target path khác, đặt cùng biến môi trường khi train:
+
+```bash
+OOF_TARGETS=SDT_new/reliability_targets/iemocap_oof_150ep_seed2024.csv \
+bash SDT_new/exec_iemocap_oof_guided.sh --device cuda --gpu-id 0
+```
+
+Mode này khởi tạo ba reliability head bằng 0, nên ban đầu reliability là
+`[1/3,1/3,1/3]` và guided fusion bằng đúng learned gate của SDT. Student và
+teacher luôn nhận `H'`; không có `mu`, `z`, Gaussian REG hay sampling noise.
+Loss bổ sung là:
+
+```text
+L_reliability = mean_valid KL(r_OOF || softmax(reliability_logits))
+L_total = L_SDT + lambda_reliability * L_reliability
+```
+
+Script mặc định dùng:
+
+```text
+lambda_reliability       = 1.0
+modality_prune_quantile  = 0.10
+sample_prune_quantile    = 0.05
+disagreement_weight      = 1.0
+```
+
+Modality pruning bỏ 10% reliability thấp nhất của từng modality khỏi CE/KD
+student. Modality tốt nhất của mỗi utterance luôn được giữ. Sample pruning tạo
+noise score `mean(CE_T,CE_A,CE_V) + disagreement_weight * JSD`, lấy threshold
+riêng cho từng emotion class để giữ cân bằng lớp, và mặc định chỉ prune khi cả
+ba modality đều dự đoán sai. `--sample-prune-any` bỏ điều kiện bảo thủ này.
+
+Pruning không xóa utterance khỏi dialogue: utterance vẫn đi qua encoder để giữ
+conversational context, nhưng loss classification/reliability của sample bị
+mask. Tại inference không cần OOF file; reliability head dự đoán trực tiếp từ
+`H'`. Console log `reliability`, `sample_keep_rate` và `modality_keep_rate`.
+
+Các ablation quan trọng:
+
+```bash
+# Chỉ OOF soft-guided gate, không prune
+bash SDT_new/exec_iemocap_oof_guided.sh \
+  --modality-prune-quantile 0 --sample-prune-quantile 0
+
+# Chỉ modality pruning
+bash SDT_new/exec_iemocap_oof_guided.sh \
+  --modality-prune-quantile 0.10 --sample-prune-quantile 0
+
+# Không đưa disagreement vào whole-sample noise score
+bash SDT_new/exec_iemocap_oof_guided.sh --disagreement-weight 0
+```
 
 ## Cài đặt và dữ liệu
 

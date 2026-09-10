@@ -10,7 +10,7 @@ from sdt_backbone import SDTBackbone
 
 
 MODALITIES = ("t", "a", "v")
-FUSION_VARIANTS = ("guided", "replace", "sdt")
+FUSION_VARIANTS = ("guided", "replace", "oof-guided", "sdt")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 
 
@@ -86,13 +86,22 @@ class Transformer_Based_Model(SDTBackbone):
         self.cold_eps = cold_eps
         self.distribution_init = distribution_init
         self.initial_logvar = initial_logvar
-        if fusion_variant != "sdt":
+        if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(
                     hidden_dim, logvar_min, logvar_max,
                     distribution_init, initial_logvar)
                 for name in MODALITIES
             })
+        elif fusion_variant == "oof-guided":
+            self.reliability_heads = nn.ModuleDict({
+                name: nn.Linear(hidden_dim, 1) for name in MODALITIES
+            })
+            # Uniform predicted reliability at initialization makes guided
+            # fusion exactly equal to SDT's learned gate.
+            for head in self.reliability_heads.values():
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
         if fusion_variant == "replace":
             self.last_gate.requires_grad_(False)
 
@@ -107,6 +116,18 @@ class Transformer_Based_Model(SDTBackbone):
             sdt_weights = torch.softmax(self.last_gate.fc(features), dim=-2)
             fusion_weights = sdt_weights
             fused = (fusion_weights * features).sum(dim=-2)
+        elif self.fusion_variant == "oof-guided":
+            # No Gaussian bottleneck and no sampling: classifiers and fusion
+            # retain SDT's enhanced representations H'.
+            latents = features
+            reliability_logits = torch.stack([
+                self.reliability_heads[name](feature).squeeze(-1)
+                for name, feature in zip(MODALITIES, enhanced)
+            ], dim=-1)
+            reliability = torch.softmax(reliability_logits, dim=-1)
+            confidence = reliability
+            fused, fusion_weights, sdt_weights = cold_fusion(
+                features, latents, reliability, self.last_gate, "guided")
         else:
             distributions = {
                 name: self.distribution_heads[name](feature)

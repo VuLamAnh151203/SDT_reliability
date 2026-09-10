@@ -1,5 +1,7 @@
 import importlib.util
+import csv
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from dataloader import collate_dialogues, split_dialogues
 from losses import COLDLoss, SDTCOLDLoss, symmetric_kl
 from model import DistributionHead, MODALITIES, Transformer_Based_Model, cold_fusion
+from reliability_data import OOFReliabilityTable
 from sdt_backbone import MaskedKLDivLoss, MaskedNLLLoss, Multimodal_GatedFusion
 
 
@@ -78,6 +81,75 @@ class SDTCOLDTests(unittest.TestCase):
     def test_sdt_preserving_logvar_must_fit_clamp(self):
         with self.assertRaises(ValueError):
             DistributionHead(8, -4.0, 4.0, "sdt-preserving", -6.0)
+
+    def test_oof_guided_starts_as_exact_sdt_gate_without_sampling(self):
+        model = Transformer_Based_Model(
+            **self.config, fusion_variant="oof-guided").eval()
+        output = model(*self.inputs)
+        self.assertFalse(output["distributions"])
+        torch.testing.assert_close(output["latents"], output["enhanced"])
+        torch.testing.assert_close(output["reliability_logits"],
+                                   torch.zeros_like(output["reliability_logits"]))
+        torch.testing.assert_close(output["reliability"],
+                                   torch.full_like(output["reliability"], 1.0 / 3.0))
+        torch.testing.assert_close(output["fusion_weights"], output["sdt_weights"])
+        expected = (output["sdt_weights"] * output["enhanced"]).sum(dim=-2)
+        torch.testing.assert_close(output["fused"], expected)
+
+    def test_oof_reliability_loss_and_pruning_masks_backpropagate(self):
+        model = Transformer_Based_Model(
+            **self.config, fusion_variant="oof-guided")
+        output = model(*self.inputs)
+        targets = torch.softmax(torch.randn(2, 4, 3), dim=-1)
+        sample_keep = self.mask.clone()
+        sample_keep[0, 3] = 0
+        modality_keep = self.mask.unsqueeze(-1).expand(-1, -1, 3).clone()
+        modality_keep[0, 0, 1] = 0
+        loss, parts, _ = SDTCOLDLoss(lambda_reliability=2.0)(
+            output, self.labels, self.mask, targets,
+            sample_keep, modality_keep)
+        self.assertTrue(torch.isfinite(loss))
+        torch.testing.assert_close(parts["weighted_reliability"],
+                                   2.0 * parts["reliability_loss"])
+        self.assertLess(parts["sample_keep_rate"].item(), 1.0)
+        self.assertLess(parts["modality_keep_rate"].item(), 1.0)
+        loss.backward()
+        for head in model.reliability_heads.values():
+            self.assertGreater(head.weight.grad.abs().sum().item(), 0)
+
+    def test_oof_table_is_aligned_and_never_prunes_every_modality(self):
+        fieldnames = ["dialogue_id", "utterance_index", "label", "mean_ce", "jsd",
+                      "all_modalities_wrong"] + [m + "_reliability" for m in MODALITIES]
+        rows = [
+            {"dialogue_id": "d1", "utterance_index": 0, "label": 0, "mean_ce": 3.0,
+             "jsd": 0.8, "all_modalities_wrong": 1,
+             "t_reliability": 0.8, "a_reliability": 0.1, "v_reliability": 0.1},
+            {"dialogue_id": "d1", "utterance_index": 1, "label": 0, "mean_ce": 0.2,
+             "jsd": 0.1, "all_modalities_wrong": 0,
+             "t_reliability": 0.1, "a_reliability": 0.7, "v_reliability": 0.2},
+            {"dialogue_id": "d2", "utterance_index": 0, "label": 0, "mean_ce": 1.0,
+             "jsd": 0.2, "all_modalities_wrong": 0,
+             "t_reliability": 0.2, "a_reliability": 0.2, "v_reliability": 0.6},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.csv"
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            table = OOFReliabilityTable(
+                path, modality_prune_quantile=0.5,
+                sample_prune_quantile=0.34, disagreement_weight=1.0)
+            class Dataset:
+                videoLabels = {"d1": [0, 0], "d2": [0]}
+            table.validate_dialogues(Dataset(), ["d1", "d2"])
+            target, sample_keep, modality_keep = table.batch(
+                ["d1", "d2"], [2, 1], 2, torch.device("cpu"))
+            torch.testing.assert_close(target[0, 0], torch.tensor([0.8, 0.1, 0.1]))
+            self.assertEqual(sample_keep[0, 0].item(), 0.0)
+            self.assertEqual(sample_keep[0, 1].item(), 1.0)
+            self.assertTrue((modality_keep.sum(dim=-1)[sample_keep.bool()] >= 1).all())
+            self.assertIsNotNone(table.summary()["modality_thresholds"]["t"])
 
     def test_both_gates_match_requested_equations(self):
         features, latents = torch.randn(2, 4, 3, 8), torch.randn(2, 4, 3, 8)

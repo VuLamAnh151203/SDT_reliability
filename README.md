@@ -38,6 +38,26 @@ reliability_logit_m = -log(v_m + eps)
 r_m = s_m / (s_T + s_A + s_V)
 ```
 
+Distribution head có hai chế độ khởi tạo:
+
+| `--distribution-init` | Khởi tạo |
+| --- | --- |
+| `random` — mặc định cũ | Hai Linear dùng khởi tạo mặc định của PyTorch |
+| `sdt-preserving` | `W_mu=I`, `b_mu=0`, `W_logvar=0`, `b_logvar=initial_logvar` |
+
+Với `sdt-preserving --initial-logvar -6`, tại thời điểm khởi tạo:
+
+```text
+mu_m = H'_m
+variance_m = exp(-6) ≈ 0.00248
+sampling std = exp(-3) ≈ 0.0498
+r_T = r_A = r_V = 1/3
+guided fusion = SDT learned-gate fusion (ở eval)
+```
+
+Các head vẫn train bình thường sau initialization. `initial_logvar` phải nằm
+trong khoảng `logvar_min..logvar_max`.
+
 `H'`, `mu`, `logvar`, `z` có shape `[batch, sequence, hidden_dim]`.
 `r` có shape `[batch, sequence, 3]`, thứ tự **T, A, V**.
 
@@ -132,6 +152,9 @@ Từ thư mục gốc workspace:
 # IEMOCAP, Variant B (mặc định)
 bash SDT_new/exec_iemocap.sh
 
+# Variant B với initialization gần SDT, lambda_co=0.5, lambda_reg=0.01
+bash SDT_new/exec_iemocap_guided_sdt_init.sh
+
 # IEMOCAP, Variant A
 bash SDT_new/exec_iemocap_replace.sh
 
@@ -146,6 +169,17 @@ Các script nhận thêm tham số ở cuối, ví dụ:
 
 ```bash
 bash SDT_new/exec_iemocap.sh --device cuda --gpu-id 0 --seed 2025 --lambda-co 0.05
+```
+
+Lệnh tương đương cho mode SDT-preserving:
+
+```bash
+bash SDT_new/exec_iemocap.sh \
+  --fusion-variant guided \
+  --distribution-init sdt-preserving \
+  --initial-logvar -6 \
+  --lambda-co 0.5 \
+  --lambda-reg 0.01
 ```
 
 Trên PowerShell có thể chạy Python trực tiếp:

@@ -14,7 +14,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from dataloader import BASE_DIR, DialogueDataset, make_loaders, split_dialogues
 from losses import SDTCOLDLoss
-from model import FUSION_VARIANTS, MODALITIES, Transformer_Based_Model
+from model import (DISTRIBUTION_INIT_MODES, FUSION_VARIANTS, MODALITIES,
+                   Transformer_Based_Model)
 
 
 def build_parser():
@@ -23,6 +24,11 @@ def build_parser():
     parser.add_argument("--feature-path")
     parser.add_argument("--fusion-variant", choices=FUSION_VARIANTS, default="guided",
                         help="guided=B (default), replace=A, sdt=original deterministic baseline")
+    parser.add_argument("--distribution-init", choices=DISTRIBUTION_INIT_MODES,
+                        default="random",
+                        help="sdt-preserving initializes mu=H' and variance small")
+    parser.add_argument("--initial-logvar", type=float, default=-6.0,
+                        help="initial constant log-variance for sdt-preserving mode")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=1024)
@@ -84,7 +90,9 @@ def make_model_config(args, dataset):
             "n_head": args.n_head, "n_classes": dataset.n_classes,
             "hidden_dim": args.hidden_dim, "n_speakers": dataset.n_speakers,
             "dropout": args.dropout, "fusion_variant": args.fusion_variant,
-            "logvar_min": args.logvar_min, "logvar_max": args.logvar_max, "cold_eps": args.cold_eps}
+            "logvar_min": args.logvar_min, "logvar_max": args.logvar_max,
+            "cold_eps": args.cold_eps, "distribution_init": args.distribution_init,
+            "initial_logvar": args.initial_logvar}
 
 
 def make_criterion(args, device):
@@ -204,8 +212,10 @@ def main(argv=None):
         checkpoint = torch.load(args.eval_checkpoint, map_location="cpu", weights_only=True)
         args.dataset = checkpoint["model_config"]["dataset"]
         for name in ("temp", "n_head", "hidden_dim", "dropout", "fusion_variant",
-                     "logvar_min", "logvar_max", "cold_eps"):
-            setattr(args, name, checkpoint["model_config"][name])
+                     "logvar_min", "logvar_max", "cold_eps", "distribution_init",
+                     "initial_logvar"):
+            if name in checkpoint["model_config"]:
+                setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
                      "no_detach_errors", "no_class_weight", "selection_protocol", "valid_ratio"):
             setattr(args, name, checkpoint["args"][name])
@@ -223,16 +233,19 @@ def main(argv=None):
     model = Transformer_Based_Model(**model_config).to(device)
     criterion = make_criterion(args, device)
     loaders = make_loaders(dataset, split_ids, args.batch_size, args.seed, args.num_workers, device.type == "cuda")
-    run_name = "{}_{}_seed{}_{}".format(args.dataset.lower(), model_config["fusion_variant"], args.seed,
-                                      datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    init_tag = model_config.get("distribution_init", "random").replace("-", "_")
+    run_name = "{}_{}_{}_seed{}_{}".format(
+        args.dataset.lower(), model_config["fusion_variant"], init_tag, args.seed,
+        datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     run_dir = Path(args.output_dir).resolve() / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
     write_json(run_dir / "config.json", {"args": vars(args), "model_config": model_config,
                                         "device": str(device), "feature_path": str(dataset.feature_path),
                                         "smoke_test": args.max_batches > 0})
     write_json(run_dir / "split_ids.json", split_ids)
-    print("Device: {}; variant: {}; selection: {}; output: {}".format(
-        device, model_config["fusion_variant"], args.selection_protocol, run_dir), flush=True)
+    print("Device: {}; variant: {}; distribution init: {}; selection: {}; output: {}".format(
+        device, model_config["fusion_variant"], init_tag,
+        args.selection_protocol, run_dir), flush=True)
     print("Dialogues: {}; parameters: {:,}".format(
         {name: len(ids) for name, ids in split_ids.items()}, sum(p.numel() for p in model.parameters())), flush=True)
     if checkpoint:

@@ -11,17 +11,33 @@ from sdt_backbone import SDTBackbone
 
 MODALITIES = ("t", "a", "v")
 FUSION_VARIANTS = ("guided", "replace", "sdt")
+DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 
 
 class DistributionHead(nn.Module):
-    def __init__(self, hidden_dim, logvar_min=-8.0, logvar_max=8.0):
+    def __init__(self, hidden_dim, logvar_min=-8.0, logvar_max=8.0,
+                 init_mode="random", initial_logvar=-6.0):
         super().__init__()
         if not (-20.0 <= logvar_min < logvar_max <= 20.0):
             raise ValueError("require -20 <= logvar_min < logvar_max <= 20")
+        if init_mode not in DISTRIBUTION_INIT_MODES:
+            raise ValueError("unknown distribution init mode: {}".format(init_mode))
+        if not math.isfinite(initial_logvar):
+            raise ValueError("initial_logvar must be finite")
+        if init_mode == "sdt-preserving" and not logvar_min <= initial_logvar <= logvar_max:
+            raise ValueError("initial_logvar must be inside the logvar clamp range")
         self.mu = nn.Linear(hidden_dim, hidden_dim)
         self.logvar = nn.Linear(hidden_dim, hidden_dim)
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
+        self.init_mode = init_mode
+        self.initial_logvar = initial_logvar
+        if init_mode == "sdt-preserving":
+            # At initialization: mu == H' and sigma == exp(initial_logvar / 2).
+            nn.init.eye_(self.mu.weight)
+            nn.init.zeros_(self.mu.bias)
+            nn.init.zeros_(self.logvar.weight)
+            nn.init.constant_(self.logvar.bias, initial_logvar)
 
     def forward(self, features):
         mu = self.mu(features)
@@ -54,7 +70,8 @@ class Transformer_Based_Model(SDTBackbone):
     def __init__(self, dataset, temp, D_text, D_visual, D_audio, n_head,
                  n_classes, hidden_dim, n_speakers, dropout,
                  fusion_variant="guided", logvar_min=-8.0, logvar_max=8.0,
-                 cold_eps=1e-8):
+                 cold_eps=1e-8, distribution_init="random",
+                 initial_logvar=-6.0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -67,9 +84,13 @@ class Transformer_Based_Model(SDTBackbone):
                          n_classes, hidden_dim, n_speakers, dropout)
         self.fusion_variant = fusion_variant
         self.cold_eps = cold_eps
+        self.distribution_init = distribution_init
+        self.initial_logvar = initial_logvar
         if fusion_variant != "sdt":
             self.distribution_heads = nn.ModuleDict({
-                name: DistributionHead(hidden_dim, logvar_min, logvar_max)
+                name: DistributionHead(
+                    hidden_dim, logvar_min, logvar_max,
+                    distribution_init, initial_logvar)
                 for name in MODALITIES
             })
         if fusion_variant == "replace":

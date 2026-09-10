@@ -47,6 +47,38 @@ class SDTCOLDTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(result["variance"]).all())
         self.assertLessEqual(result["logvar"].max().item(), 4.0)
 
+    def test_sdt_preserving_distribution_initialization(self):
+        model = Transformer_Based_Model(
+            **self.config, fusion_variant="guided",
+            distribution_init="sdt-preserving", initial_logvar=-6.0).eval()
+        output = model(*self.inputs)
+        identity = torch.eye(self.config["hidden_dim"])
+        expected_variance = torch.full_like(
+            output["distributions"]["t"]["variance"], torch.exp(torch.tensor(-6.0)))
+        for index, name in enumerate(MODALITIES):
+            head = model.distribution_heads[name]
+            torch.testing.assert_close(head.mu.weight, identity)
+            torch.testing.assert_close(head.mu.bias, torch.zeros_like(head.mu.bias))
+            torch.testing.assert_close(head.logvar.weight, torch.zeros_like(head.logvar.weight))
+            torch.testing.assert_close(head.logvar.bias, torch.full_like(head.logvar.bias, -6.0))
+            torch.testing.assert_close(output["distributions"][name]["mu"],
+                                       output["enhanced"][:, :, index, :])
+            torch.testing.assert_close(output["distributions"][name]["variance"], expected_variance)
+        torch.testing.assert_close(output["reliability"],
+                                   torch.full_like(output["reliability"], 1.0 / 3.0))
+        torch.testing.assert_close(output["fusion_weights"], output["sdt_weights"])
+        expected_fused = (output["sdt_weights"] * output["enhanced"]).sum(dim=-2)
+        torch.testing.assert_close(output["fused"], expected_fused)
+
+        model.train()
+        sampled = model(*self.inputs)
+        self.assertFalse(torch.equal(sampled["latents"], sampled["enhanced"]))
+        self.assertLess((sampled["latents"] - sampled["enhanced"]).std().item(), 0.07)
+
+    def test_sdt_preserving_logvar_must_fit_clamp(self):
+        with self.assertRaises(ValueError):
+            DistributionHead(8, -4.0, 4.0, "sdt-preserving", -6.0)
+
     def test_both_gates_match_requested_equations(self):
         features, latents = torch.randn(2, 4, 3, 8), torch.randn(2, 4, 3, 8)
         norms = torch.tensor([3.0, 1.0, 2.0]).expand(2, 4, 3)

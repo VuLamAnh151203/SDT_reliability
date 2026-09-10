@@ -80,7 +80,7 @@ class Transformer_Based_Model(SDTBackbone):
         enhanced = self.encode_modalities(textf, visuf, acouf, u_mask, qmask, dia_len)
         features = torch.stack(enhanced, dim=-2)
         distributions = {}
-        variance_norm = error_scores = reliability = None
+        variance_norm = confidence = reliability_logits = reliability = None
         if self.fusion_variant == "sdt":
             latents = features
             sdt_weights = torch.softmax(self.last_gate.fc(features), dim=-2)
@@ -97,9 +97,12 @@ class Transformer_Based_Model(SDTBackbone):
                 distributions[m]["variance"].float().norm(p=2, dim=-1)
                 for m in MODALITIES
             ], dim=-1)
-            error_scores = (variance_norm + self.cold_eps).reciprocal()
-            # Requested convention: larger variance norm gives higher reliability.
-            reliability = variance_norm / variance_norm.sum(dim=-1, keepdim=True)
+            # A large variance norm means high uncertainty and therefore low
+            # confidence/reliability. reliability_logits is used by COLD so
+            # softmax produces probabilities proportional to inverse variance.
+            confidence = (variance_norm + self.cold_eps).reciprocal()
+            reliability_logits = -(variance_norm + self.cold_eps).log()
+            reliability = confidence / confidence.sum(dim=-1, keepdim=True)
             fused, fusion_weights, sdt_weights = cold_fusion(
                 features, latents, reliability, self.last_gate, self.fusion_variant)
 
@@ -121,7 +124,11 @@ class Transformer_Based_Model(SDTBackbone):
             "distributions": distributions,
             "latents": latents,
             "variance_norm": variance_norm,
-            "error_scores": error_scores,
+            "confidence": confidence,
+            "reliability_logits": reliability_logits,
+            # Backward-compatible alias for checkpoints/analysis written by
+            # the first implementation. New code should use confidence.
+            "error_scores": confidence,
             "reliability": reliability,
             "sdt_weights": sdt_weights,
             "fusion_weights": fusion_weights,

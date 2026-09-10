@@ -35,7 +35,7 @@ def build_parser():
     parser.add_argument("--gamma-2", type=float, default=1.0)
     parser.add_argument("--gamma-3", type=float, default=1.0)
     parser.add_argument("--lambda-co", type=float, default=0.1)
-    parser.add_argument("--lambda-reg", type=float, default=1e-4)
+    parser.add_argument("--lambda-reg", type=float, default=0.1)
     parser.add_argument("--logvar-min", type=float, default=-8.0)
     parser.add_argument("--logvar-max", type=float, default=8.0)
     parser.add_argument("--cold-eps", type=float, default=1e-8)
@@ -264,9 +264,12 @@ def main(argv=None):
                         "args": vars(args), "epoch": epoch, "selection_metrics": selected_metrics,
                         "split_ids": split_ids, "feature_path": str(dataset.feature_path)},
                        run_dir / "best_checkpoint.pt")
-        print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; COLD={:.4f} reg={:.4f} ({:.1f}s)".format(
+        print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
+              "COLD={:.4f} (weighted={:.4f}) reg={:.4f} (weighted={:.4f}) ({:.1f}s)".format(
             epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
-            selected_metrics["weighted_f1"], train_metrics["cold"], train_metrics["reg"], row["seconds"]), flush=True)
+            selected_metrics["weighted_f1"], train_metrics["cold"],
+            train_metrics["weighted_cold"], train_metrics["reg"],
+            train_metrics["weighted_reg"], row["seconds"]), flush=True)
     checkpoint = torch.load(run_dir / "best_checkpoint.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     metrics, rows, true, predicted = run_epoch(model, criterion, loaders["test"], device,

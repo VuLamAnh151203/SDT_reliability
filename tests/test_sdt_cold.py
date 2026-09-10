@@ -76,15 +76,16 @@ class SDTCOLDTests(unittest.TestCase):
         output = self.model().eval()(*self.inputs)
         valid = self.mask.bool()
         parts, errors = COLDLoss()(output, self.labels, valid)
-        all_errors, all_scores = [], []
+        all_qualities, all_scores = [], []
         for index, name in enumerate(MODALITIES):
             error = F.cross_entropy(output["student_logits"][name][valid], self.labels[valid], reduction="none")
-            score = output["error_scores"][..., index][valid]
+            quality = -error.detach()
+            score = output["reliability_logits"][..., index][valid]
             torch.testing.assert_close(errors[name], error)
-            torch.testing.assert_close(parts["cold_" + name], symmetric_kl(error.detach(), score))
-            all_errors.append(error.detach())
+            torch.testing.assert_close(parts["cold_" + name], symmetric_kl(quality, score))
+            all_qualities.append(quality)
             all_scores.append(score)
-        torch.testing.assert_close(parts["cold_tav"], symmetric_kl(torch.cat(all_errors), torch.cat(all_scores)))
+        torch.testing.assert_close(parts["cold_tav"], symmetric_kl(torch.cat(all_qualities), torch.cat(all_scores)))
         torch.testing.assert_close(parts["cold"], sum(parts["cold_" + m] for m in (*MODALITIES, "tav")))
         self.assertEqual(len(errors["t"]), 6)
 
@@ -152,8 +153,14 @@ class SDTCOLDTests(unittest.TestCase):
         first, second = model(*self.inputs), model(*self.inputs)
         torch.testing.assert_close(first["logits"], second["logits"], rtol=0, atol=0)
         norms = first["variance_norm"]
-        torch.testing.assert_close(first["reliability"], norms / norms.sum(dim=-1, keepdim=True))
-        torch.testing.assert_close(first["error_scores"], 1 / (norms + 1e-8))
+        confidence = 1 / (norms + 1e-8)
+        torch.testing.assert_close(first["confidence"], confidence)
+        torch.testing.assert_close(first["error_scores"], confidence)
+        torch.testing.assert_close(first["reliability_logits"], -(norms + 1e-8).log())
+        torch.testing.assert_close(first["reliability"], confidence / confidence.sum(dim=-1, keepdim=True))
+        largest_variance = norms.argmax(dim=-1)
+        smallest_reliability = first["reliability"].argmin(dim=-1)
+        torch.testing.assert_close(largest_variance, smallest_reliability)
 
     def test_empty_masks_and_singleton_cross_modal_loss(self):
         output = self.model()(*self.inputs)
@@ -174,7 +181,7 @@ class SDTCOLDTests(unittest.TestCase):
         expected = sum(torch.distributions.kl_divergence(
             torch.distributions.Normal(output["distributions"][m]["mu"][valid],
                                        (0.5 * output["distributions"][m]["logvar"][valid]).exp()),
-            torch.distributions.Normal(0.0, 1.0)).sum(dim=-1).mean() for m in MODALITIES)
+            torch.distributions.Normal(0.0, 1.0)).mean() for m in MODALITIES)
         torch.testing.assert_close(parts["reg"], expected)
 
     def test_baseline_and_encoder_match_original_sdt(self):

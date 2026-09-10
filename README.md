@@ -34,7 +34,8 @@ eval:  z_m = mu_m
 student_logits_m = student_m(z_m)
 v_m = ||variance_m||_2
 s_m = 1 / (v_m + eps)
-r_m = v_m / (v_T + v_A + v_V)
+reliability_logit_m = -log(v_m + eps)
+r_m = s_m / (s_T + s_A + s_V)
 ```
 
 `H'`, `mu`, `logvar`, `z` có shape `[batch, sequence, hidden_dim]`.
@@ -51,11 +52,11 @@ Gate trong SDT nguồn có trọng số **theo từng chiều feature**, shape
 `r_m` trên hidden dimension. Code dùng `softmax(W*H' + log(r))` để tính `g_bar`
 ổn định hơn, tương đương phép nhân rồi chuẩn hóa trong hướng dẫn.
 
-**Quy ước variance được giữ đúng như đề xuất:** `softmax(CE)` được ghép với
-`softmax(1/||variance||)`, còn reliability fusion tỷ lệ thuận với
-`||variance||`. Vì vậy variance norm lớn được dùng như reliability cao trong
-triển khai này. Không diễn giải nó theo quy ước thông thường “variance lớn là
-uncertainty cao”, và không đổi fusion sang inverse variance.
+Quan hệ trong implementation được chỉnh theo cùng một chiều ngữ nghĩa:
+`prediction error cao → variance cao → reliability thấp → fusion weight thấp`.
+COLD ghép prediction quality `-CE` với reliability logit `-log(v + eps)`.
+Softmax của reliability logit tạo xác suất tỷ lệ với `1/(v + eps)`, nhưng ổn
+định hơn việc đưa trực tiếp reciprocal vào softmax.
 
 ## Loss và những lựa chọn cần ghi lại khi làm thí nghiệm
 
@@ -64,11 +65,12 @@ tính CE, softmax COLD và Gaussian regularizer.
 
 ```text
 D_m = cross_entropy(student_logits_m[valid], labels[valid], reduction='none')
-S_m = s_m[valid]
+Q_m = -D_m
+R_m = -log(v_m + eps)
 symKL(x,y) = KL(softmax(x) || softmax(y)) + KL(softmax(y) || softmax(x))
 
-L_CO_m   = symKL(D_m, S_m)
-L_CO_TAV = symKL(cat(D_T,D_A,D_V), cat(S_T,S_A,S_V))
+L_CO_m   = symKL(Q_m, R_m)
+L_CO_TAV = symKL(cat(Q_T,Q_A,Q_V), cat(R_T,R_A,R_V))
 L_COLD   = L_CO_T + L_CO_A + L_CO_V + L_CO_TAV
 
 L_SDT = gamma_1 * CE_teacher
@@ -88,16 +90,18 @@ protocol giống nhau khi so sánh.
 Các chi tiết đề xuất chưa chỉ rõ được triển khai như sau:
 
 1. **`L_reg`:** chọn Gaussian prior KL, vì hướng dẫn chỉ nêu tên regularizer:
-   `L_reg_m = mean_valid[0.5 * sum_hidden(mu² + exp(logvar) - 1 - logvar)]`.
+   `L_reg_m = mean_valid,hidden[0.5 * (mu² + exp(logvar) - 1 - logvar)]`.
    `L_reg` là tổng T/A/V. Đây là giả định triển khai, không khẳng định là
-   regularizer của COLD gốc. Dùng `--lambda-reg 0` để tắt.
+   regularizer của COLD gốc. KL được lấy trung bình cả utterance lẫn latent
+   dimension để giá trị không tăng tỷ lệ với `hidden_dim`. Dùng
+   `--lambda-reg 0` để tắt.
 2. **CE target của COLD:** mặc định `D_m.detach()` để COLD điều chỉnh variance
    theo prediction error; student vẫn học qua CE/KL SDT. Dùng
    `--no-detach-errors` nếu muốn gradient COLD chạy qua cả CE target.
 3. **Chặn logvar:** mặc định `[-8, 8]`; thay bằng `--logvar-min/--logvar-max`.
    `eps=1e-8`. Variance norm và reciprocal được tính bằng float32.
 4. **Trọng số:** `gamma_1=gamma_2=gamma_3=1`, `lambda_co=0.1`,
-   `lambda_reg=0.0001` là cấu hình khởi đầu, chưa được tuning.
+   `lambda_reg=0.1` là cấu hình khởi đầu, chưa được tuning.
 
 IEMOCAP giữ class weights của `SDT/train.py` cho các CE của SDT. CE dùng làm
 target COLD luôn **không có class weight** để phản ánh error từng utterance
@@ -189,6 +193,8 @@ Mỗi run lưu:
 
 - `config.json`, `split_ids.json`: cấu hình, đường dẫn dữ liệu, danh sách split.
 - `epoch_metrics.csv`: từng thành phần SDT, COLD T/A/V/TAV, regularizer, Acc/F1.
+- Console và CSV ghi cả COLD/reg thô lẫn `weighted_cold`/`weighted_reg`
+  thực sự được cộng vào total loss.
 - `best_checkpoint.pt`: model state, model config và metadata chọn epoch.
 - `test_metrics.json`, `summary.json`, `classification_report.json`,
   `confusion_matrix.json`.

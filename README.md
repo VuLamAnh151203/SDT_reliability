@@ -1,0 +1,255 @@
+# SDT_new: SDT + TAV COLD
+
+Triển khai theo hướng dẫn được cung cấp: giữ encoder SDT, thêm Gaussian distribution
+head sau mỗi enhanced representation, dùng lại ba student classifier, và đưa
+reliability vào multimodal fusion. Variant B (`guided`) là mặc định.
+
+Code encoder/classifier được tách từ `../SDT/model.py`, nhánh
+`appraisal_mode='none'`. `ORIGIN.txt` ghi SHA256 của file nguồn tại thời điểm tách.
+Thư mục này tự chứa code cần chạy; dữ liệu có thể dùng chung với `../SDT/data/`.
+
+## Những phần giữ nguyên
+
+- Temporal convolution cho text/audio/visual; position và speaker embeddings.
+- Chín intra/inter-modal transformer và chín unimodal gate.
+- Ba phép giảm chiều tạo `H'_T`, `H'_A`, `H'_V`.
+- Ba student classifier `ReLU → Dropout → Linear` và teacher classifier `Linear`.
+- CE teacher, tổng CE student và tổng KL self-distillation với temperature.
+
+`sdt_backbone.py` chứa các thành phần này. `model.py` bổ sung COLD sau `H'`.
+Không cần appraisal, speech-concept, CSE hoặc spherical router để chạy.
+
+## Distribution, score và hai biến thể fusion
+
+Mỗi modality có hai Linear độc lập:
+
+```text
+mu_m       = Linear_mu(H'_m)
+logvar_m   = clamp(Linear_logvar(H'_m), logvar_min, logvar_max)
+variance_m = exp(logvar_m)
+
+train: z_m = mu_m + exp(0.5 * logvar_m) * epsilon, epsilon ~ N(0,I)
+eval:  z_m = mu_m
+
+student_logits_m = student_m(z_m)
+v_m = ||variance_m||_2
+s_m = 1 / (v_m + eps)
+r_m = v_m / (v_T + v_A + v_V)
+```
+
+`H'`, `mu`, `logvar`, `z` có shape `[batch, sequence, hidden_dim]`.
+`r` có shape `[batch, sequence, 3]`, thứ tự **T, A, V**.
+
+| `--fusion-variant` | Công thức |
+| --- | --- |
+| `replace` — A | `h = sum_m r_m * z_m`; không dùng learned multimodal gate |
+| `guided` — B, mặc định | `g = softmax_m(W * H'_m)`, `g_bar = normalize_m(g * r)`, `h = sum_m g_bar_m * z_m` |
+| `sdt` — đối chứng | SDT deterministic: classifier và learned gate nhận `H'`; không tạo distribution head, COLD/reg bằng 0 |
+
+Gate trong SDT nguồn có trọng số **theo từng chiều feature**, shape
+`[batch, sequence, 3, hidden_dim]`. B giữ đúng cấu trúc này và broadcast scalar
+`r_m` trên hidden dimension. Code dùng `softmax(W*H' + log(r))` để tính `g_bar`
+ổn định hơn, tương đương phép nhân rồi chuẩn hóa trong hướng dẫn.
+
+**Quy ước variance được giữ đúng như đề xuất:** `softmax(CE)` được ghép với
+`softmax(1/||variance||)`, còn reliability fusion tỷ lệ thuận với
+`||variance||`. Vì vậy variance norm lớn được dùng như reliability cao trong
+triển khai này. Không diễn giải nó theo quy ước thông thường “variance lớn là
+uncertainty cao”, và không đổi fusion sang inverse variance.
+
+## Loss và những lựa chọn cần ghi lại khi làm thí nghiệm
+
+Chỉ các utterance có `umask > 0` tham gia loss. Padding bị loại **trước** khi
+tính CE, softmax COLD và Gaussian regularizer.
+
+```text
+D_m = cross_entropy(student_logits_m[valid], labels[valid], reduction='none')
+S_m = s_m[valid]
+symKL(x,y) = KL(softmax(x) || softmax(y)) + KL(softmax(y) || softmax(x))
+
+L_CO_m   = symKL(D_m, S_m)
+L_CO_TAV = symKL(cat(D_T,D_A,D_V), cat(S_T,S_A,S_V))
+L_COLD   = L_CO_T + L_CO_A + L_CO_V + L_CO_TAV
+
+L_SDT = gamma_1 * CE_teacher
+      + gamma_2 * (CE_T + CE_A + CE_V)
+      + gamma_3 * (KL_T + KL_A + KL_V)
+
+L_total = L_SDT + lambda_co * L_COLD + lambda_reg * L_reg
+```
+
+Softmax COLD chạy trên vector **tất cả utterance hợp lệ trong minibatch** của
+mỗi modality. Thành phần TAV chạy trên một vector chiều `3 * N_valid`, theo
+đúng phép concatenate được cung cấp. Không softmax theo class hay chỉ ba
+modality của từng utterance. KL dùng tổng trên support, không chia thêm cho
+`N_valid`. Loss COLD do đó phụ thuộc cách chia minibatch; cần giữ batch size và
+protocol giống nhau khi so sánh.
+
+Các chi tiết đề xuất chưa chỉ rõ được triển khai như sau:
+
+1. **`L_reg`:** chọn Gaussian prior KL, vì hướng dẫn chỉ nêu tên regularizer:
+   `L_reg_m = mean_valid[0.5 * sum_hidden(mu² + exp(logvar) - 1 - logvar)]`.
+   `L_reg` là tổng T/A/V. Đây là giả định triển khai, không khẳng định là
+   regularizer của COLD gốc. Dùng `--lambda-reg 0` để tắt.
+2. **CE target của COLD:** mặc định `D_m.detach()` để COLD điều chỉnh variance
+   theo prediction error; student vẫn học qua CE/KL SDT. Dùng
+   `--no-detach-errors` nếu muốn gradient COLD chạy qua cả CE target.
+3. **Chặn logvar:** mặc định `[-8, 8]`; thay bằng `--logvar-min/--logvar-max`.
+   `eps=1e-8`. Variance norm và reciprocal được tính bằng float32.
+4. **Trọng số:** `gamma_1=gamma_2=gamma_3=1`, `lambda_co=0.1`,
+   `lambda_reg=0.0001` là cấu hình khởi đầu, chưa được tuning.
+
+IEMOCAP giữ class weights của `SDT/train.py` cho các CE của SDT. CE dùng làm
+target COLD luôn **không có class weight** để phản ánh error từng utterance
+theo công thức bạn gửi. `--no-class-weight` tắt class weights của SDT.
+
+Self-distillation giữ hành vi code SDT nguồn: teacher probability **không
+detach**, và KL **không nhân thêm temperature²**. Việc detach CE target COLD
+không thay đổi gradient này.
+
+## Cài đặt và dữ liệu
+
+```bash
+cd SDT_new
+python -m pip install -r requirements.txt
+```
+
+Chương trình lần lượt tìm pickle trong `SDT_new/data/` rồi `../SDT/data/`, hoặc
+dùng đường dẫn chỉ định bởi `--feature-path`. Đường dẫn tương đối chỉ định qua
+CLI được tính từ thư mục hiện tại. Code đọc schema SDT IEMOCAP 12 phần tử và
+MELD 13 phần tử; dùng `videoText`, `videoAudio`, `videoVisual` như SDT nguồn.
+Kích thước input được suy ra từ pickle.
+
+## Chạy
+
+Từ thư mục gốc workspace:
+
+```bash
+# IEMOCAP, Variant B (mặc định)
+bash SDT_new/exec_iemocap.sh
+
+# IEMOCAP, Variant A
+bash SDT_new/exec_iemocap_replace.sh
+
+# SDT deterministic để đối chứng cùng training harness
+bash SDT_new/exec_original_sdt.sh
+
+# MELD, B; thêm --fusion-variant replace để chạy A
+bash SDT_new/exec_meld.sh
+```
+
+Các script nhận thêm tham số ở cuối, ví dụ:
+
+```bash
+bash SDT_new/exec_iemocap.sh --device cuda --gpu-id 0 --seed 2025 --lambda-co 0.05
+```
+
+Trên PowerShell có thể chạy Python trực tiếp:
+
+```powershell
+python SDT_new/train.py --Dataset IEMOCAP --fusion-variant guided --epochs 150
+python SDT_new/train.py --Dataset IEMOCAP --fusion-variant replace --epochs 150
+```
+
+Trong môi trường Windows đã kiểm tra, lệnh `python` đang trỏ tới shim pyenv
+chưa chọn version. Python có sẵn dùng để kiểm tra là 3.11.8; có thể gọi trực tiếp:
+
+```powershell
+& "$env:USERPROFILE\.pyenv\pyenv-win\versions\3.11.8\python.exe" SDT_new/train.py --device cpu
+```
+
+Python này đang dùng PyTorch CPU. Khi train trên GPU, dùng môi trường Python
+có bản PyTorch CUDA tương ứng và truyền `--device cuda`.
+
+Script chạy foreground để hiển thị log và lỗi. Mỗi lần chạy tạo thư mục kết
+quả riêng theo dataset, variant, seed và timestamp trong `SDT_new/results/`.
+Biến môi trường `PYTHON` trong script Bash cho phép chọn Python executable.
+
+## Protocol chọn checkpoint
+
+Mặc định `--selection-protocol test` khớp membership và cách chọn epoch của
+`SDT/train.py`: dùng toàn bộ `trainVid`, không có validation, chọn checkpoint
+có weighted F1 cao nhất trên `testVid`. Do test tham gia chọn epoch, kết quả
+này là **test-selected**, không phải đánh giá trên test độc lập.
+
+Để chọn bằng validation và chỉ đánh giá test sau khi chọn xong:
+
+```bash
+bash SDT_new/exec_iemocap.sh --selection-protocol validation --valid-ratio 0.1
+```
+
+Validation lấy 10% dialogue đầu của `trainVid`, giống cách chia sampler SDT
+khi `valid > 0`; train/validation/test không chồng lặp. Dùng cùng protocol,
+seed và hyperparameter nền cho A, B và đối chứng. Các script chạy một seed
+mỗi lần; có thể gọi lại với `--seed` khác.
+
+## Checkpoint, log và inference
+
+Mỗi run lưu:
+
+- `config.json`, `split_ids.json`: cấu hình, đường dẫn dữ liệu, danh sách split.
+- `epoch_metrics.csv`: từng thành phần SDT, COLD T/A/V/TAV, regularizer, Acc/F1.
+- `best_checkpoint.pt`: model state, model config và metadata chọn epoch.
+- `test_metrics.json`, `summary.json`, `classification_report.json`,
+  `confusion_matrix.json`.
+- `test_predictions.csv`: dialogue/index, label, prediction/probability,
+  prediction student, CE error, variance norm, reliability, gate trung bình
+  theo hidden dimension. Dòng padding không được xuất.
+
+Đánh giá lại checkpoint:
+
+```bash
+python SDT_new/train.py --eval-checkpoint path/to/best_checkpoint.pt --device cpu
+```
+
+Architecture và loss settings được lấy từ checkpoint. Có thể chỉ định
+`--feature-path` mới khi chuyển máy; schema và dialogue split phải khớp.
+Checkpoint dùng để inference/evaluation, chưa cung cấp resume optimizer.
+
+Model `forward` chỉ nhận features/masks/speakers/lengths, **không nhận nhãn**.
+`model.eval()` dùng `z=mu`; không cần CE target hoặc COLD loss khi dự đoán:
+
+```python
+# Chạy trong SDT_new, hoặc thêm thư mục này vào sys.path.
+import torch
+from model import Transformer_Based_Model
+
+checkpoint = torch.load("path/to/best_checkpoint.pt", map_location="cpu", weights_only=True)
+model = Transformer_Based_Model(**checkpoint["model_config"])
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+with torch.no_grad():
+    # text/visual/audio: [L,B,D_m], mask: [B,L], speakers: [B,L,S]
+    output = model(text, visual, audio, mask, speakers, lengths)
+    predictions = output["logits"].argmax(dim=-1)
+    valid_predictions = predictions[mask.bool()]
+```
+
+## Kiểm tra
+
+```bash
+python -m unittest discover -s SDT_new/tests -v
+python SDT_new/train.py --device cpu --epochs 1 --batch-size 2 \
+  --hidden-dim 16 --n-head 2 --num-threads 1 --max-batches 1
+```
+
+Tests kiểm tra công thức KL/fusion, padding, gradient, sampling train/eval,
+Gaussian regularizer, MELD speaker handling và đối chiếu encoder/baseline
+với SDT nguồn khi file đó có mặt. `--max-batches` chỉ dùng kiểm tra luồng chạy;
+kết quả được đánh dấu `smoke_test` và không dùng làm kết quả nghiên cứu.
+
+## Nguồn SDT
+
+Giữ attribution từ README nguồn:
+
+```bibtex
+@article{ma2024sdt,
+  author={Ma, Hui and Wang, Jian and Lin, Hongfei and Zhang, Bo and Zhang, Yijia and Xu, Bo},
+  journal={IEEE Transactions on Multimedia},
+  title={A Transformer-Based Model With Self-Distillation for Multimodal Emotion Recognition in Conversations},
+  year={2024},
+  volume={26},
+  pages={776-788},
+  doi={10.1109/TMM.2023.3271019}
+}
+```

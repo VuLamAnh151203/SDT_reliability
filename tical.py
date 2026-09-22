@@ -12,6 +12,45 @@ import torch.nn as nn
 
 
 MODALITIES = ("t", "a", "v")
+EMOTION_WHEEL_ORDERS = {
+    "IEMOCAP": (0, 4, 3, 5, 1, 2),
+    "MELD": (4, 1, 2, 6, 5, 3, 0),
+}
+
+
+def emotion_wheel_angles(dataset, n_classes, device=None, dtype=torch.float32):
+    """Return class-indexed angles while preserving the semantic wheel order."""
+    if dataset not in EMOTION_WHEEL_ORDERS:
+        raise ValueError("emotion wheel is unavailable for {}".format(dataset))
+    order = EMOTION_WHEEL_ORDERS[dataset]
+    if len(order) != n_classes or sorted(order) != list(range(n_classes)):
+        raise ValueError("emotion wheel order does not match the class count")
+    ordered = torch.arange(n_classes, device=device, dtype=dtype)
+    ordered = ordered * (2.0 * math.pi / n_classes)
+    angles = torch.empty(n_classes, device=device, dtype=dtype)
+    angles[torch.tensor(order, device=device, dtype=torch.long)] = ordered
+    return angles
+
+
+def circular_class_distance_matrix(class_angles):
+    """Pairwise shortest angular distance normalized to [0, 1]."""
+    if class_angles.ndim != 1 or class_angles.numel() < 2:
+        raise ValueError("class_angles must be a 1-D tensor with at least 2 entries")
+    difference = class_angles[:, None] - class_angles[None, :]
+    cosine = torch.cos(difference).clamp(-1.0, 1.0)
+    return torch.acos(cosine) / math.pi
+
+
+def emotion_wheel_prototypes(class_angles, feature_dim, radius=0.75, eps=1e-5):
+    """Embed fixed emotion-wheel prototypes in the first two ball dimensions."""
+    if feature_dim < 2:
+        raise ValueError("emotion-wheel prototypes require at least 2 dimensions")
+    if not math.isfinite(radius) or not 0.0 < radius < 1.0 - eps:
+        raise ValueError("prototype radius must be in (0, 1 - hyp_eps)")
+    prototypes = class_angles.new_zeros(class_angles.numel(), feature_dim)
+    prototypes[:, 0] = radius * torch.cos(class_angles)
+    prototypes[:, 1] = radius * torch.sin(class_angles)
+    return prototypes
 
 
 class HyperbolicProjector(nn.Module):
@@ -55,6 +94,23 @@ def poincare_distance(first, second, eps=1e-5):
     if not torch.isfinite(distance).all():
         raise FloatingPointError("nonfinite hyperbolic distance")
     return distance
+
+
+def hyperbolic_prototype_outputs(features, prototypes, temperature=1.0,
+                                 eps=1e-5):
+    """Return class distances, logits, pseudo-labels, and absolute typicality."""
+    if features.ndim != 2 or prototypes.ndim != 2:
+        raise ValueError("features and prototypes must be two-dimensional")
+    if features.size(-1) != prototypes.size(-1):
+        raise ValueError("features and prototypes must share their final dimension")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("wheel temperature must be finite and positive")
+    distances = poincare_distance(
+        features.unsqueeze(1), prototypes.unsqueeze(0), eps)
+    nearest_distance, pseudo_labels = distances.min(dim=-1)
+    logits = -distances / temperature
+    typicality = torch.exp(-nearest_distance / temperature).clamp(0.0, 1.0)
+    return distances, logits, pseudo_labels, typicality
 
 
 class AnchorBank(nn.Module):
@@ -136,10 +192,35 @@ def compute_typicality(distances, eps=1e-8):
     return typicality
 
 
+def blend_typicality(anchor, prototype, prototype_weight=0.5, eps=1e-8):
+    """Geometrically blend data-driven and fixed-prototype typicality."""
+    if anchor.shape != prototype.shape:
+        raise ValueError("anchor and prototype typicality must have equal shapes")
+    if not math.isfinite(prototype_weight) or not 0.0 <= prototype_weight <= 1.0:
+        raise ValueError("prototype typicality weight must be in [0, 1]")
+    if prototype_weight == 0.0:
+        return anchor
+    if prototype_weight == 1.0:
+        return prototype
+    return (anchor.clamp_min(eps).pow(1.0 - prototype_weight)
+            * prototype.clamp_min(eps).pow(prototype_weight)).clamp(0.0, 1.0)
+
+
 def categorical_label_discrepancy(pseudo_t, pseudo_a, pseudo_v):
     return ((pseudo_t != pseudo_a).float()
             + (pseudo_t != pseudo_v).float()
             + (pseudo_a != pseudo_v).float()) / 3.0
+
+
+def wheel_label_discrepancy(pseudo_t, pseudo_a, pseudo_v,
+                            class_distance_matrix):
+    """Average semantic wheel distance across the three modality pairs."""
+    if class_distance_matrix.ndim != 2 or (
+            class_distance_matrix.size(0) != class_distance_matrix.size(1)):
+        raise ValueError("class distance matrix must be square")
+    return (class_distance_matrix[pseudo_t, pseudo_a]
+            + class_distance_matrix[pseudo_t, pseudo_v]
+            + class_distance_matrix[pseudo_a, pseudo_v]) / 3.0
 
 
 def compute_consistency(tau_t, tau_a, tau_v, label_discrepancy,
@@ -154,8 +235,9 @@ def compute_consistency(tau_t, tau_a, tau_v, label_discrepancy,
     return result
 
 
-def hyp_cpcc_loss(features, pseudo_labels, eps=1e-8, hyp_eps=1e-5):
-    """Minimize 1 - Pearson correlation of geometry and categorical distance."""
+def hyp_cpcc_loss(features, pseudo_labels, eps=1e-8, hyp_eps=1e-5,
+                  class_distance_matrix=None):
+    """Minimize 1 - correlation of geometry and categorical/wheel distance."""
     if features.ndim != 2 or pseudo_labels.ndim != 1:
         raise ValueError("HypCPCC expects [N,D] features and [N] labels")
     if features.size(0) < 2:
@@ -163,7 +245,18 @@ def hyp_cpcc_loss(features, pseudo_labels, eps=1e-8, hyp_eps=1e-5):
     row, column = torch.triu_indices(
         features.size(0), features.size(0), offset=1, device=features.device)
     geometric = poincare_distance(features[row], features[column], hyp_eps)
-    categorical = (pseudo_labels[row] != pseudo_labels[column]).type_as(geometric)
+    if class_distance_matrix is None:
+        categorical = (pseudo_labels[row] != pseudo_labels[column]).type_as(geometric)
+    else:
+        if class_distance_matrix.ndim != 2 or (
+                class_distance_matrix.size(0) != class_distance_matrix.size(1)):
+            raise ValueError("class distance matrix must be square")
+        if pseudo_labels.numel() and (
+                pseudo_labels.min() < 0
+                or pseudo_labels.max() >= class_distance_matrix.size(0)):
+            raise ValueError("labels exceed the class distance matrix")
+        categorical = class_distance_matrix[
+            pseudo_labels[row], pseudo_labels[column]].type_as(geometric)
     geometric = geometric - geometric.mean()
     categorical = categorical - categorical.mean()
     denominator = geometric.square().sum().sqrt() * categorical.square().sum().sqrt()
@@ -179,7 +272,10 @@ class TiCALModule(nn.Module):
     def __init__(self, hidden_dim, hyperbolic_dim, n_classes, anchor_size=2048,
                  anchor_conf_threshold=0.8, hyp_eps=1e-5,
                  typicality_eps=1e-8, consistency_t=0.2,
-                 consistency_k=0.5, detach_tau=True, detach_kappa=True):
+                 consistency_k=0.5, detach_tau=True, detach_kappa=True,
+                 dataset="IEMOCAP", use_emotion_wheel=False,
+                 wheel_prototype_radius=0.75, wheel_temperature=1.0,
+                 wheel_anchor_mix=0.5):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -198,6 +294,25 @@ class TiCALModule(nn.Module):
         self.consistency_k = consistency_k
         self.detach_tau = detach_tau
         self.detach_kappa = detach_kappa
+        self.use_emotion_wheel = bool(use_emotion_wheel)
+        self.wheel_temperature = float(wheel_temperature)
+        self.wheel_anchor_mix = float(wheel_anchor_mix)
+        if self.use_emotion_wheel:
+            if not math.isfinite(self.wheel_temperature) or self.wheel_temperature <= 0:
+                raise ValueError("wheel temperature must be finite and positive")
+            if (not math.isfinite(self.wheel_anchor_mix)
+                    or not 0.0 <= self.wheel_anchor_mix <= 1.0):
+                raise ValueError("wheel anchor mix must be in [0, 1]")
+            wheel_angles = emotion_wheel_angles(dataset, n_classes)
+            self.register_buffer("wheel_angles", wheel_angles)
+            self.register_buffer(
+                "wheel_prototypes",
+                emotion_wheel_prototypes(
+                    wheel_angles, hyperbolic_dim,
+                    wheel_prototype_radius, hyp_eps))
+            self.register_buffer(
+                "wheel_class_distances",
+                circular_class_distance_matrix(wheel_angles))
         self.projectors = nn.ModuleDict({
             name: HyperbolicProjector(hidden_dim, hyperbolic_dim, hyp_eps)
             for name in MODALITIES
@@ -216,21 +331,62 @@ class TiCALModule(nn.Module):
             for name, feature in zip(MODALITIES, pure_features)
         }
         result = {"ready": False, "projected": projected, "distance": None,
-                  "pseudo_labels": None, "tau": None, "label_discrepancy": None,
-                  "kappa": None, "hyp_eps": self.hyp_eps}
+                  "pseudo_labels": None, "anchor_tau": None, "tau": None,
+                  "categorical_discrepancy": None,
+                  "wheel_discrepancy": None, "label_discrepancy": None,
+                  "kappa": None, "hyp_eps": self.hyp_eps,
+                  "wheel_enabled": self.use_emotion_wheel,
+                  "wheel_distances": None, "wheel_logits": None,
+                  "wheel_pseudo_labels": None, "prototype_tau": None,
+                  "wheel_class_distances": (
+                      self.wheel_class_distances
+                      if self.use_emotion_wheel else None)}
         valid = valid_mask.bool()
+        if self.use_emotion_wheel and valid.any():
+            wheel_distances, wheel_logits = {}, {}
+            wheel_pseudo, prototype_tau = {}, {}
+            for name in MODALITIES:
+                (wheel_distances[name], wheel_logits[name],
+                 wheel_pseudo[name], prototype_tau[name]) = (
+                    hyperbolic_prototype_outputs(
+                        projected[name][valid], self.wheel_prototypes,
+                        self.wheel_temperature, self.hyp_eps))
+                if self.detach_tau:
+                    prototype_tau[name] = prototype_tau[name].detach()
+            result.update({
+                "wheel_distances": wheel_distances,
+                "wheel_logits": wheel_logits,
+                "wheel_pseudo_labels": wheel_pseudo,
+                "prototype_tau": prototype_tau,
+            })
         if not query_enabled or not self.banks_ready() or not valid.any():
             return result
 
-        distance, pseudo, tau = {}, {}, {}
+        distance, pseudo, anchor_tau = {}, {}, {}
         for name in MODALITIES:
             distance[name], pseudo[name] = self.anchor_banks[name].query(projected[name][valid])
-            tau[name] = compute_typicality(distance[name], self.typicality_eps)
+            anchor_tau[name] = compute_typicality(
+                distance[name], self.typicality_eps)
             if self.detach_tau:
-                tau[name] = tau[name].detach()
-            assert ((tau[name] >= 0) & (tau[name] <= 1)).all()
-        discrepancy = categorical_label_discrepancy(
+                anchor_tau[name] = anchor_tau[name].detach()
+            assert ((anchor_tau[name] >= 0) & (anchor_tau[name] <= 1)).all()
+        categorical_discrepancy = categorical_label_discrepancy(
             pseudo["t"], pseudo["a"], pseudo["v"])
+        if self.use_emotion_wheel:
+            tau = {
+                name: blend_typicality(
+                    anchor_tau[name], result["prototype_tau"][name],
+                    self.wheel_anchor_mix, self.typicality_eps)
+                for name in MODALITIES
+            }
+            wheel_discrepancy = wheel_label_discrepancy(
+                pseudo["t"], pseudo["a"], pseudo["v"],
+                self.wheel_class_distances)
+            discrepancy = wheel_discrepancy
+        else:
+            tau = anchor_tau
+            wheel_discrepancy = None
+            discrepancy = categorical_discrepancy
         kappa = compute_consistency(
             tau["t"], tau["a"], tau["v"], discrepancy,
             self.consistency_t, self.consistency_k, self.typicality_eps)
@@ -239,7 +395,10 @@ class TiCALModule(nn.Module):
         assert ((kappa >= 0) & (kappa <= 1)).all()
         assert torch.isfinite(kappa).all()
         result.update({"ready": True, "distance": distance,
-                       "pseudo_labels": pseudo, "tau": tau,
+                       "pseudo_labels": pseudo, "anchor_tau": anchor_tau,
+                       "tau": tau,
+                       "categorical_discrepancy": categorical_discrepancy,
+                       "wheel_discrepancy": wheel_discrepancy,
                        "label_discrepancy": discrepancy, "kappa": kappa})
         return result
 

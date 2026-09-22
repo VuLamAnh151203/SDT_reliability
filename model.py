@@ -77,7 +77,9 @@ class Transformer_Based_Model(SDTBackbone):
                  anchor_conf_threshold=0.8, hyperbolic_dim=128,
                  hyp_eps=1e-5, typicality_eps=1e-8,
                  consistency_t=0.2, consistency_k=0.5,
-                 detach_tau=True, detach_kappa=True, beta_gate=1.0):
+                 detach_tau=True, detach_kappa=True, beta_gate=1.0,
+                 use_emotion_wheel=False, wheel_prototype_radius=0.75,
+                 wheel_temperature=1.0, wheel_anchor_mix=0.5):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -90,6 +92,8 @@ class Transformer_Based_Model(SDTBackbone):
             raise ValueError("unknown tical_mode: {}".format(tical_mode))
         if use_tical and fusion_variant != "sdt":
             raise ValueError("TiCAL must use --fusion-variant sdt; COLD cannot run with TiCAL")
+        if use_emotion_wheel and not use_tical:
+            raise ValueError("emotion wheel requires TiCAL")
         if tical_warmup_epochs < 0 or not math.isfinite(beta_gate) or beta_gate < 0:
             raise ValueError("TiCAL warmup and beta_gate must be nonnegative")
         if TICAL_MODALITIES != MODALITIES:
@@ -104,12 +108,15 @@ class Transformer_Based_Model(SDTBackbone):
         self.tical_mode = tical_mode
         self.tical_warmup_epochs = tical_warmup_epochs
         self.beta_gate = beta_gate
+        self.use_emotion_wheel = bool(use_emotion_wheel)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
                 hidden_dim, hyperbolic_dim, n_classes, anchor_size,
                 anchor_conf_threshold, hyp_eps, typicality_eps,
-                consistency_t, consistency_k, detach_tau, detach_kappa)
+                consistency_t, consistency_k, detach_tau, detach_kappa,
+                dataset, use_emotion_wheel, wheel_prototype_radius,
+                wheel_temperature, wheel_anchor_mix)
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(

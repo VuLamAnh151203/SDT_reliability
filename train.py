@@ -46,6 +46,14 @@ def build_parser():
     parser.add_argument("--no-detach-kappa", action="store_true")
     parser.add_argument("--beta-gate", type=float, default=1.0)
     parser.add_argument("--lambda-hyp", type=float, default=0.1)
+    parser.add_argument("--use-emotion-wheel", action="store_true",
+                        help="constrain TiCAL with fixed hyperbolic emotion-wheel prototypes")
+    parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
+    parser.add_argument("--wheel-temperature", type=float, default=1.0)
+    parser.add_argument("--wheel-anchor-mix", type=float, default=0.5,
+                        help="0=anchor typicality, 1=prototype typicality")
+    parser.add_argument("--lambda-wheel-proto", type=float, default=0.0)
+    parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=1024)
@@ -131,7 +139,11 @@ def make_model_config(args, dataset):
             "consistency_k": args.consistency_k,
             "detach_tau": not args.no_detach_tau,
             "detach_kappa": not args.no_detach_kappa,
-            "beta_gate": args.beta_gate}
+            "beta_gate": args.beta_gate,
+            "use_emotion_wheel": args.use_emotion_wheel,
+            "wheel_prototype_radius": args.wheel_prototype_radius,
+            "wheel_temperature": args.wheel_temperature,
+            "wheel_anchor_mix": args.wheel_anchor_mix}
 
 
 def make_criterion(args, device):
@@ -143,7 +155,8 @@ def make_criterion(args, device):
                        args.lambda_co, args.lambda_reg, not args.no_detach_errors,
                        args.lambda_reliability,
                        args.tical_mode if args.use_tical else None,
-                       args.lambda_hyp).to(device)
+                       args.lambda_hyp, args.lambda_wheel_proto,
+                       args.lambda_wheel_cpcc).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -153,7 +166,21 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
     for name in MODALITIES:
         storage["tau_" + name].append(tical["tau"][name].detach().cpu())
         storage["pseudo_" + name].append(tical["pseudo_labels"][name].detach().cpu())
+        if tical.get("anchor_tau") is not None:
+            storage["anchor_tau_" + name].append(
+                tical["anchor_tau"][name].detach().cpu())
+        if tical.get("prototype_tau") is not None:
+            storage["prototype_tau_" + name].append(
+                tical["prototype_tau"][name].detach().cpu())
+        if tical.get("wheel_pseudo_labels") is not None:
+            storage["wheel_pseudo_" + name].append(
+                tical["wheel_pseudo_labels"][name].detach().cpu())
     storage["kappa"].append(tical["kappa"].detach().cpu())
+    storage["categorical_discrepancy"].append(
+        tical["categorical_discrepancy"].detach().cpu())
+    if tical.get("wheel_discrepancy") is not None:
+        storage["wheel_discrepancy"].append(
+            tical["wheel_discrepancy"].detach().cpu())
     storage["correct"].append(prediction[valid].eq(labels[valid]).detach().cpu())
 
 
@@ -168,6 +195,13 @@ def _tical_epoch_metrics(storage, model, utterance_count):
     for name in MODALITIES:
         for statistic in ("mean", "std", "q05", "q50", "q95"):
             result["tau_{}_{}".format(name, statistic)] = 0.0
+        if getattr(model, "use_emotion_wheel", False):
+            result["anchor_tau_{}_mean".format(name)] = 0.0
+            result["prototype_tau_{}_mean".format(name)] = 0.0
+            result["wheel_pseudo_{}_anchor_agreement".format(name)] = 0.0
+    if getattr(model, "use_emotion_wheel", False):
+        result["categorical_discrepancy_mean"] = 0.0
+        result["wheel_discrepancy_mean"] = 0.0
     for group in ("low", "medium", "high"):
         result["kappa_{}_frac".format(group)] = 0.0
         result["kappa_{}_accuracy".format(group)] = 0.0
@@ -191,6 +225,19 @@ def _tical_epoch_metrics(storage, model, utterance_count):
             "tau_{}_q50".format(name): torch.quantile(tau, 0.50).item(),
             "tau_{}_q95".format(name): torch.quantile(tau, 0.95).item(),
         })
+        if getattr(model, "use_emotion_wheel", False):
+            result["anchor_tau_{}_mean".format(name)] = values[
+                "anchor_tau_" + name].float().mean().item()
+            result["prototype_tau_{}_mean".format(name)] = values[
+                "prototype_tau_" + name].float().mean().item()
+            result["wheel_pseudo_{}_anchor_agreement".format(name)] = (
+                values["wheel_pseudo_" + name]
+                .eq(values["pseudo_" + name]).float().mean().item())
+    if getattr(model, "use_emotion_wheel", False):
+        result["categorical_discrepancy_mean"] = values[
+            "categorical_discrepancy"].float().mean().item()
+        result["wheel_discrepancy_mean"] = values[
+            "wheel_discrepancy"].float().mean().item()
     pseudo_t, pseudo_a, pseudo_v = (values["pseudo_" + name] for name in MODALITIES)
     result.update({
         "agreement_ta": pseudo_t.eq(pseudo_a).float().mean().item(),
@@ -225,7 +272,12 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     totals, true, predicted, rows = {}, [], [], []
     tical_storage = {"tau_" + name: [] for name in MODALITIES}
     tical_storage.update({"pseudo_" + name: [] for name in MODALITIES})
-    tical_storage.update({"kappa": [], "correct": [], "anchors_added": 0})
+    tical_storage.update({"anchor_tau_" + name: [] for name in MODALITIES})
+    tical_storage.update({"prototype_tau_" + name: [] for name in MODALITIES})
+    tical_storage.update({"wheel_pseudo_" + name: [] for name in MODALITIES})
+    tical_storage.update({"kappa": [], "correct": [],
+                          "categorical_discrepancy": [],
+                          "wheel_discrepancy": [], "anchors_added": 0})
     count = 0
     with torch.set_grad_enabled(training):
         for batch_index, batch in enumerate(loader):
@@ -293,8 +345,23 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
         tical = {
             "kappa": tical["kappa"].detach().cpu(),
             "label_discrepancy": tical["label_discrepancy"].detach().cpu(),
+            "categorical_discrepancy": tical[
+                "categorical_discrepancy"].detach().cpu(),
+            "wheel_discrepancy": (
+                tical["wheel_discrepancy"].detach().cpu()
+                if tical.get("wheel_discrepancy") is not None else None),
             "tau": {m: tical["tau"][m].detach().cpu() for m in MODALITIES},
+            "anchor_tau": {
+                m: tical["anchor_tau"][m].detach().cpu() for m in MODALITIES},
+            "prototype_tau": (
+                {m: tical["prototype_tau"][m].detach().cpu()
+                 for m in MODALITIES}
+                if tical.get("prototype_tau") is not None else None),
             "pseudo": {m: tical["pseudo_labels"][m].detach().cpu() for m in MODALITIES},
+            "wheel_pseudo": (
+                {m: tical["wheel_pseudo_labels"][m].detach().cpu()
+                 for m in MODALITIES}
+                if tical.get("wheel_pseudo_labels") is not None else None),
         }
     offset = 0
     rows = []
@@ -305,13 +372,27 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
             if tical_ready:
                 row["kappa"] = float(tical["kappa"][offset])
                 row["label_discrepancy"] = float(tical["label_discrepancy"][offset])
+                row["categorical_discrepancy"] = float(
+                    tical["categorical_discrepancy"][offset])
+                if tical["wheel_discrepancy"] is not None:
+                    row["wheel_discrepancy"] = float(
+                        tical["wheel_discrepancy"][offset])
             row.update({"prob_{}".format(c): float(p) for c, p in enumerate(probabilities[batch_index, index])})
             for modal_index, name in enumerate(MODALITIES):
                 row[name + "_prediction"] = int(students[name][batch_index, index])
                 row[name + "_gate_mean"] = float(gate[batch_index, index, modal_index])
                 if tical_ready:
                     row[name + "_tau"] = float(tical["tau"][name][offset])
-                    row[name + "_pseudo_label"] = int(tical["pseudo"][name][offset])
+                    row[name + "_anchor_tau"] = float(
+                        tical["anchor_tau"][name][offset])
+                    row[name + "_pseudo_label"] = int(
+                        tical["pseudo"][name][offset])
+                    if tical["prototype_tau"] is not None:
+                        row[name + "_prototype_tau"] = float(
+                            tical["prototype_tau"][name][offset])
+                    if tical["wheel_pseudo"] is not None:
+                        row[name + "_wheel_pseudo_label"] = int(
+                            tical["wheel_pseudo"][name][offset])
                 if reliability is not None:
                     row[name + "_reliability"] = float(reliability[batch_index, index, modal_index])
                 if variance_norm is not None:
@@ -360,7 +441,8 @@ def main(argv=None):
     if (args.tical_warmup_epochs < 0 or args.anchor_size < 1
             or args.hyperbolic_dim < 1 or args.lambda_hyp < 0
             or args.beta_gate < 0 or args.consistency_t < 0
-            or args.consistency_k < 0):
+            or args.consistency_k < 0 or args.lambda_wheel_proto < 0
+            or args.lambda_wheel_cpcc < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
     if not 0 <= args.anchor_conf_threshold <= 1:
         raise ValueError("--anchor-conf-threshold must be in [0,1]")
@@ -373,6 +455,20 @@ def main(argv=None):
         raise ValueError("--oof-reliability-targets requires --fusion-variant oof-guided")
     if args.use_tical and args.fusion_variant != "sdt":
         raise ValueError("--use-tical requires --fusion-variant sdt (COLD is disabled)")
+    if args.use_emotion_wheel and not args.use_tical:
+        raise ValueError("--use-emotion-wheel requires --use-tical")
+    if not args.use_emotion_wheel and (
+            args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0):
+        raise ValueError("wheel loss weights require --use-emotion-wheel")
+    if args.use_emotion_wheel:
+        if args.hyperbolic_dim < 2:
+            raise ValueError("emotion wheel requires --hyperbolic-dim >= 2")
+        if not 0 < args.wheel_prototype_radius < 1 - args.hyp_eps:
+            raise ValueError("--wheel-prototype-radius must be in (0, 1-hyp-eps)")
+        if args.wheel_temperature <= 0:
+            raise ValueError("--wheel-temperature must be positive")
+        if not 0 <= args.wheel_anchor_mix <= 1:
+            raise ValueError("--wheel-anchor-mix must be in [0,1]")
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
     seed_everything(args.seed)
@@ -386,7 +482,9 @@ def main(argv=None):
                      "initial_logvar", "use_tical", "tical_mode",
                      "tical_warmup_epochs", "anchor_size", "anchor_conf_threshold",
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
-                     "consistency_t", "consistency_k", "beta_gate"):
+                     "consistency_t", "consistency_k", "beta_gate",
+                     "use_emotion_wheel", "wheel_prototype_radius",
+                     "wheel_temperature", "wheel_anchor_mix"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -394,7 +492,10 @@ def main(argv=None):
                      "lambda_reliability", "modality_prune_quantile",
                      "sample_prune_quantile", "disagreement_weight", "sample_prune_any",
                      "oof_reliability_targets", "tical_mode", "lambda_hyp",
-                     "no_detach_tau", "no_detach_kappa"):
+                     "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
+                     "wheel_prototype_radius", "wheel_temperature",
+                     "wheel_anchor_mix", "lambda_wheel_proto",
+                     "lambda_wheel_cpcc"):
             if name in checkpoint["args"]:
                 setattr(args, name, checkpoint["args"][name])
         if args.feature_path is None:
@@ -424,6 +525,8 @@ def main(argv=None):
         init_tag = "no_distribution"
     method_tag = ("tical_" + model_config["tical_mode"]
                   if model_config.get("use_tical") else model_config["fusion_variant"])
+    if model_config.get("use_emotion_wheel"):
+        method_tag += "_wheel"
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
@@ -475,10 +578,13 @@ def main(argv=None):
         if args.use_tical:
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
+                  "wheel(proto/cpcc)={:.4f}/{:.4f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
                 selected_metrics["weighted_f1"], train_metrics["original_distillation"],
                 train_metrics["ca_distillation"], train_metrics["weighted_hyp"],
+                train_metrics["weighted_wheel_proto"],
+                train_metrics["weighted_wheel_cpcc"],
                 train_metrics.get("kappa_mean", 0.0), train_metrics["tical_ready_rate"],
                 train_metrics["anchor_t_size"], train_metrics["anchor_a_size"],
                 train_metrics["anchor_v_size"], row["seconds"]), flush=True)

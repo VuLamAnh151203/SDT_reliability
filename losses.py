@@ -131,10 +131,12 @@ class SDTCOLDLoss(nn.Module):
     def __init__(self, class_weights=None, gamma_1=1.0, gamma_2=1.0,
                  gamma_3=1.0, lambda_co=0.1, lambda_reg=0.1,
                  detach_errors=True, lambda_reliability=1.0,
-                 tical_mode=None, lambda_hyp=0.1):
+                 tical_mode=None, lambda_hyp=0.1,
+                 lambda_wheel_proto=0.0, lambda_wheel_cpcc=0.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
-                   lambda_reliability, lambda_hyp)
+                   lambda_reliability, lambda_hyp, lambda_wheel_proto,
+                   lambda_wheel_cpcc)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -144,6 +146,8 @@ class SDTCOLDLoss(nn.Module):
             raise ValueError("unknown TiCAL loss mode: {}".format(tical_mode))
         self.tical_mode = tical_mode
         self.lambda_hyp = lambda_hyp
+        self.lambda_wheel_proto = lambda_wheel_proto
+        self.lambda_wheel_cpcc = lambda_wheel_cpcc
         self.ce = MaskedNLLLoss(class_weights)
         self.kl = MaskedKLDivLoss()
         self.cold = COLDLoss(detach_errors=detach_errors)
@@ -151,6 +155,8 @@ class SDTCOLDLoss(nn.Module):
     def forward(self, outputs, labels, valid_mask, reliability_targets=None,
                 sample_keep_mask=None, modality_keep_mask=None):
         targets = labels.reshape(-1)
+        valid = valid_mask.bool()
+        zero = outputs["logits"][valid].sum() * 0.0
         n_classes = outputs["logits"].size(-1)
         if sample_keep_mask is None and modality_keep_mask is None:
             task = self.ce(outputs["log_prob"].reshape(-1, n_classes), targets, valid_mask)
@@ -197,7 +203,6 @@ class SDTCOLDLoss(nn.Module):
         cold_parts, errors = self.cold(outputs, labels, valid_mask)
         weighted_cold = self.lambda_co * cold_parts["cold"]
         weighted_reg = self.lambda_reg * cold_parts["reg"]
-        zero = outputs["logits"][valid_mask.bool()].sum() * 0.0
         reliability = zero
         if reliability_targets is not None:
             if outputs["reliability_logits"] is None:
@@ -216,9 +221,35 @@ class SDTCOLDLoss(nn.Module):
                 hyp_eps=tical_output["hyp_eps"])
                 for name in MODALITIES) / len(MODALITIES)
         weighted_hyp = self.lambda_hyp * hyp
+        wheel_proto = zero
+        wheel_cpcc = zero
+        wheel_ready = bool(
+            tical_output is not None
+            and tical_output.get("wheel_enabled", False)
+            and tical_output.get("wheel_logits") is not None
+        )
+        if wheel_ready:
+            valid_targets = labels[valid]
+            wheel_proto = sum(
+                F.cross_entropy(
+                    tical_output["wheel_logits"][name], valid_targets)
+                for name in MODALITIES
+            ) / len(MODALITIES)
+            class_distances = tical_output["wheel_class_distances"]
+            wheel_cpcc = sum(
+                hyp_cpcc_loss(
+                    tical_output["projected"][name][valid],
+                    valid_targets,
+                    hyp_eps=tical_output["hyp_eps"],
+                    class_distance_matrix=class_distances,
+                )
+                for name in MODALITIES
+            ) / len(MODALITIES)
+        weighted_wheel_proto = self.lambda_wheel_proto * wheel_proto
+        weighted_wheel_cpcc = self.lambda_wheel_cpcc * wheel_cpcc
         total = (sdt + weighted_cold + weighted_reg
-                 + weighted_reliability + weighted_hyp)
-        valid = valid_mask.bool()
+                 + weighted_reliability + weighted_hyp
+                 + weighted_wheel_proto + weighted_wheel_cpcc)
         sample_keep_rate = (torch.ones((), device=total.device) if sample_keep_mask is None
                             else sample_keep_mask[valid].float().mean())
         modality_keep_rate = (torch.ones((), device=total.device) if modality_keep_mask is None
@@ -227,6 +258,10 @@ class SDTCOLDLoss(nn.Module):
                  "distillation": kd, "original_distillation": original_kd,
                  "ca_distillation": ca_kd, "hyp": hyp,
                  "weighted_hyp": weighted_hyp, **cold_parts,
+                 "wheel_proto": wheel_proto,
+                 "weighted_wheel_proto": weighted_wheel_proto,
+                 "wheel_cpcc": wheel_cpcc,
+                 "weighted_wheel_cpcc": weighted_wheel_cpcc,
                  "weighted_cold": weighted_cold, "weighted_reg": weighted_reg,
                  "reliability_loss": reliability,
                  "weighted_reliability": weighted_reliability,

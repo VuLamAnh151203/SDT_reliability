@@ -1,5 +1,36 @@
 # SDT_new: SDT + COLD + TiCAL
 
+## Chạy SDT + TiCAL + Emotion Wheel
+
+```bash
+bash SDT_new/exec_iemocap_tical_wheel.sh --device cuda --gpu-id 0
+```
+
+Script này chạy `TICAL_MODE=full`, giữ SDT deterministic và thêm các ràng buộc
+emotion wheel trong Poincaré ball:
+
+- prototype cố định theo thứ tự
+  `happy -> excited -> angry -> frustrated -> sad -> neutral`;
+- prototype CE kéo pure feature về emotion đúng;
+- wheel CPCC khớp khoảng cách hyperbolic với circular class distance;
+- typicality dùng geometric blend giữa nearest anchor và nearest prototype;
+- modality disagreement dùng circular distance thay vì chỉ báo khác/giống class.
+
+Cấu hình mặc định của script:
+
+```text
+hyperbolic_dim          = 2
+wheel_prototype_radius  = 0.75
+wheel_temperature       = 1.0
+wheel_anchor_mix        = 0.5
+lambda_wheel_proto      = 0.1
+lambda_wheel_cpcc       = 0.05
+```
+
+Kế hoạch, công thức và checklist kiểm thử nằm trong
+`KE_HOACH_SDT_TICAL_EMOTION_WHEEL.md`. Các mode TiCAL cũ không đổi khi không
+truyền `--use-emotion-wheel`.
+
 ## Chạy SDT + TiCAL (không dùng COLD)
 
 Script riêng:

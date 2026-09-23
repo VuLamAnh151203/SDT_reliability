@@ -117,15 +117,20 @@ class AnchorBank(nn.Module):
     """A bounded FIFO bank of detached hyperbolic features and class labels."""
 
     def __init__(self, feature_dim, n_classes, max_size, eps=1e-5,
-                 query_chunk_size=256):
+                 query_chunk_size=256, balance_mode="none"):
         super().__init__()
         if max_size < 1 or query_chunk_size < 1:
             raise ValueError("anchor size and query chunk size must be positive")
+        if balance_mode not in ("none", "equal"):
+            raise ValueError("anchor balance mode must be 'none' or 'equal'")
+        if balance_mode == "equal" and max_size < n_classes:
+            raise ValueError("equal anchor balance requires at least one slot per class")
         self.feature_dim = feature_dim
         self.n_classes = n_classes
         self.max_size = max_size
         self.eps = eps
         self.query_chunk_size = query_chunk_size
+        self.balance_mode = balance_mode
         self.register_buffer("features", torch.empty(0, feature_dim))
         self.register_buffer("labels", torch.empty(0, dtype=torch.long))
 
@@ -158,8 +163,24 @@ class AnchorBank(nn.Module):
             raise ValueError("anchor features must be finite")
         if (labels < 0).any() or (labels >= self.n_classes).any():
             raise ValueError("anchor labels are outside the class range")
-        self.features = torch.cat((self.features, features), dim=0)[-self.max_size:]
-        self.labels = torch.cat((self.labels, labels), dim=0)[-self.max_size:]
+        combined_features = torch.cat((self.features, features), dim=0)
+        combined_labels = torch.cat((self.labels, labels), dim=0)
+        if self.balance_mode == "none":
+            self.features = combined_features[-self.max_size:]
+            self.labels = combined_labels[-self.max_size:]
+            return
+
+        base, remainder = divmod(self.max_size, self.n_classes)
+        retained_features, retained_labels = [], []
+        for class_index in range(self.n_classes):
+            capacity = base + int(class_index < remainder)
+            class_indices = combined_labels.eq(class_index).nonzero(
+                as_tuple=False).flatten()[-capacity:]
+            if class_indices.numel():
+                retained_features.append(combined_features[class_indices])
+                retained_labels.append(combined_labels[class_indices])
+        self.features = torch.cat(retained_features, dim=0)
+        self.labels = torch.cat(retained_labels, dim=0)
 
     def query(self, features):
         if self.size == 0:
@@ -275,7 +296,7 @@ class TiCALModule(nn.Module):
                  consistency_k=0.5, detach_tau=True, detach_kappa=True,
                  dataset="IEMOCAP", use_emotion_wheel=False,
                  wheel_prototype_radius=0.75, wheel_temperature=1.0,
-                 wheel_anchor_mix=0.5):
+                 wheel_anchor_mix=0.5, anchor_balance="none"):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -318,7 +339,9 @@ class TiCALModule(nn.Module):
             for name in MODALITIES
         })
         self.anchor_banks = nn.ModuleDict({
-            name: AnchorBank(hyperbolic_dim, n_classes, anchor_size, hyp_eps)
+            name: AnchorBank(
+                hyperbolic_dim, n_classes, anchor_size, hyp_eps,
+                balance_mode=anchor_balance)
             for name in MODALITIES
         })
 

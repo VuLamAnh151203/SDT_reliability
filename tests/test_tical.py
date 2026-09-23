@@ -52,6 +52,33 @@ class TiCALTests(unittest.TestCase):
         self.assertEqual(nearest.item(), 1)
         self.assertTrue(torch.isfinite(distance).all())
 
+    def test_equal_anchor_balance_preserves_rare_classes_and_class_fifo(self):
+        bank = AnchorBank(
+            2, n_classes=3, max_size=6, balance_mode="equal")
+        bank.update(
+            torch.tensor([[0.10, 0.0], [0.20, 0.0], [0.30, 0.0]]),
+            torch.tensor([0, 1, 2]))
+        bank.update(
+            torch.tensor([[0.40, 0.0], [0.50, 0.0], [0.60, 0.0],
+                          [0.70, 0.0]]),
+            torch.zeros(4, dtype=torch.long))
+        torch.testing.assert_close(
+            bank.class_counts(), torch.tensor([2, 1, 1]))
+        class_zero = bank.features[bank.labels.eq(0), 0]
+        torch.testing.assert_close(class_zero, torch.tensor([0.60, 0.70]))
+        _, nearest = bank.query(torch.tensor([[0.30, 0.0]]))
+        self.assertEqual(nearest.item(), 2)
+
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, anchor_size=12,
+            hyperbolic_dim=4, anchor_balance="equal")
+        self.assertTrue(all(
+            anchor.balance_mode == "equal"
+            for anchor in model.tical.anchor_banks.values()))
+
+        with self.assertRaises(ValueError):
+            AnchorBank(2, n_classes=3, max_size=2, balance_mode="equal")
+
     def test_consistency_orders_guideline_sanity_cases(self):
         high = compute_consistency(*(torch.tensor([0.9]) for _ in range(3)),
                                    torch.tensor([0.0]))

@@ -82,6 +82,11 @@ bash SDT_new/exec_iemocap_tical.sh \
   --consistency-t 0.2 --consistency-k 0.5
 ```
 
+Anchor bank mặc định là global FIFO (`--anchor-balance none`). Với dữ liệu mất
+cân bằng như MELD, `--anchor-balance equal` chia tổng `anchor-size` thành FIFO
+riêng có quota gần bằng nhau cho từng lớp. Query nearest-anchor và điều kiện
+teacher đúng/confident không đổi, nên có thể ablate riêng tác dụng của balancing.
+
 Mỗi epoch ghi đầy đủ vào `epoch_metrics.csv`: kích thước và số anchor mỗi class,
 agreement T/A/T/V/A/V/T=A=V, mean/std/q05/q50/q95 của từng `tau`, phân phối
 `kappa`, tỷ lệ ba nhóm consistency, accuracy từng nhóm, original KL,

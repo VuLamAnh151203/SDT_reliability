@@ -36,6 +36,8 @@ def build_parser():
                         default="kd", help="incremental TiCAL ablation")
     parser.add_argument("--tical-warmup-epochs", type=int, default=5)
     parser.add_argument("--anchor-size", type=int, default=2048)
+    parser.add_argument("--anchor-balance", choices=("none", "equal"), default="none",
+                        help="none=global FIFO; equal=separate equal-capacity FIFO per class")
     parser.add_argument("--anchor-conf-threshold", type=float, default=0.8)
     parser.add_argument("--hyperbolic-dim", type=int, default=128)
     parser.add_argument("--hyp-eps", type=float, default=1e-5)
@@ -132,6 +134,7 @@ def make_model_config(args, dataset):
             "tical_mode": args.tical_mode,
             "tical_warmup_epochs": args.tical_warmup_epochs,
             "anchor_size": args.anchor_size,
+            "anchor_balance": args.anchor_balance,
             "anchor_conf_threshold": args.anchor_conf_threshold,
             "hyperbolic_dim": args.hyperbolic_dim, "hyp_eps": args.hyp_eps,
             "typicality_eps": args.typicality_eps,
@@ -480,7 +483,8 @@ def main(argv=None):
         for name in ("temp", "n_head", "hidden_dim", "dropout", "fusion_variant",
                      "logvar_min", "logvar_max", "cold_eps", "distribution_init",
                      "initial_logvar", "use_tical", "tical_mode",
-                     "tical_warmup_epochs", "anchor_size", "anchor_conf_threshold",
+                     "tical_warmup_epochs", "anchor_size", "anchor_balance",
+                     "anchor_conf_threshold",
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
@@ -525,6 +529,9 @@ def main(argv=None):
         init_tag = "no_distribution"
     method_tag = ("tical_" + model_config["tical_mode"]
                   if model_config.get("use_tical") else model_config["fusion_variant"])
+    if (model_config.get("use_tical")
+            and model_config.get("anchor_balance", "none") != "none"):
+        method_tag += "_anchors_" + model_config["anchor_balance"]
     if model_config.get("use_emotion_wheel"):
         method_tag += "_wheel"
     run_name = "{}_{}_{}_seed{}_{}".format(

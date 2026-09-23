@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 exec "${PYTHON:-python}" -u "$SCRIPT_DIR/train.py" \
   --Dataset MELD --fusion-variant sdt \
   --tical-warmup-epochs 5 \
-  --anchor-size 4096 --anchor-conf-threshold 0.8 \
+  --anchor-size 4096 --anchor-balance none --anchor-conf-threshold 0.8 \
   --hyperbolic-dim 16 --hyp-eps 1e-5 --typicality-eps 1e-8 \
   --consistency-t 0.2 --consistency-k 0.5 \
   --beta-gate 1.0 --lambda-hyp 0.1 \

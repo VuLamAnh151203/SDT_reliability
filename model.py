@@ -80,7 +80,8 @@ class Transformer_Based_Model(SDTBackbone):
                  detach_tau=True, detach_kappa=True, beta_gate=1.0,
                  use_emotion_wheel=False, wheel_prototype_radius=0.75,
                  wheel_temperature=1.0, wheel_anchor_mix=0.5,
-                 anchor_balance="none"):
+                 anchor_balance="none", anchor_min_per_class=0,
+                 anchor_admission="teacher"):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -117,7 +118,8 @@ class Transformer_Based_Model(SDTBackbone):
                 anchor_conf_threshold, hyp_eps, typicality_eps,
                 consistency_t, consistency_k, detach_tau, detach_kappa,
                 dataset, use_emotion_wheel, wheel_prototype_radius,
-                wheel_temperature, wheel_anchor_mix, anchor_balance)
+                wheel_temperature, wheel_anchor_mix, anchor_balance,
+                anchor_min_per_class, anchor_admission)
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(
@@ -244,8 +246,9 @@ class Transformer_Based_Model(SDTBackbone):
             return 0
         if not self.training:
             raise RuntimeError("cannot update TiCAL anchors outside training")
-        return self.tical.update(outputs["tical"]["projected"], outputs["logits"],
-                                 labels, valid_mask)
+        return self.tical.update(
+            outputs["tical"]["projected"], outputs["logits"],
+            outputs["student_logits"], labels, valid_mask)
 
     def tical_anchor_summary(self):
         return self.tical.summary() if self.use_tical else None

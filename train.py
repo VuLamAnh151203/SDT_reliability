@@ -38,6 +38,11 @@ def build_parser():
     parser.add_argument("--anchor-size", type=int, default=2048)
     parser.add_argument("--anchor-balance", choices=("none", "equal"), default="none",
                         help="none=global FIFO; equal=separate equal-capacity FIFO per class")
+    parser.add_argument("--anchor-min-per-class", type=int, default=0,
+                        help="query only after every class in every bank has N anchors; 0 keeps old readiness")
+    parser.add_argument("--anchor-admission", choices=("teacher", "modality"),
+                        default="teacher",
+                        help="modality also requires the matching unimodal classifier to be correct")
     parser.add_argument("--anchor-conf-threshold", type=float, default=0.8)
     parser.add_argument("--hyperbolic-dim", type=int, default=128)
     parser.add_argument("--hyp-eps", type=float, default=1e-5)
@@ -135,6 +140,8 @@ def make_model_config(args, dataset):
             "tical_warmup_epochs": args.tical_warmup_epochs,
             "anchor_size": args.anchor_size,
             "anchor_balance": args.anchor_balance,
+            "anchor_min_per_class": args.anchor_min_per_class,
+            "anchor_admission": args.anchor_admission,
             "anchor_conf_threshold": args.anchor_conf_threshold,
             "hyperbolic_dim": args.hyperbolic_dim, "hyp_eps": args.hyp_eps,
             "typicality_eps": args.typicality_eps,
@@ -442,6 +449,7 @@ def main(argv=None):
     if args.lambda_reliability < 0 or args.disagreement_weight < 0:
         raise ValueError("reliability/disagreement weights must be nonnegative")
     if (args.tical_warmup_epochs < 0 or args.anchor_size < 1
+            or args.anchor_min_per_class < 0
             or args.hyperbolic_dim < 1 or args.lambda_hyp < 0
             or args.beta_gate < 0 or args.consistency_t < 0
             or args.consistency_k < 0 or args.lambda_wheel_proto < 0
@@ -484,6 +492,7 @@ def main(argv=None):
                      "logvar_min", "logvar_max", "cold_eps", "distribution_init",
                      "initial_logvar", "use_tical", "tical_mode",
                      "tical_warmup_epochs", "anchor_size", "anchor_balance",
+                     "anchor_min_per_class", "anchor_admission",
                      "anchor_conf_threshold",
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
                      "consistency_t", "consistency_k", "beta_gate",
@@ -532,6 +541,13 @@ def main(argv=None):
     if (model_config.get("use_tical")
             and model_config.get("anchor_balance", "none") != "none"):
         method_tag += "_anchors_" + model_config["anchor_balance"]
+    if (model_config.get("use_tical")
+            and model_config.get("anchor_admission", "teacher") != "teacher"):
+        method_tag += "_admit_" + model_config["anchor_admission"]
+    if (model_config.get("use_tical")
+            and model_config.get("anchor_min_per_class", 0) > 0):
+        method_tag += "_minclass{}".format(
+            model_config["anchor_min_per_class"])
     if model_config.get("use_emotion_wheel"):
         method_tag += "_wheel"
     run_name = "{}_{}_{}_seed{}_{}".format(

@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from losses import SDTCOLDLoss, masked_kl_per_utterance
 from model import MODALITIES, Transformer_Based_Model
-from tical import (AnchorBank, HyperbolicProjector, compute_consistency,
+from tical import (AnchorBank, HyperbolicProjector, TiCALModule, compute_consistency,
                    blend_typicality, circular_class_distance_matrix,
                    emotion_wheel_angles, emotion_wheel_prototypes,
                    hyp_cpcc_loss, hyperbolic_prototype_outputs,
@@ -78,6 +78,52 @@ class TiCALTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             AnchorBank(2, n_classes=3, max_size=2, balance_mode="equal")
+
+    def test_class_coverage_controls_bank_readiness(self):
+        tical = TiCALModule(
+            hidden_dim=4, hyperbolic_dim=2, n_classes=3,
+            anchor_size=12, anchor_balance="equal",
+            anchor_min_per_class=2)
+        first = torch.tensor([[0.10, 0.0], [0.20, 0.0], [0.30, 0.0]])
+        labels = torch.tensor([0, 1, 2])
+        for bank in tical.anchor_banks.values():
+            bank.update(first, labels)
+        self.assertFalse(tical.banks_ready())
+        second = torch.tensor([[0.11, 0.0], [0.21, 0.0], [0.31, 0.0]])
+        for bank in tical.anchor_banks.values():
+            bank.update(second, labels)
+        self.assertTrue(tical.banks_ready())
+
+    def test_modality_admission_builds_modality_specific_banks(self):
+        tical = TiCALModule(
+            hidden_dim=4, hyperbolic_dim=2, n_classes=3,
+            anchor_size=12, anchor_conf_threshold=0.0,
+            anchor_balance="equal", anchor_admission="modality")
+        projected = {
+            name: torch.tensor([[[0.10, 0.0], [0.20, 0.0], [0.30, 0.0]]])
+            for name in MODALITIES
+        }
+        labels = torch.tensor([[0, 1, 2]])
+        teacher_logits = F.one_hot(labels, 3).float() * 10.0
+        predictions = {
+            "t": torch.tensor([[0, 0, 0]]),
+            "a": torch.tensor([[1, 1, 1]]),
+            "v": torch.tensor([[2, 2, 2]]),
+        }
+        student_logits = {
+            name: F.one_hot(prediction, 3).float() * 10.0
+            for name, prediction in predictions.items()
+        }
+        added = tical.update(
+            projected, teacher_logits, student_logits, labels,
+            torch.ones_like(labels, dtype=torch.bool))
+        self.assertEqual(added, 3)
+        torch.testing.assert_close(
+            tical.anchor_banks["t"].class_counts(), torch.tensor([1, 0, 0]))
+        torch.testing.assert_close(
+            tical.anchor_banks["a"].class_counts(), torch.tensor([0, 1, 0]))
+        torch.testing.assert_close(
+            tical.anchor_banks["v"].class_counts(), torch.tensor([0, 0, 1]))
 
     def test_consistency_orders_guideline_sanity_cases(self):
         high = compute_consistency(*(torch.tensor([0.9]) for _ in range(3)),

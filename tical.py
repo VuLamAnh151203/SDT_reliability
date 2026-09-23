@@ -199,6 +199,17 @@ class AnchorBank(nn.Module):
     def class_counts(self):
         return torch.bincount(self.labels.detach().cpu(), minlength=self.n_classes)
 
+    def has_class_coverage(self, minimum):
+        """Return whether every class currently has at least ``minimum`` items."""
+        if minimum < 0:
+            raise ValueError("minimum class coverage must be nonnegative")
+        if minimum == 0:
+            return True
+        if self.size < self.n_classes * minimum:
+            return False
+        counts = torch.bincount(self.labels, minlength=self.n_classes)
+        return bool(counts.ge(minimum).all().item())
+
 
 def compute_typicality(distances, eps=1e-8):
     if distances.ndim != 1:
@@ -296,7 +307,8 @@ class TiCALModule(nn.Module):
                  consistency_k=0.5, detach_tau=True, detach_kappa=True,
                  dataset="IEMOCAP", use_emotion_wheel=False,
                  wheel_prototype_radius=0.75, wheel_temperature=1.0,
-                 wheel_anchor_mix=0.5, anchor_balance="none"):
+                 wheel_anchor_mix=0.5, anchor_balance="none",
+                 anchor_min_per_class=0, anchor_admission="teacher"):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -308,6 +320,13 @@ class TiCALModule(nn.Module):
             raise ValueError("TiCAL eps values must be positive")
         if consistency_t < 0 or consistency_k < 0:
             raise ValueError("TiCAL consistency settings must be nonnegative")
+        if anchor_min_per_class < 0:
+            raise ValueError("minimum anchors per class must be nonnegative")
+        if anchor_min_per_class * n_classes > anchor_size:
+            raise ValueError(
+                "minimum per-class coverage exceeds total anchor capacity")
+        if anchor_admission not in ("teacher", "modality"):
+            raise ValueError("anchor admission must be 'teacher' or 'modality'")
         self.anchor_conf_threshold = anchor_conf_threshold
         self.hyp_eps = hyp_eps
         self.typicality_eps = typicality_eps
@@ -315,6 +334,8 @@ class TiCALModule(nn.Module):
         self.consistency_k = consistency_k
         self.detach_tau = detach_tau
         self.detach_kappa = detach_kappa
+        self.anchor_min_per_class = int(anchor_min_per_class)
+        self.anchor_admission = anchor_admission
         self.use_emotion_wheel = bool(use_emotion_wheel)
         self.wheel_temperature = float(wheel_temperature)
         self.wheel_anchor_mix = float(wheel_anchor_mix)
@@ -346,7 +367,13 @@ class TiCALModule(nn.Module):
         })
 
     def banks_ready(self):
-        return all(self.anchor_banks[name].size > 0 for name in MODALITIES)
+        if self.anchor_min_per_class == 0:
+            return all(self.anchor_banks[name].size > 0 for name in MODALITIES)
+        return all(
+            self.anchor_banks[name].has_class_coverage(
+                self.anchor_min_per_class)
+            for name in MODALITIES
+        )
 
     def forward(self, pure_features, valid_mask, query_enabled=True):
         projected = {
@@ -426,16 +453,26 @@ class TiCALModule(nn.Module):
         return result
 
     @torch.no_grad()
-    def update(self, projected, teacher_logits, labels, valid_mask):
+    def update(self, projected, teacher_logits, student_logits, labels,
+               valid_mask):
         if not self.training:
             raise RuntimeError("TiCAL anchor banks are frozen during validation/test")
         probability = teacher_logits.softmax(dim=-1)
         confidence, prediction = probability.max(dim=-1)
-        eligible = (valid_mask.bool() & prediction.eq(labels)
-                    & confidence.gt(self.anchor_conf_threshold))
+        base_eligible = (valid_mask.bool() & prediction.eq(labels)
+                         & confidence.gt(self.anchor_conf_threshold))
+        admitted = []
         for name in MODALITIES:
+            eligible = base_eligible
+            if self.anchor_admission == "modality":
+                eligible = (eligible
+                            & student_logits[name].argmax(dim=-1).eq(labels))
             self.anchor_banks[name].update(projected[name][eligible], labels[eligible])
-        return int(eligible.sum().item())
+            admitted.append(eligible)
+        # Keep the historical metric semantics: count samples which inserted
+        # at least one anchor, rather than summing insertions across banks.
+        contributed = torch.stack(admitted, dim=-1).any(dim=-1)
+        return int(contributed.sum().item())
 
     def summary(self):
         return {

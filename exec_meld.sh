@@ -11,12 +11,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 #   --use-tical --tical-mode fusion   # CA-KD + fusion adjustment
 #   --use-tical --tical-mode full     # all TiCAL components
 #
+# Anchor-quality ablations are available through:
+#   bash exec_meld_anchor_experiment.sh combined --gpu-id 0
+#
 # Arguments appended by the caller occur last and therefore override these
 # common defaults.
 exec "${PYTHON:-python}" -u "$SCRIPT_DIR/train.py" \
   --Dataset MELD --fusion-variant sdt \
   --tical-warmup-epochs 5 \
-  --anchor-size 4096 --anchor-balance none --anchor-conf-threshold 0.8 \
+  --anchor-size 4096 --anchor-conf-threshold 0.8 \
+  --anchor-balance none --anchor-admission teacher --anchor-min-per-class 0 \
   --hyperbolic-dim 16 --hyp-eps 1e-5 --typicality-eps 1e-8 \
   --consistency-t 0.2 --consistency-k 0.5 \
   --beta-gate 1.0 --lambda-hyp 0.1 \

@@ -45,7 +45,8 @@ SEEDS="2024 2025 2026 2027 2028" \
   bash geometry_analysis/run_ablation.sh all --gpu-id 0
 ```
 
-Mặc định runner dùng IEMOCAP, validation split 10%, dimension 16 và Wheel
+Mặc định runner dùng IEMOCAP, train trên toàn bộ training dialogues, chọn
+checkpoint bằng test weighted F1 giống protocol SDT gốc, dimension 16 và Wheel
 temperature 1. Có thể thay đổi bằng biến môi trường:
 
 ```bash
@@ -76,7 +77,8 @@ các run dùng cùng dimension, seed, split và cùng budget chọn temperature.
 
 ## Temperature sweep
 
-Khoảng cách của ba geometry có scale khác nhau. Chạy cùng grid trên validation:
+Khoảng cách của ba geometry có scale khác nhau. Nếu thực hiện temperature
+sweep theo protocol test hiện tại:
 
 ```bash
 for temperature in 0.25 0.5 1.0 2.0; do
@@ -86,7 +88,6 @@ for temperature in 0.25 0.5 1.0 2.0; do
 done
 ```
 
-Không chọn temperature theo test F1. Sau khi chọn temperature cho từng
-geometry trên validation, chạy lại tập seed báo cáo và chỉ dùng test để báo
-kết quả cuối. Giữ mỗi temperature trong một `OUTPUT_DIR` riêng để script tổng
-hợp không trộn các temperature thành cùng một nhóm.
+Giữ mỗi temperature trong một `OUTPUT_DIR` riêng để script tổng hợp không trộn
+các temperature thành cùng một nhóm. Nếu cần protocol nghiêm ngặt không dùng
+test để tune temperature hoặc checkpoint, đặt `SELECTION_PROTOCOL=validation`.

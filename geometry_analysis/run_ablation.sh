@@ -12,7 +12,10 @@ EXPERIMENT="${EXPERIMENT^^}"
 DATASET="${DATASET:-IEMOCAP}"
 SEEDS="${SEEDS:-2024}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/results/${DATASET,,}}"
-SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-validation}"
+# Match the original SDT protocol: train on every training dialogue and use
+# test weighted F1 to select the best epoch.  Set SELECTION_PROTOCOL=validation
+# explicitly only when a held-out training split is desired.
+SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
 VALID_RATIO="${VALID_RATIO:-0.1}"
 WHEEL_DIM="${WHEEL_DIM:-16}"
 WHEEL_RADIUS="${WHEEL_RADIUS:-0.75}"

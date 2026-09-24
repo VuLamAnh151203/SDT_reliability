@@ -121,14 +121,16 @@ Mỗi run tạo folder `geometry_diagnostics_test` chứa:
 - `confusion_matrix.csv`;
 - `geometry_dashboard.png` và `confusion_matrix.png`.
 
-`geometry_report.md` có thêm bảng Pearson/Spearman giữa hyperbolic radius
-(Poincaré) hoặc embedding norm (Euclidean/spherical) với confidence cuối của
-SDT. File tổng hợp `geometry_diagnostics_test.csv` chứa các cột
+`geometry_report.md` có thêm bảng Pearson/Spearman giữa Poincaré ball radius
+`r=||z||` hoặc embedding norm (Euclidean/spherical) với confidence cuối của
+SDT. Hyperbolic radius không bị mất và vẫn nằm trong `geometry_report.json`.
+File tổng hợp `geometry_diagnostics_test.csv` chứa các cột
 `t/a/v_radial_confidence_pearson` và `t/a/v_radial_confidence_spearman`.
 Riêng checkpoint Poincaré còn tạo `poincare_radius_confidence.png`: hàng trên
-là scatter radius–confidence kèm mean ± SEM theo confidence bin; hàng dưới so
-sánh phân bố radius của dự đoán đúng và sai. Các bin số liệu tương ứng được lưu
-trong `poincare_radius_confidence_bins.csv`.
+là scatter giữa Poincaré ball radius `r=||z||` trong `[0,1)` và confidence,
+kèm mean ± SEM theo confidence bin; hàng dưới so sánh phân bố radius của dự
+đoán đúng và sai. Các bin số liệu tương ứng được lưu trong
+`poincare_radius_confidence_bins.csv` với `radius_scale=ball_norm`.
 
 Khi đầu vào là cả thư mục, script còn tạo
 `geometry_diagnostics_test.csv` để so sánh E/S/P trên cùng một bảng. B0 được

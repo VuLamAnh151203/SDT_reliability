@@ -353,7 +353,7 @@ def correlation_bundle(values, confidence, entropy, correctness, margin):
 
 
 def confidence_bin_rows(confidence, radius, correctness, modality,
-                        n_bins=10):
+                        n_bins=10, radius_scale="ball_norm"):
     """Summarize Poincare radius in fixed confidence intervals."""
     confidence = np.asarray(confidence, dtype=np.float64)
     radius = np.asarray(radius, dtype=np.float64)
@@ -373,6 +373,7 @@ def confidence_bin_rows(confidence, radius, correctness, modality,
         local_radius = radius[mask]
         rows.append({
             "modality": modality,
+            "radius_scale": radius_scale,
             "bin": index,
             "confidence_low": float(edges[index]),
             "confidence_high": float(edges[index + 1]),
@@ -704,7 +705,9 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
         }
         plot_data[name] = {
             "margin": margin,
-            "norm_or_rho": rho if rho is not None else norms,
+            "norm_or_rho": norms,
+            "ball_radius": norms,
+            "hyperbolic_radius": rho,
             "confidence": confidence,
             "correctness": correctness,
             "tiers": merged_tiers,
@@ -752,7 +755,7 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
         for name in MODALITIES:
             radius_confidence_bins.extend(confidence_bin_rows(
                 plot_data[name]["confidence"],
-                plot_data[name]["norm_or_rho"],
+                plot_data[name]["ball_radius"],
                 plot_data[name]["correctness"], name))
         write_csv(
             output_dir / "poincare_radius_confidence_bins.csv",
@@ -813,11 +816,11 @@ def write_markdown(path, report):
     for name in MODALITIES:
         item = report["modalities"][name]["radial"]
         if item["hyperbolic_radius"] is not None:
-            measure = "hyperbolic radius"
-            overall = item["hyperbolic_radius"]
-            correct = item["hyperbolic_radius_correct"]
-            incorrect = item["hyperbolic_radius_incorrect"]
-            correlations = item["rho_correlations"]["confidence"]
+            measure = "Poincare ball radius"
+            overall = item["euclidean_norm"]
+            correct = item["euclidean_norm_correct"]
+            incorrect = item["euclidean_norm_incorrect"]
+            correlations = item["norm_correlations"]["confidence"]
         else:
             measure = "embedding norm"
             overall = item["euclidean_norm"]
@@ -871,7 +874,9 @@ def render_plots(output_dir, plot_data, cm, class_names, geometry):
             s=8, alpha=0.3)
         axes[2, column].set_xlabel("final confidence")
         axes[2, column].set_ylabel(
-            "hyperbolic radius" if geometry == "poincare" else "embedding norm")
+            "Poincare ball radius" if geometry == "poincare" else "embedding norm")
+        if geometry == "poincare":
+            axes[2, column].set_ylim(0.0, 1.0)
         radial_spearman = spearman(
             data["norm_or_rho"], data["confidence"])
         axes[2, column].set_title(
@@ -915,7 +920,9 @@ def render_poincare_radius_confidence(output_dir, plot_data, plt):
     for column, name in enumerate(MODALITIES):
         data = plot_data[name]
         confidence = np.asarray(data["confidence"], dtype=np.float64)
-        radius = np.asarray(data["norm_or_rho"], dtype=np.float64)
+        # Coordinate radius in the Poincare ball.  Unlike geodesic radius
+        # rho=2*atanh(||z||), this is bounded in [0, 1).
+        radius = np.asarray(data["ball_radius"], dtype=np.float64)
         correctness = np.asarray(data["correctness"], dtype=bool)
         bins = confidence_bin_rows(
             confidence, radius, correctness.astype(float), name)
@@ -936,8 +943,9 @@ def render_poincare_radius_confidence(output_dir, plot_data, plt):
             MODALITY_NAMES[name], _format_optional(pearson_value),
             _format_optional(spearman_value)))
         top.set_xlabel("Final SDT confidence")
-        top.set_ylabel("Hyperbolic radius ρ")
+        top.set_ylabel("Poincaré ball radius r = ||z||")
         top.set_xlim(0.0, 1.02)
+        top.set_ylim(0.0, 1.0)
         top.grid(alpha=0.2)
         top.legend(loc="best")
 
@@ -956,7 +964,8 @@ def render_poincare_radius_confidence(output_dir, plot_data, plt):
             "mean correct={:.4f}, incorrect={:.4f}, Δ={:+.4f}".format(
                 correct_mean, incorrect_mean,
                 correct_mean - incorrect_mean))
-        bottom.set_xlabel("Hyperbolic radius ρ")
+        bottom.set_xlabel("Poincaré ball radius r = ||z||")
+        bottom.set_xlim(0.0, 1.0)
         bottom.set_ylabel("Density")
         bottom.grid(alpha=0.2)
         bottom.legend(loc="best")
@@ -971,7 +980,8 @@ def render_poincare_radius_confidence(output_dir, plot_data, plt):
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.78})
 
     figure.suptitle(
-        "Poincaré radius versus final SDT confidence", fontsize=16)
+        "Poincaré ball radius (0 ≤ r < 1) versus final SDT confidence",
+        fontsize=16)
     figure.tight_layout(rect=(0, 0, 1, 0.96))
     figure.savefig(
         output_dir / "poincare_radius_confidence.png", dpi=200)
@@ -994,10 +1004,10 @@ def flattened_report_row(report):
         item = report["modalities"][name]
         radial = item["radial"]
         if radial["hyperbolic_radius"] is not None:
-            radial_measure = radial["hyperbolic_radius"]
-            radial_correct = radial["hyperbolic_radius_correct"]
-            radial_incorrect = radial["hyperbolic_radius_incorrect"]
-            radial_confidence = radial["rho_correlations"]["confidence"]
+            radial_measure = radial["euclidean_norm"]
+            radial_correct = radial["euclidean_norm_correct"]
+            radial_incorrect = radial["euclidean_norm_incorrect"]
+            radial_confidence = radial["norm_correlations"]["confidence"]
         else:
             radial_measure = radial["euclidean_norm"]
             radial_correct = radial["euclidean_norm_correct"]

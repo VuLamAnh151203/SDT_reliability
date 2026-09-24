@@ -352,6 +352,44 @@ def correlation_bundle(values, confidence, entropy, correctness, margin):
     return output
 
 
+def confidence_bin_rows(confidence, radius, correctness, modality,
+                        n_bins=10):
+    """Summarize Poincare radius in fixed confidence intervals."""
+    confidence = np.asarray(confidence, dtype=np.float64)
+    radius = np.asarray(radius, dtype=np.float64)
+    correctness = np.asarray(correctness, dtype=np.float64)
+    if not (confidence.shape == radius.shape == correctness.shape):
+        raise ValueError("confidence, radius, and correctness shapes differ")
+    if n_bins < 2:
+        raise ValueError("n_bins must be at least 2")
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    assignments = np.clip(np.digitize(confidence, edges, right=False) - 1,
+                          0, n_bins - 1)
+    rows = []
+    for index in range(n_bins):
+        mask = assignments == index
+        if not mask.any():
+            continue
+        local_radius = radius[mask]
+        rows.append({
+            "modality": modality,
+            "bin": index,
+            "confidence_low": float(edges[index]),
+            "confidence_high": float(edges[index + 1]),
+            "count": int(mask.sum()),
+            "confidence_mean": float(confidence[mask].mean()),
+            "radius_mean": float(local_radius.mean()),
+            "radius_std": float(local_radius.std()),
+            "radius_sem": float(
+                local_radius.std() / math.sqrt(local_radius.size)),
+            "radius_q25": float(np.quantile(local_radius, 0.25)),
+            "radius_median": float(np.median(local_radius)),
+            "radius_q75": float(np.quantile(local_radius, 0.75)),
+            "accuracy": float(correctness[mask].mean()),
+        })
+    return rows
+
+
 def infer_experiment_id(config, args):
     if not config.get("use_emotion_wheel", False):
         return "B0"
@@ -668,6 +706,7 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
             "margin": margin,
             "norm_or_rho": rho if rho is not None else norms,
             "confidence": confidence,
+            "correctness": correctness,
             "tiers": merged_tiers,
             "class_mean_matrix": class_mean_matrix,
         }
@@ -708,6 +747,16 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
     write_csv(output_dir / "class_pair_metrics.csv", class_pair_rows)
     write_csv(output_dir / "distance_tiers.csv", tier_rows)
     write_csv(output_dir / "knn_metrics.csv", knn_output)
+    if geometry == "poincare":
+        radius_confidence_bins = []
+        for name in MODALITIES:
+            radius_confidence_bins.extend(confidence_bin_rows(
+                plot_data[name]["confidence"],
+                plot_data[name]["norm_or_rho"],
+                plot_data[name]["correctness"], name))
+        write_csv(
+            output_dir / "poincare_radius_confidence_bins.csv",
+            radius_confidence_bins)
     confusion_rows = [
         {"true_class": class_index, "emotion": class_names[class_index],
          **{"pred_{}_{}".format(predicted_index, class_names[predicted_index]):
@@ -854,6 +903,78 @@ def render_plots(output_dir, plot_data, cm, class_names, geometry):
     figure.colorbar(image, ax=axis)
     figure.tight_layout()
     figure.savefig(output_dir / "confusion_matrix.png", dpi=180)
+    plt.close(figure)
+
+    if geometry == "poincare":
+        render_poincare_radius_confidence(output_dir, plot_data, plt)
+
+
+def render_poincare_radius_confidence(output_dir, plot_data, plt):
+    """Render a Poincare-only radius/confidence diagnostic figure."""
+    figure, axes = plt.subplots(2, 3, figsize=(18, 10))
+    for column, name in enumerate(MODALITIES):
+        data = plot_data[name]
+        confidence = np.asarray(data["confidence"], dtype=np.float64)
+        radius = np.asarray(data["norm_or_rho"], dtype=np.float64)
+        correctness = np.asarray(data["correctness"], dtype=bool)
+        bins = confidence_bin_rows(
+            confidence, radius, correctness.astype(float), name)
+
+        top = axes[0, column]
+        top.scatter(confidence, radius, s=9, alpha=0.18,
+                    color="tab:blue", rasterized=True)
+        bin_confidence = np.asarray(
+            [row["confidence_mean"] for row in bins])
+        bin_radius = np.asarray([row["radius_mean"] for row in bins])
+        bin_sem = np.asarray([row["radius_sem"] for row in bins])
+        top.errorbar(bin_confidence, bin_radius, yerr=bin_sem,
+                     color="black", marker="o", markersize=5,
+                     linewidth=2, capsize=3, label="bin mean ± SEM")
+        pearson_value = pearson(radius, confidence)
+        spearman_value = spearman(radius, confidence)
+        top.set_title("{}: Pearson={}, Spearman={}".format(
+            MODALITY_NAMES[name], _format_optional(pearson_value),
+            _format_optional(spearman_value)))
+        top.set_xlabel("Final SDT confidence")
+        top.set_ylabel("Hyperbolic radius ρ")
+        top.set_xlim(0.0, 1.02)
+        top.grid(alpha=0.2)
+        top.legend(loc="best")
+
+        bottom = axes[1, column]
+        correct_radius = radius[correctness]
+        incorrect_radius = radius[~correctness]
+        bottom.hist(correct_radius, bins=35, density=True, alpha=0.50,
+                    color="tab:green", label="correct")
+        bottom.hist(incorrect_radius, bins=35, density=True, alpha=0.50,
+                    color="tab:red", label="incorrect")
+        correct_mean = float(correct_radius.mean())
+        incorrect_mean = float(incorrect_radius.mean())
+        bottom.axvline(correct_mean, color="tab:green", linestyle="--")
+        bottom.axvline(incorrect_mean, color="tab:red", linestyle="--")
+        bottom.set_title(
+            "mean correct={:.4f}, incorrect={:.4f}, Δ={:+.4f}".format(
+                correct_mean, incorrect_mean,
+                correct_mean - incorrect_mean))
+        bottom.set_xlabel("Hyperbolic radius ρ")
+        bottom.set_ylabel("Density")
+        bottom.grid(alpha=0.2)
+        bottom.legend(loc="best")
+        radius_stats = summary_stats(radius)
+        bottom.text(
+            0.02, 0.97,
+            "N={}\nmean±std={:.4f}±{:.4f}\nq05–q95={:.4f}–{:.4f}".format(
+                radius_stats["count"], radius_stats["mean"],
+                radius_stats["std"], radius_stats["q05"],
+                radius_stats["q95"]),
+            transform=bottom.transAxes, va="top", fontsize=9,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.78})
+
+    figure.suptitle(
+        "Poincaré radius versus final SDT confidence", fontsize=16)
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    figure.savefig(
+        output_dir / "poincare_radius_confidence.png", dpi=200)
     plt.close(figure)
 
 

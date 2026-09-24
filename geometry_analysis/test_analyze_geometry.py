@@ -3,7 +3,8 @@ import unittest
 import numpy as np
 
 from geometry_analysis.analyze_geometry import (
-    balanced_indices, class_balanced_pair_values, knn_rows, pearson,
+    balanced_indices, class_balanced_pair_values, confidence_bin_rows,
+    knn_rows, pearson,
     rankdata, silhouette_values, spearman, tier_name, wheel_steps)
 from geometry_analysis.summarize_causal import causal_id, paired_deltas
 
@@ -78,6 +79,17 @@ class GeometryAnalysisTest(unittest.TestCase):
             [row["delta_weighted_f1"] for row in deltas],
             [1.0, 2.0, 3.0, 4.0])
         self.assertTrue(all(row["supports_hypothesis"] for row in deltas))
+
+    def test_confidence_bins_include_one_and_report_statistics(self):
+        rows = confidence_bin_rows(
+            np.asarray([0.05, 0.15, 0.85, 1.0]),
+            np.asarray([1.0, 2.0, 3.0, 5.0]),
+            np.asarray([0, 1, 1, 1]), "t", n_bins=2)
+        self.assertEqual([row["count"] for row in rows], [2, 2])
+        self.assertEqual(rows[1]["confidence_high"], 1.0)
+        self.assertEqual(rows[1]["radius_mean"], 4.0)
+        self.assertEqual(rows[1]["radius_median"], 4.0)
+        self.assertEqual(rows[1]["accuracy"], 1.0)
 
 
 if __name__ == "__main__":

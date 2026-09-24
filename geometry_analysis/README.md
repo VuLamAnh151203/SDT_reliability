@@ -125,6 +125,10 @@ Mỗi run tạo folder `geometry_diagnostics_test` chứa:
 (Poincaré) hoặc embedding norm (Euclidean/spherical) với confidence cuối của
 SDT. File tổng hợp `geometry_diagnostics_test.csv` chứa các cột
 `t/a/v_radial_confidence_pearson` và `t/a/v_radial_confidence_spearman`.
+Riêng checkpoint Poincaré còn tạo `poincare_radius_confidence.png`: hàng trên
+là scatter radius–confidence kèm mean ± SEM theo confidence bin; hàng dưới so
+sánh phân bố radius của dự đoán đúng và sai. Các bin số liệu tương ứng được lưu
+trong `poincare_radius_confidence_bins.csv`.
 
 Khi đầu vào là cả thư mục, script còn tạo
 `geometry_diagnostics_test.csv` để so sánh E/S/P trên cùng một bảng. B0 được

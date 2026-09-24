@@ -121,6 +121,11 @@ Mỗi run tạo folder `geometry_diagnostics_test` chứa:
 - `confusion_matrix.csv`;
 - `geometry_dashboard.png` và `confusion_matrix.png`.
 
+`geometry_report.md` có thêm bảng Pearson/Spearman giữa hyperbolic radius
+(Poincaré) hoặc embedding norm (Euclidean/spherical) với confidence cuối của
+SDT. File tổng hợp `geometry_diagnostics_test.csv` chứa các cột
+`t/a/v_radial_confidence_pearson` và `t/a/v_radial_confidence_spearman`.
+
 Khi đầu vào là cả thư mục, script còn tạo
 `geometry_diagnostics_test.csv` để so sánh E/S/P trên cùng một bảng. B0 được
 bỏ qua vì SDT baseline không có projection head của geometry experiment.

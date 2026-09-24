@@ -600,6 +600,12 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
         radial_report = {
             "applicable": geometry == "poincare",
             "euclidean_norm": summary_stats(norms),
+            "euclidean_norm_correct": summary_stats(
+                norms[correctness.astype(bool)]),
+            "euclidean_norm_incorrect": summary_stats(
+                norms[~correctness.astype(bool)]),
+            "norm_correlations": correlation_bundle(
+                norms, confidence, entropy, correctness, margin),
             "hyperbolic_radius": summary_stats(rho) if rho is not None else None,
             "hyperbolic_radius_correct": (
                 summary_stats(rho[correctness.astype(bool)])
@@ -750,6 +756,33 @@ def write_markdown(path, report):
                 ordering=_format_optional(item["semantic_distance"][
                     "ordering_accuracy_same_adjacent_far"]),
                 silhouette=item["cluster"]["silhouette"]["mean"]))
+    lines.extend([
+        "", "## Radius/norm versus final confidence", "",
+        "| Modality | Measure | Mean | Correct | Incorrect | Pearson | Spearman |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ])
+    for name in MODALITIES:
+        item = report["modalities"][name]["radial"]
+        if item["hyperbolic_radius"] is not None:
+            measure = "hyperbolic radius"
+            overall = item["hyperbolic_radius"]
+            correct = item["hyperbolic_radius_correct"]
+            incorrect = item["hyperbolic_radius_incorrect"]
+            correlations = item["rho_correlations"]["confidence"]
+        else:
+            measure = "embedding norm"
+            overall = item["euclidean_norm"]
+            correct = item["euclidean_norm_correct"]
+            incorrect = item["euclidean_norm_incorrect"]
+            correlations = item["norm_correlations"]["confidence"]
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} | {} |".format(
+                MODALITY_NAMES[name], measure,
+                _format_optional(overall["mean"]),
+                _format_optional(correct["mean"]),
+                _format_optional(incorrect["mean"]),
+                _format_optional(correlations["pearson"]),
+                _format_optional(correlations["spearman"])))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -790,7 +823,11 @@ def render_plots(output_dir, plot_data, cm, class_names, geometry):
         axes[2, column].set_xlabel("final confidence")
         axes[2, column].set_ylabel(
             "hyperbolic radius" if geometry == "poincare" else "embedding norm")
-        axes[2, column].set_title("Radius/norm relation")
+        radial_spearman = spearman(
+            data["norm_or_rho"], data["confidence"])
+        axes[2, column].set_title(
+            "Radius/norm relation (Spearman={})".format(
+                _format_optional(radial_spearman)))
 
         image = axes[3, column].imshow(
             data["class_mean_matrix"], cmap="viridis")
@@ -834,6 +871,17 @@ def flattened_report_row(report):
     }
     for name in MODALITIES:
         item = report["modalities"][name]
+        radial = item["radial"]
+        if radial["hyperbolic_radius"] is not None:
+            radial_measure = radial["hyperbolic_radius"]
+            radial_correct = radial["hyperbolic_radius_correct"]
+            radial_incorrect = radial["hyperbolic_radius_incorrect"]
+            radial_confidence = radial["rho_correlations"]["confidence"]
+        else:
+            radial_measure = radial["euclidean_norm"]
+            radial_correct = radial["euclidean_norm_correct"]
+            radial_incorrect = radial["euclidean_norm_incorrect"]
+            radial_confidence = radial["norm_correlations"]["confidence"]
         row.update({
             name + "_wheel_accuracy": item["prototype"]["wheel_accuracy"],
             name + "_normalized_margin": item["prototype"][
@@ -849,9 +897,14 @@ def flattened_report_row(report):
             name + "_off_plane_ratio": item["off_plane"]["ratio"]["mean"],
             name + "_silhouette": item["cluster"]["silhouette"]["mean"],
             name + "_mean_rho": (
-                item["radial"]["hyperbolic_radius"]["mean"]
-                if item["radial"]["hyperbolic_radius"] is not None else None),
-            name + "_boundary_gt_095": item["radial"][
+                radial["hyperbolic_radius"]["mean"]
+                if radial["hyperbolic_radius"] is not None else None),
+            name + "_radial_mean": radial_measure["mean"],
+            name + "_radial_correct_mean": radial_correct["mean"],
+            name + "_radial_incorrect_mean": radial_incorrect["mean"],
+            name + "_radial_confidence_pearson": radial_confidence["pearson"],
+            name + "_radial_confidence_spearman": radial_confidence["spearman"],
+            name + "_boundary_gt_095": radial[
                 "boundary_fraction_norm_gt_0_95"],
         })
     return row

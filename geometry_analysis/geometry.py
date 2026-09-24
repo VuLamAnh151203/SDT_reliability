@@ -12,6 +12,7 @@ import torch.nn as nn
 
 
 GEOMETRIES = ("euclidean", "spherical", "poincare")
+RADIUS_MODES = ("free", "fixed")
 
 
 def _validate_geometry(geometry):
@@ -23,15 +24,31 @@ def _validate_geometry(geometry):
 class GeometryProjector(nn.Module):
     """Common affine head followed by a geometry-specific map."""
 
-    def __init__(self, input_dim, output_dim, geometry="poincare", eps=1e-5):
+    def __init__(self, input_dim, output_dim, geometry="poincare", eps=1e-5,
+                 radius_mode="free", fixed_radius=0.75,
+                 zero_residual=False):
         super().__init__()
         if input_dim < 1 or output_dim < 1:
             raise ValueError("projection dimensions must be positive")
         if not 0.0 < eps < 0.1:
             raise ValueError("geometry eps must be in (0, 0.1)")
         _validate_geometry(geometry)
+        if radius_mode not in RADIUS_MODES:
+            raise ValueError("radius mode must be one of {}".format(RADIUS_MODES))
+        if not math.isfinite(fixed_radius) or fixed_radius <= 0.0:
+            raise ValueError("fixed radius must be finite and positive")
+        if geometry == "poincare" and fixed_radius >= 1.0 - eps:
+            raise ValueError("fixed Poincare radius must be in (0, 1-eps)")
+        if geometry == "spherical" and radius_mode == "fixed" and not math.isclose(
+                fixed_radius, 1.0, rel_tol=0.0, abs_tol=eps):
+            raise ValueError("fixed spherical radius must equal 1")
+        if zero_residual and output_dim < 2:
+            raise ValueError("zero-residual projection requires at least 2 dimensions")
         self.geometry = geometry
         self.eps = float(eps)
+        self.radius_mode = radius_mode
+        self.fixed_radius = float(fixed_radius)
+        self.zero_residual = bool(zero_residual)
         self.linear = nn.Linear(input_dim, output_dim)
         # Keep the affine initialization identical for all geometries.
         nn.init.xavier_uniform_(self.linear.weight, gain=0.01)
@@ -39,6 +56,14 @@ class GeometryProjector(nn.Module):
 
     def forward(self, features):
         tangent = self.linear(features)
+        # Apply this constraint in tangent space so dimensions 3..D cannot
+        # influence the Poincare/spherical normalization or receive gradients
+        # indirectly through its norm.  The result is a 2-D representation
+        # embedded in the same 16-D tensor shape as the unconstrained model.
+        if self.zero_residual and tangent.size(-1) > 2:
+            tangent = torch.cat(
+                (tangent[..., :2], torch.zeros_like(tangent[..., 2:])),
+                dim=-1)
         if self.geometry == "euclidean":
             projected = tangent
         elif self.geometry == "spherical":
@@ -52,6 +77,15 @@ class GeometryProjector(nn.Module):
             scale = ((1.0 - self.eps)
                      / projected_norm.clamp_min(self.eps)).clamp(max=1.0)
             projected = projected * scale
+        if self.radius_mode == "fixed":
+            norm = projected.norm(p=2, dim=-1, keepdim=True)
+            direction = projected / norm.clamp_min(self.eps)
+            # A zero input has no direction.  Give it a deterministic unit
+            # direction so the fixed-radius invariant still holds exactly.
+            fallback = torch.zeros_like(projected)
+            fallback[..., 0] = 1.0
+            direction = torch.where(norm > self.eps, direction, fallback)
+            projected = self.fixed_radius * direction
         if not torch.isfinite(projected).all():
             raise FloatingPointError(
                 "nonfinite {} projection".format(self.geometry))

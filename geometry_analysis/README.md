@@ -124,3 +124,55 @@ Mỗi run tạo folder `geometry_diagnostics_test` chứa:
 Khi đầu vào là cả thư mục, script còn tạo
 `geometry_diagnostics_test.csv` để so sánh E/S/P trên cùng một bảng. B0 được
 bỏ qua vì SDT baseline không có projection head của geometry experiment.
+
+## Ablation radial, residual và hyperbolic metric
+
+Runner `run_causal_ablation.sh` giữ nguyên SDT, hai Wheel loss
+(`lambda_proto=0.1`, `lambda_cpcc=0.05`), dữ liệu, seed và mọi
+hyperparameter khác. Chỉ projection/constraint thay đổi:
+
+| ID | Cấu hình | Câu hỏi |
+|---|---|---|
+| `P-FREE` | Poincaré 16D, radius tự do | Mốc so sánh chung |
+| `P-FIXED` | Poincaré 16D, mọi điểm có radius cố định | Radius tự do có ích không? |
+| `P-2D` | Poincaré 2D | 16 chiều có tốt hơn 2 chiều không? |
+| `P-ZERORES` | Head Poincaré 16D nhưng đặt chiều 3–16 bằng 0 | Residual dimensions có ích không? |
+| `E-FREE` | Euclidean 16D, norm tự do | Metric/map Poincaré có ích không? |
+
+Chạy từng cấu hình với một seed:
+
+```bash
+cd SDT_new
+bash geometry_analysis/run_causal_ablation.sh P-FREE --gpu-id 0
+bash geometry_analysis/run_causal_ablation.sh P-FIXED --gpu-id 0
+bash geometry_analysis/run_causal_ablation.sh P-2D --gpu-id 0
+bash geometry_analysis/run_causal_ablation.sh P-ZERORES --gpu-id 0
+bash geometry_analysis/run_causal_ablation.sh E-FREE --gpu-id 0
+```
+
+Hoặc chạy liên tiếp cả năm cấu hình:
+
+```bash
+SEEDS=2024 bash geometry_analysis/run_causal_ablation.sh all --gpu-id 0
+python geometry_analysis/summarize_causal.py \
+  geometry_analysis/results/causal_iemocap
+```
+
+`P-FIXED` mặc định dùng radius 0.75. Có thể đổi bằng
+`FIXED_RADIUS=0.5`. Kết quả tổng hợp gồm `causal_runs.csv`,
+`causal_deltas.csv` và `causal_summary.md`. Bốn chênh lệch được tính theo
+cùng seed:
+
+```text
+radial             = P-FREE - P-FIXED
+dimension          = P-FREE - P-2D
+residual           = P-FREE - P-ZERORES
+hyperbolic_metric  = P-FREE - E-FREE
+```
+
+`P-2D` đồng thời giảm số tham số của projection head. Vì vậy,
+`P-FREE - P-ZERORES` là kiểm soát trực tiếp hơn cho vai trò của các chiều
+residual: cả hai vẫn dùng head 16D, nhưng `P-ZERORES` không cho output sử dụng
+các chiều 3–16. So sánh `P-FREE - E-FREE` đo toàn bộ ảnh hưởng của
+Poincaré map và metric trong implementation này; riêng một so sánh đó chưa đủ
+để tách curvature khỏi khác biệt của phép map.

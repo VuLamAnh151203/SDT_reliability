@@ -250,7 +250,8 @@ class TiCALModule(nn.Module):
                  wheel_prototype_radius=0.75, wheel_temperature=1.0,
                  wheel_anchor_mix=0.5, anchor_balance="none",
                  anchor_min_per_class=0, anchor_admission="teacher",
-                 wheel_geometry="poincare"):
+                 wheel_geometry="poincare", wheel_radius_mode="free",
+                 wheel_fixed_radius=0.75, wheel_zero_residual=False):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -282,6 +283,9 @@ class TiCALModule(nn.Module):
         if wheel_geometry not in GEOMETRIES:
             raise ValueError("unknown wheel geometry: {}".format(wheel_geometry))
         self.wheel_geometry = wheel_geometry
+        self.wheel_radius_mode = wheel_radius_mode
+        self.wheel_fixed_radius = float(wheel_fixed_radius)
+        self.wheel_zero_residual = bool(wheel_zero_residual)
         self.wheel_temperature = float(wheel_temperature)
         self.wheel_anchor_mix = float(wheel_anchor_mix)
         if self.use_emotion_wheel:
@@ -302,7 +306,9 @@ class TiCALModule(nn.Module):
                 circular_class_distance_matrix(wheel_angles))
         self.projectors = nn.ModuleDict({
             name: GeometryProjector(
-                hidden_dim, hyperbolic_dim, wheel_geometry, hyp_eps)
+                hidden_dim, hyperbolic_dim, wheel_geometry, hyp_eps,
+                wheel_radius_mode, wheel_fixed_radius,
+                wheel_zero_residual)
             for name in MODALITIES
         })
         self.anchor_banks = nn.ModuleDict({
@@ -333,6 +339,9 @@ class TiCALModule(nn.Module):
                   "kappa": None, "hyp_eps": self.hyp_eps,
                   "wheel_enabled": self.use_emotion_wheel,
                   "wheel_geometry": self.wheel_geometry,
+                  "wheel_radius_mode": self.wheel_radius_mode,
+                  "wheel_fixed_radius": self.wheel_fixed_radius,
+                  "wheel_zero_residual": self.wheel_zero_residual,
                   "wheel_distances": None, "wheel_logits": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
                   "wheel_class_distances": (

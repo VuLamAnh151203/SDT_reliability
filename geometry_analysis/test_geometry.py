@@ -63,6 +63,29 @@ class GeometryTest(unittest.TestCase):
                 points[:, None], points[None, :], geometry)
             torch.testing.assert_close(matrix, matrix.t())
 
+    def test_fixed_radius_removes_radial_variation(self):
+        projector = GeometryProjector(
+            5, 16, "poincare", radius_mode="fixed", fixed_radius=0.75)
+        projected = projector(torch.randn(32, 5))
+        torch.testing.assert_close(
+            projected.norm(dim=-1), torch.full((32,), 0.75),
+            atol=1e-6, rtol=1e-6)
+        projected.sum().backward()
+        self.assertGreater(
+            projector.linear.weight.grad.abs().sum().item(), 0.0)
+
+    def test_zero_residual_keeps_only_wheel_plane(self):
+        projector = GeometryProjector(
+            5, 16, "poincare", zero_residual=True)
+        projected = projector(torch.randn(32, 5))
+        self.assertTrue((projected[:, 2:] == 0).all())
+        self.assertGreater(projected[:, :2].abs().sum().item(), 0.0)
+        projected.sum().backward()
+        torch.testing.assert_close(
+            projector.linear.weight.grad[2:],
+            torch.zeros_like(projector.linear.weight.grad[2:]),
+            atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

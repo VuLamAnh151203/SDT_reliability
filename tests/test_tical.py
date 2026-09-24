@@ -220,6 +220,38 @@ class TiCALTests(unittest.TestCase):
         self.assertIsNotNone(projector_gradient)
         self.assertGreater(projector_gradient.abs().sum().item(), 0.0)
 
+    def test_causal_geometry_projection_constraints_are_applied(self):
+        common = dict(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_geometry="poincare")
+
+        fixed = Transformer_Based_Model(
+            **common, wheel_radius_mode="fixed", wheel_fixed_radius=0.75)
+        fixed_output = fixed(*self.inputs)
+        for name in MODALITIES:
+            radius = fixed_output["tical"]["projected"][name].norm(dim=-1)
+            torch.testing.assert_close(
+                radius, torch.full_like(radius, 0.75), atol=1e-6, rtol=0)
+
+        zero_residual = Transformer_Based_Model(
+            **common, wheel_zero_residual=True)
+        zero_output = zero_residual(*self.inputs)
+        for name in MODALITIES:
+            projected = zero_output["tical"]["projected"][name]
+            self.assertEqual(projected.shape[-1], 16)
+            torch.testing.assert_close(
+                projected[..., 2:], torch.zeros_like(projected[..., 2:]),
+                atol=0, rtol=0)
+
+        two_dimensional = Transformer_Based_Model(
+            **{**common, "hyperbolic_dim": 2})
+        two_dimensional_output = two_dimensional(*self.inputs)
+        for name in MODALITIES:
+            self.assertEqual(
+                two_dimensional_output["tical"]["projected"][name].shape[-1],
+                2)
+
     def test_tical_queries_old_bank_and_ca_kd_matches_formula(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="kd",

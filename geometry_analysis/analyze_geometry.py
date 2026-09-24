@@ -360,7 +360,16 @@ def infer_experiment_id(config, args):
     has_proto = float(args.get("lambda_wheel_proto", 0.0)) > 0
     has_cpcc = float(args.get("lambda_wheel_cpcc", 0.0)) > 0
     suffix = "PC" if has_proto and has_cpcc else "P" if has_proto else "C"
-    return prefix + "-" + suffix
+    run_id = prefix + "-" + suffix
+    dimension = int(config.get("hyperbolic_dim", 0))
+    if config.get("wheel_radius_mode", "free") == "fixed":
+        run_id += "-fixed-r{}".format(
+            str(config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))
+    if config.get("wheel_zero_residual", False):
+        run_id += "-zerores"
+    if dimension != 16:
+        run_id += "-d{}".format(dimension)
+    return run_id
 
 
 def analyze_checkpoint(checkpoint_path, cli_args, device):
@@ -666,6 +675,9 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
         "epoch": int(checkpoint.get("epoch", 0)),
         "geometry": geometry,
         "dimension": int(config["hyperbolic_dim"]),
+        "radius_mode": config.get("wheel_radius_mode", "free"),
+        "fixed_radius": float(config.get("wheel_fixed_radius", 0.75)),
+        "zero_residual": bool(config.get("wheel_zero_residual", False)),
         "lambda_proto": float(saved_args.get("lambda_wheel_proto", 0.0)),
         "lambda_cpcc": float(saved_args.get("lambda_wheel_cpcc", 0.0)),
         "n_utterances": int(labels.size),
@@ -709,8 +721,9 @@ def write_markdown(path, report):
     lines = [
         "# Geometry diagnostics", "",
         "- Experiment: `{}`".format(report["experiment_id"]),
-        "- Geometry: `{}` ({}D)".format(
-            report["geometry"], report["dimension"]),
+        "- Geometry: `{}` ({}D); radius: `{}`; zero residual: `{}`".format(
+            report["geometry"], report["dimension"],
+            report["radius_mode"], report["zero_residual"]),
         "- Split: `{}`; utterances: {}; pairwise subset: {}".format(
             report["split"], report["n_utterances"],
             report["n_pairwise_utterances"]),
@@ -812,6 +825,9 @@ def flattened_report_row(report):
         "id": report["experiment_id"], "dataset": report["dataset"],
         "seed": report["seed"], "epoch": report["epoch"],
         "geometry": report["geometry"], "dimension": report["dimension"],
+        "radius_mode": report["radius_mode"],
+        "fixed_radius": report["fixed_radius"],
+        "zero_residual": report["zero_residual"],
         "weighted_f1": report["classification"]["weighted_f1"],
         "macro_f1": report["classification"]["macro_f1"],
         "accuracy": report["classification"]["accuracy"],

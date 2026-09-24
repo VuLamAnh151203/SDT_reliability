@@ -5,6 +5,7 @@ import numpy as np
 from geometry_analysis.analyze_geometry import (
     balanced_indices, class_balanced_pair_values, knn_rows, pearson,
     rankdata, silhouette_values, spearman, tier_name, wheel_steps)
+from geometry_analysis.summarize_causal import causal_id, paired_deltas
 
 
 class GeometryAnalysisTest(unittest.TestCase):
@@ -45,6 +46,38 @@ class GeometryAnalysisTest(unittest.TestCase):
         self.assertTrue((silhouette_values(matrix, labels) > 0.8).all())
         rows = knn_rows(matrix, labels, "t", (1,), n_classes=2)
         self.assertEqual(rows[0]["accuracy"], 100.0)
+
+    def test_causal_ablation_ids_and_paired_deltas(self):
+        base = {
+            "wheel_geometry": "poincare", "hyperbolic_dim": 16,
+            "wheel_radius_mode": "free", "wheel_zero_residual": False,
+        }
+        self.assertEqual(causal_id(base), "P-FREE")
+        self.assertEqual(
+            causal_id({**base, "wheel_radius_mode": "fixed"}), "P-FIXED")
+        self.assertEqual(
+            causal_id({**base, "hyperbolic_dim": 2}), "P-2D")
+        self.assertEqual(
+            causal_id({**base, "wheel_zero_residual": True}), "P-ZERORES")
+        self.assertEqual(
+            causal_id({**base, "wheel_geometry": "euclidean"}), "E-FREE")
+
+        rows = []
+        scores = {
+            "P-FREE": 75.0, "P-FIXED": 74.0, "P-2D": 73.0,
+            "P-ZERORES": 72.0, "E-FREE": 71.0,
+        }
+        for run_id, score in scores.items():
+            rows.append({
+                "id": run_id, "seed": 2024, "weighted_f1": score,
+                "macro_f1": score - 1, "accuracy": score + 1,
+            })
+        deltas = paired_deltas(rows)
+        self.assertEqual(len(deltas), 4)
+        self.assertEqual(
+            [row["delta_weighted_f1"] for row in deltas],
+            [1.0, 2.0, 3.0, 4.0])
+        self.assertTrue(all(row["supports_hypothesis"] for row in deltas))
 
 
 if __name__ == "__main__":

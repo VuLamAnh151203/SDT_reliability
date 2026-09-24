@@ -17,7 +17,7 @@ from losses import SDTCOLDLoss
 from model import (DISTRIBUTION_INIT_MODES, FUSION_VARIANTS, MODALITIES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
-from geometry_analysis.geometry import GEOMETRIES
+from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
 
 
 def build_parser():
@@ -59,6 +59,13 @@ def build_parser():
     parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
     parser.add_argument("--wheel-geometry", choices=GEOMETRIES, default="poincare",
                         help="controlled wheel geometry ablation")
+    parser.add_argument("--wheel-radius-mode", choices=RADIUS_MODES,
+                        default="free",
+                        help="free=learn sample radius; fixed=remove radial information")
+    parser.add_argument("--wheel-fixed-radius", type=float, default=0.75,
+                        help="sample radius used by --wheel-radius-mode fixed")
+    parser.add_argument("--wheel-zero-residual", action="store_true",
+                        help="set projected dimensions 3..D to zero")
     parser.add_argument("--wheel-temperature", type=float, default=1.0)
     parser.add_argument("--wheel-anchor-mix", type=float, default=0.5,
                         help="0=anchor typicality, 1=prototype typicality")
@@ -155,6 +162,9 @@ def make_model_config(args, dataset):
             "beta_gate": args.beta_gate,
             "use_emotion_wheel": args.use_emotion_wheel,
             "wheel_geometry": args.wheel_geometry,
+            "wheel_radius_mode": args.wheel_radius_mode,
+            "wheel_fixed_radius": args.wheel_fixed_radius,
+            "wheel_zero_residual": args.wheel_zero_residual,
             "wheel_prototype_radius": args.wheel_prototype_radius,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix}
@@ -534,6 +544,16 @@ def main(argv=None):
             raise ValueError("--wheel-temperature must be positive")
         if not 0 <= args.wheel_anchor_mix <= 1:
             raise ValueError("--wheel-anchor-mix must be in [0,1]")
+        if args.wheel_fixed_radius <= 0:
+            raise ValueError("--wheel-fixed-radius must be positive")
+        if (args.wheel_geometry == "poincare"
+                and args.wheel_fixed_radius >= 1 - args.hyp_eps):
+            raise ValueError(
+                "fixed Poincare radius must be smaller than 1-hyp-eps")
+        if (args.wheel_geometry == "spherical"
+                and args.wheel_radius_mode == "fixed"
+                and abs(args.wheel_fixed_radius - 1.0) > args.hyp_eps):
+            raise ValueError("fixed spherical radius must equal 1")
     if args.num_threads:
         torch.set_num_threads(args.num_threads)
     seed_everything(args.seed)
@@ -552,7 +572,8 @@ def main(argv=None):
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
                      "wheel_temperature", "wheel_anchor_mix",
-                     "wheel_geometry"):
+                     "wheel_geometry", "wheel_radius_mode",
+                     "wheel_fixed_radius", "wheel_zero_residual"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -562,7 +583,8 @@ def main(argv=None):
                      "oof_reliability_targets", "tical_mode", "lambda_hyp",
                      "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
                      "wheel_prototype_radius", "wheel_temperature",
-                     "wheel_geometry",
+                     "wheel_geometry", "wheel_radius_mode",
+                     "wheel_fixed_radius", "wheel_zero_residual",
                      "wheel_anchor_mix", "lambda_wheel_proto",
                      "lambda_wheel_cpcc"):
             if name in checkpoint["args"]:
@@ -607,6 +629,12 @@ def main(argv=None):
     if model_config.get("use_emotion_wheel"):
         method_tag += "_wheel_{}".format(
             model_config.get("wheel_geometry", "poincare"))
+        if model_config.get("wheel_radius_mode", "free") == "fixed":
+            method_tag += "_fixedr{}".format(
+                str(model_config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))
+        if model_config.get("wheel_zero_residual", False):
+            method_tag += "_zerores"
+        method_tag += "_d{}".format(model_config["hyperbolic_dim"])
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))

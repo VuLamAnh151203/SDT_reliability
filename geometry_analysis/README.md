@@ -91,3 +91,36 @@ done
 Giữ mỗi temperature trong một `OUTPUT_DIR` riêng để script tổng hợp không trộn
 các temperature thành cùng một nhóm. Nếu cần protocol nghiêm ngặt không dùng
 test để tune temperature hoặc checkpoint, đặt `SELECTION_PROTOCOL=validation`.
+
+## Phân tích latent geometry từ checkpoint
+
+Phân tích một checkpoint, không train lại:
+
+```bash
+bash geometry_analysis/run_diagnostics.sh \
+  geometry_analysis/results/iemocap/<run>/best_checkpoint.pt \
+  --gpu-id 0
+```
+
+Phân tích tất cả checkpoint Wheel trong một thư mục:
+
+```bash
+bash geometry_analysis/run_diagnostics.sh \
+  geometry_analysis/results/iemocap \
+  --gpu-id 0
+```
+
+Mỗi run tạo folder `geometry_diagnostics_test` chứa:
+
+- `geometry_report.json` và `geometry_report.md`;
+- `sample_metrics.csv`: prototype margin, radius/norm, off-plane ratio;
+- `per_class_metrics.csv`: compactness, silhouette và lớp cạnh tranh gần nhất;
+- `class_pair_metrics.csv`: khoảng cách giữa từng cặp cảm xúc;
+- `distance_tiers.csv`: same/adjacent/middle/far;
+- `knn_metrics.csv`: geometry-aware k-NN;
+- `confusion_matrix.csv`;
+- `geometry_dashboard.png` và `confusion_matrix.png`.
+
+Khi đầu vào là cả thư mục, script còn tạo
+`geometry_diagnostics_test.csv` để so sánh E/S/P trên cùng một bảng. B0 được
+bỏ qua vì SDT baseline không có projection head của geometry experiment.

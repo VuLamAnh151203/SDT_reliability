@@ -17,6 +17,7 @@ from losses import SDTCOLDLoss
 from model import (DISTRIBUTION_INIT_MODES, FUSION_VARIANTS, MODALITIES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
+from geometry_analysis.geometry import GEOMETRIES
 
 
 def build_parser():
@@ -56,6 +57,8 @@ def build_parser():
     parser.add_argument("--use-emotion-wheel", action="store_true",
                         help="constrain TiCAL with fixed hyperbolic emotion-wheel prototypes")
     parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
+    parser.add_argument("--wheel-geometry", choices=GEOMETRIES, default="poincare",
+                        help="controlled wheel geometry ablation")
     parser.add_argument("--wheel-temperature", type=float, default=1.0)
     parser.add_argument("--wheel-anchor-mix", type=float, default=0.5,
                         help="0=anchor typicality, 1=prototype typicality")
@@ -151,6 +154,7 @@ def make_model_config(args, dataset):
             "detach_kappa": not args.no_detach_kappa,
             "beta_gate": args.beta_gate,
             "use_emotion_wheel": args.use_emotion_wheel,
+            "wheel_geometry": args.wheel_geometry,
             "wheel_prototype_radius": args.wheel_prototype_radius,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix}
@@ -171,7 +175,29 @@ def make_criterion(args, device):
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
     tical = output.get("tical")
-    if tical is None or not tical["ready"]:
+    if tical is None:
+        return
+    if tical.get("wheel_pseudo_labels") is not None:
+        valid_labels = labels[valid]
+        for name in MODALITIES:
+            projected = tical["projected"][name][valid]
+            distances = tical["wheel_distances"][name]
+            correct_distance = distances.gather(
+                1, valid_labels.unsqueeze(1)).squeeze(1)
+            wrong_distances = distances.clone()
+            wrong_distances.scatter_(1, valid_labels.unsqueeze(1), float("inf"))
+            nearest_wrong = wrong_distances.min(dim=1).values
+            storage["wheel_correct_" + name].append(
+                tical["wheel_pseudo_labels"][name].eq(valid_labels).detach().cpu())
+            storage["geometry_norm_" + name].append(
+                projected.norm(dim=-1).detach().cpu())
+            storage["off_plane_norm_" + name].append(
+                projected[..., 2:].norm(dim=-1).detach().cpu())
+            storage["prototype_distance_" + name].append(
+                correct_distance.detach().cpu())
+            storage["prototype_margin_" + name].append(
+                (nearest_wrong - correct_distance).detach().cpu())
+    if not tical["ready"]:
         return
     for name in MODALITIES:
         storage["tau_" + name].append(tical["tau"][name].detach().cpu())
@@ -209,6 +235,12 @@ def _tical_epoch_metrics(storage, model, utterance_count):
             result["anchor_tau_{}_mean".format(name)] = 0.0
             result["prototype_tau_{}_mean".format(name)] = 0.0
             result["wheel_pseudo_{}_anchor_agreement".format(name)] = 0.0
+            result["wheel_{}_accuracy".format(name)] = 0.0
+            result["geometry_{}_norm_mean".format(name)] = 0.0
+            result["geometry_{}_norm_std".format(name)] = 0.0
+            result["geometry_{}_off_plane_norm_mean".format(name)] = 0.0
+            result["wheel_{}_correct_distance_mean".format(name)] = 0.0
+            result["wheel_{}_prototype_margin_mean".format(name)] = 0.0
     if getattr(model, "use_emotion_wheel", False):
         result["categorical_discrepancy_mean"] = 0.0
         result["wheel_discrepancy_mean"] = 0.0
@@ -220,10 +252,28 @@ def _tical_epoch_metrics(storage, model, utterance_count):
         result["anchor_{}_size".format(name)] = float(summary[name]["size"])
         for class_index, count in enumerate(summary[name]["class_counts"]):
             result["anchor_{}_class_{}".format(name, class_index)] = float(count)
-    if not storage["kappa"]:
-        return result
     values = {key: torch.cat(chunks) for key, chunks in storage.items()
               if isinstance(chunks, list) and chunks}
+    if getattr(model, "use_emotion_wheel", False):
+        for name in MODALITIES:
+            if "wheel_correct_" + name not in values:
+                continue
+            norms = values["geometry_norm_" + name].float()
+            result.update({
+                "wheel_{}_accuracy".format(name): 100.0 * values[
+                    "wheel_correct_" + name].float().mean().item(),
+                "geometry_{}_norm_mean".format(name): norms.mean().item(),
+                "geometry_{}_norm_std".format(name): norms.std(
+                    unbiased=False).item(),
+                "geometry_{}_off_plane_norm_mean".format(name): values[
+                    "off_plane_norm_" + name].float().mean().item(),
+                "wheel_{}_correct_distance_mean".format(name): values[
+                    "prototype_distance_" + name].float().mean().item(),
+                "wheel_{}_prototype_margin_mean".format(name): values[
+                    "prototype_margin_" + name].float().mean().item(),
+            })
+    if not storage["kappa"]:
+        return result
     n_ready = int(values["kappa"].numel())
     result["tical_ready_rate"] = n_ready / max(1, utterance_count)
     for name in MODALITIES:
@@ -285,6 +335,9 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     tical_storage.update({"anchor_tau_" + name: [] for name in MODALITIES})
     tical_storage.update({"prototype_tau_" + name: [] for name in MODALITIES})
     tical_storage.update({"wheel_pseudo_" + name: [] for name in MODALITIES})
+    for prefix in ("wheel_correct_", "geometry_norm_", "off_plane_norm_",
+                   "prototype_distance_", "prototype_margin_"):
+        tical_storage.update({prefix + name: [] for name in MODALITIES})
     tical_storage.update({"kappa": [], "correct": [],
                           "categorical_discrepancy": [],
                           "wheel_discrepancy": [], "anchors_added": 0})
@@ -332,6 +385,7 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     metrics = {name: value / count for name, value in totals.items()}
     metrics.update({"accuracy": 100.0 * accuracy_score(true, predicted),
                     "weighted_f1": 100.0 * f1_score(true, predicted, average="weighted", zero_division=0),
+                    "macro_f1": 100.0 * f1_score(true, predicted, average="macro", zero_division=0),
                     "utterances": count})
     metrics.update(_tical_epoch_metrics(tical_storage, model, count))
     return metrics, rows, true, predicted
@@ -497,7 +551,8 @@ def main(argv=None):
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
-                     "wheel_temperature", "wheel_anchor_mix"):
+                     "wheel_temperature", "wheel_anchor_mix",
+                     "wheel_geometry"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -507,6 +562,7 @@ def main(argv=None):
                      "oof_reliability_targets", "tical_mode", "lambda_hyp",
                      "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
                      "wheel_prototype_radius", "wheel_temperature",
+                     "wheel_geometry",
                      "wheel_anchor_mix", "lambda_wheel_proto",
                      "lambda_wheel_cpcc"):
             if name in checkpoint["args"]:
@@ -549,7 +605,8 @@ def main(argv=None):
         method_tag += "_minclass{}".format(
             model_config["anchor_min_per_class"])
     if model_config.get("use_emotion_wheel"):
-        method_tag += "_wheel"
+        method_tag += "_wheel_{}".format(
+            model_config.get("wheel_geometry", "poincare"))
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))

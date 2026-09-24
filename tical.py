@@ -10,6 +10,12 @@ import math
 import torch
 import torch.nn as nn
 
+from geometry_analysis.geometry import (GEOMETRIES, GeometryProjector,
+                                        geometry_cpcc_loss,
+                                        geometry_distance,
+                                        geometry_prototype_outputs,
+                                        wheel_prototypes)
+
 
 MODALITIES = ("t", "a", "v")
 EMOTION_WHEEL_ORDERS = {
@@ -43,81 +49,35 @@ def circular_class_distance_matrix(class_angles):
 
 def emotion_wheel_prototypes(class_angles, feature_dim, radius=0.75, eps=1e-5):
     """Embed fixed emotion-wheel prototypes in the first two ball dimensions."""
-    if feature_dim < 2:
-        raise ValueError("emotion-wheel prototypes require at least 2 dimensions")
-    if not math.isfinite(radius) or not 0.0 < radius < 1.0 - eps:
-        raise ValueError("prototype radius must be in (0, 1 - hyp_eps)")
-    prototypes = class_angles.new_zeros(class_angles.numel(), feature_dim)
-    prototypes[:, 0] = radius * torch.cos(class_angles)
-    prototypes[:, 1] = radius * torch.sin(class_angles)
-    return prototypes
+    return wheel_prototypes(
+        class_angles, feature_dim, "poincare", radius, eps)
 
 
-class HyperbolicProjector(nn.Module):
+class HyperbolicProjector(GeometryProjector):
     """Learned Euclidean projection followed by the exp-map at the ball origin."""
 
     def __init__(self, input_dim, output_dim, eps=1e-5):
-        super().__init__()
-        if input_dim < 1 or output_dim < 1:
-            raise ValueError("projection dimensions must be positive")
-        if not 0 < eps < 0.1:
-            raise ValueError("hyp_eps must be in (0, 0.1)")
-        self.linear = nn.Linear(input_dim, output_dim)
-        # Default Linear initialization pushes high-dimensional vectors close
-        # to the unit-ball boundary.  Start near the origin for stable distance.
-        nn.init.xavier_uniform_(self.linear.weight, gain=0.01)
-        nn.init.zeros_(self.linear.bias)
-        self.eps = eps
-
-    def forward(self, features):
-        tangent = self.linear(features)
-        norm = tangent.norm(p=2, dim=-1, keepdim=True).clamp_min(self.eps)
-        projected = torch.tanh(norm) * tangent / norm
-        projected_norm = projected.norm(p=2, dim=-1, keepdim=True)
-        scale = ((1.0 - self.eps) / projected_norm.clamp_min(self.eps)).clamp(max=1.0)
-        projected = projected * scale
-        if not torch.isfinite(projected).all():
-            raise FloatingPointError("nonfinite Poincare projection")
-        return projected
+        super().__init__(input_dim, output_dim, "poincare", eps)
 
 
 def poincare_distance(first, second, eps=1e-5):
     """Poincare-ball distance with broadcasting over all leading dimensions."""
-    if first.size(-1) != second.size(-1):
-        raise ValueError("Poincare vectors must have the same final dimension")
-    first_sq = (first * first).sum(dim=-1).clamp(max=1.0 - eps)
-    second_sq = (second * second).sum(dim=-1).clamp(max=1.0 - eps)
-    difference_sq = ((first - second) ** 2).sum(dim=-1)
-    denominator = ((1.0 - first_sq) * (1.0 - second_sq)).clamp_min(eps)
-    argument = (1.0 + 2.0 * difference_sq / denominator).clamp_min(1.0 + eps)
-    distance = torch.acosh(argument)
-    if not torch.isfinite(distance).all():
-        raise FloatingPointError("nonfinite hyperbolic distance")
-    return distance
+    return geometry_distance(first, second, "poincare", eps)
 
 
 def hyperbolic_prototype_outputs(features, prototypes, temperature=1.0,
                                  eps=1e-5):
     """Return class distances, logits, pseudo-labels, and absolute typicality."""
-    if features.ndim != 2 or prototypes.ndim != 2:
-        raise ValueError("features and prototypes must be two-dimensional")
-    if features.size(-1) != prototypes.size(-1):
-        raise ValueError("features and prototypes must share their final dimension")
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("wheel temperature must be finite and positive")
-    distances = poincare_distance(
-        features.unsqueeze(1), prototypes.unsqueeze(0), eps)
-    nearest_distance, pseudo_labels = distances.min(dim=-1)
-    logits = -distances / temperature
-    typicality = torch.exp(-nearest_distance / temperature).clamp(0.0, 1.0)
-    return distances, logits, pseudo_labels, typicality
+    return geometry_prototype_outputs(
+        features, prototypes, "poincare", temperature, eps)
 
 
 class AnchorBank(nn.Module):
     """A bounded FIFO bank of detached hyperbolic features and class labels."""
 
     def __init__(self, feature_dim, n_classes, max_size, eps=1e-5,
-                 query_chunk_size=256, balance_mode="none"):
+                 query_chunk_size=256, balance_mode="none",
+                 geometry="poincare"):
         super().__init__()
         if max_size < 1 or query_chunk_size < 1:
             raise ValueError("anchor size and query chunk size must be positive")
@@ -131,6 +91,9 @@ class AnchorBank(nn.Module):
         self.eps = eps
         self.query_chunk_size = query_chunk_size
         self.balance_mode = balance_mode
+        if geometry not in GEOMETRIES:
+            raise ValueError("unknown anchor geometry: {}".format(geometry))
+        self.geometry = geometry
         self.register_buffer("features", torch.empty(0, feature_dim))
         self.register_buffer("labels", torch.empty(0, dtype=torch.long))
 
@@ -189,8 +152,9 @@ class AnchorBank(nn.Module):
             raise ValueError("query features have the wrong shape")
         distances, nearest_labels = [], []
         for chunk in features.split(self.query_chunk_size, dim=0):
-            pairwise = poincare_distance(
-                chunk.unsqueeze(1), self.features.unsqueeze(0), self.eps)
+            pairwise = geometry_distance(
+                chunk.unsqueeze(1), self.features.unsqueeze(0),
+                self.geometry, self.eps)
             nearest_distance, nearest_index = pairwise.min(dim=1)
             distances.append(nearest_distance)
             nearest_labels.append(self.labels[nearest_index])
@@ -268,34 +232,11 @@ def compute_consistency(tau_t, tau_a, tau_v, label_discrepancy,
 
 
 def hyp_cpcc_loss(features, pseudo_labels, eps=1e-8, hyp_eps=1e-5,
-                  class_distance_matrix=None):
+                  class_distance_matrix=None, geometry="poincare"):
     """Minimize 1 - correlation of geometry and categorical/wheel distance."""
-    if features.ndim != 2 or pseudo_labels.ndim != 1:
-        raise ValueError("HypCPCC expects [N,D] features and [N] labels")
-    if features.size(0) < 2:
-        return features.sum() * 0.0
-    row, column = torch.triu_indices(
-        features.size(0), features.size(0), offset=1, device=features.device)
-    geometric = poincare_distance(features[row], features[column], hyp_eps)
-    if class_distance_matrix is None:
-        categorical = (pseudo_labels[row] != pseudo_labels[column]).type_as(geometric)
-    else:
-        if class_distance_matrix.ndim != 2 or (
-                class_distance_matrix.size(0) != class_distance_matrix.size(1)):
-            raise ValueError("class distance matrix must be square")
-        if pseudo_labels.numel() and (
-                pseudo_labels.min() < 0
-                or pseudo_labels.max() >= class_distance_matrix.size(0)):
-            raise ValueError("labels exceed the class distance matrix")
-        categorical = class_distance_matrix[
-            pseudo_labels[row], pseudo_labels[column]].type_as(geometric)
-    geometric = geometric - geometric.mean()
-    categorical = categorical - categorical.mean()
-    denominator = geometric.square().sum().sqrt() * categorical.square().sum().sqrt()
-    if denominator.detach().item() <= eps:
-        return geometric.sum() * 0.0
-    correlation = (geometric * categorical).sum() / denominator.clamp_min(eps)
-    return 1.0 - correlation.clamp(-1.0, 1.0)
+    return geometry_cpcc_loss(
+        features, pseudo_labels, geometry, eps, hyp_eps,
+        class_distance_matrix)
 
 
 class TiCALModule(nn.Module):
@@ -308,7 +249,8 @@ class TiCALModule(nn.Module):
                  dataset="IEMOCAP", use_emotion_wheel=False,
                  wheel_prototype_radius=0.75, wheel_temperature=1.0,
                  wheel_anchor_mix=0.5, anchor_balance="none",
-                 anchor_min_per_class=0, anchor_admission="teacher"):
+                 anchor_min_per_class=0, anchor_admission="teacher",
+                 wheel_geometry="poincare"):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -337,6 +279,9 @@ class TiCALModule(nn.Module):
         self.anchor_min_per_class = int(anchor_min_per_class)
         self.anchor_admission = anchor_admission
         self.use_emotion_wheel = bool(use_emotion_wheel)
+        if wheel_geometry not in GEOMETRIES:
+            raise ValueError("unknown wheel geometry: {}".format(wheel_geometry))
+        self.wheel_geometry = wheel_geometry
         self.wheel_temperature = float(wheel_temperature)
         self.wheel_anchor_mix = float(wheel_anchor_mix)
         if self.use_emotion_wheel:
@@ -349,20 +294,21 @@ class TiCALModule(nn.Module):
             self.register_buffer("wheel_angles", wheel_angles)
             self.register_buffer(
                 "wheel_prototypes",
-                emotion_wheel_prototypes(
-                    wheel_angles, hyperbolic_dim,
+                wheel_prototypes(
+                    wheel_angles, hyperbolic_dim, wheel_geometry,
                     wheel_prototype_radius, hyp_eps))
             self.register_buffer(
                 "wheel_class_distances",
                 circular_class_distance_matrix(wheel_angles))
         self.projectors = nn.ModuleDict({
-            name: HyperbolicProjector(hidden_dim, hyperbolic_dim, hyp_eps)
+            name: GeometryProjector(
+                hidden_dim, hyperbolic_dim, wheel_geometry, hyp_eps)
             for name in MODALITIES
         })
         self.anchor_banks = nn.ModuleDict({
             name: AnchorBank(
                 hyperbolic_dim, n_classes, anchor_size, hyp_eps,
-                balance_mode=anchor_balance)
+                balance_mode=anchor_balance, geometry=wheel_geometry)
             for name in MODALITIES
         })
 
@@ -386,6 +332,7 @@ class TiCALModule(nn.Module):
                   "wheel_discrepancy": None, "label_discrepancy": None,
                   "kappa": None, "hyp_eps": self.hyp_eps,
                   "wheel_enabled": self.use_emotion_wheel,
+                  "wheel_geometry": self.wheel_geometry,
                   "wheel_distances": None, "wheel_logits": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
                   "wheel_class_distances": (
@@ -398,9 +345,10 @@ class TiCALModule(nn.Module):
             for name in MODALITIES:
                 (wheel_distances[name], wheel_logits[name],
                  wheel_pseudo[name], prototype_tau[name]) = (
-                    hyperbolic_prototype_outputs(
+                    geometry_prototype_outputs(
                         projected[name][valid], self.wheel_prototypes,
-                        self.wheel_temperature, self.hyp_eps))
+                        self.wheel_geometry, self.wheel_temperature,
+                        self.hyp_eps))
                 if self.detach_tau:
                     prototype_tau[name] = prototype_tau[name].detach()
             result.update({

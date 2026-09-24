@@ -81,7 +81,7 @@ class Transformer_Based_Model(SDTBackbone):
                  use_emotion_wheel=False, wheel_prototype_radius=0.75,
                  wheel_temperature=1.0, wheel_anchor_mix=0.5,
                  anchor_balance="none", anchor_min_per_class=0,
-                 anchor_admission="teacher"):
+                 anchor_admission="teacher", wheel_geometry="poincare"):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -111,6 +111,7 @@ class Transformer_Based_Model(SDTBackbone):
         self.tical_warmup_epochs = tical_warmup_epochs
         self.beta_gate = beta_gate
         self.use_emotion_wheel = bool(use_emotion_wheel)
+        self.wheel_geometry = wheel_geometry
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -119,7 +120,7 @@ class Transformer_Based_Model(SDTBackbone):
                 consistency_t, consistency_k, detach_tau, detach_kappa,
                 dataset, use_emotion_wheel, wheel_prototype_radius,
                 wheel_temperature, wheel_anchor_mix, anchor_balance,
-                anchor_min_per_class, anchor_admission)
+                anchor_min_per_class, anchor_admission, wheel_geometry)
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(

@@ -218,7 +218,8 @@ class SDTCOLDLoss(nn.Module):
             hyp = sum(hyp_cpcc_loss(
                 tical_output["projected"][name][valid],
                 tical_output["pseudo_labels"][name],
-                hyp_eps=tical_output["hyp_eps"])
+                hyp_eps=tical_output["hyp_eps"],
+                geometry=tical_output.get("wheel_geometry", "poincare"))
                 for name in MODALITIES) / len(MODALITIES)
         weighted_hyp = self.lambda_hyp * hyp
         wheel_proto = zero
@@ -242,6 +243,7 @@ class SDTCOLDLoss(nn.Module):
                     valid_targets,
                     hyp_eps=tical_output["hyp_eps"],
                     class_distance_matrix=class_distances,
+                    geometry=tical_output.get("wheel_geometry", "poincare"),
                 )
                 for name in MODALITIES
             ) / len(MODALITIES)

@@ -342,6 +342,32 @@ class TiCALTests(unittest.TestCase):
             torch.ones_like(output["fusion_weights"].sum(dim=-2)),
             atol=1e-6, rtol=0)
 
+    def test_pure_fusion_uses_pure_features_for_gate_students_and_teacher(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            fusion_feature_source="pure").eval()
+        output = model(*self.inputs)
+        self.assertEqual(output["fusion_feature_source"], "pure")
+        torch.testing.assert_close(output["fusion_features"], output["pure"])
+        expected_weights = torch.softmax(
+            model.last_gate.fc(output["pure"]), dim=-2)
+        torch.testing.assert_close(output["sdt_weights"], expected_weights)
+        expected_fused = (expected_weights * output["pure"]).sum(dim=-2)
+        torch.testing.assert_close(output["fused"], expected_fused)
+        classifiers = (model.t_output_layer, model.a_output_layer,
+                       model.v_output_layer)
+        for index, (name, classifier) in enumerate(
+                zip(MODALITIES, classifiers)):
+            torch.testing.assert_close(
+                output["student_logits"][name],
+                classifier(output["pure"][:, :, index, :]))
+
+        with self.assertRaises(ValueError):
+            Transformer_Based_Model(
+                **{**self.config, "fusion_variant": "guided"},
+                fusion_feature_source="pure")
+
     def test_tical_queries_old_bank_and_ca_kd_matches_formula(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="kd",

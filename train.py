@@ -14,8 +14,9 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from dataloader import BASE_DIR, DialogueDataset, make_loaders, split_dialogues
 from losses import SDTCOLDLoss, wheel_uncertainty_target
-from model import (DISTRIBUTION_INIT_MODES, FUSION_VARIANTS, MODALITIES,
-                   WHEEL_UNCERTAINTY_MODES, Transformer_Based_Model)
+from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
+                   FUSION_VARIANTS, MODALITIES, WHEEL_UNCERTAINTY_MODES,
+                   Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
 
@@ -26,6 +27,9 @@ def build_parser():
     parser.add_argument("--feature-path")
     parser.add_argument("--fusion-variant", choices=FUSION_VARIANTS, default="guided",
                         help="guided=B, replace=A, oof-guided=OOF reliability, sdt=baseline")
+    parser.add_argument("--fusion-feature-source",
+                        choices=FUSION_FEATURE_SOURCES, default="enhanced",
+                        help="enhanced=H' SDT fusion; pure=H_TT/H_AA/H_VV fusion")
     parser.add_argument("--distribution-init", choices=DISTRIBUTION_INIT_MODES,
                         default="random",
                         help="sdt-preserving initializes mu=H' and variance small")
@@ -155,6 +159,7 @@ def make_model_config(args, dataset):
             "n_head": args.n_head, "n_classes": dataset.n_classes,
             "hidden_dim": args.hidden_dim, "n_speakers": dataset.n_speakers,
             "dropout": args.dropout, "fusion_variant": args.fusion_variant,
+            "fusion_feature_source": args.fusion_feature_source,
             "logvar_min": args.logvar_min, "logvar_max": args.logvar_max,
             "cold_eps": args.cold_eps, "distribution_init": args.distribution_init,
             "initial_logvar": args.initial_logvar, "use_tical": args.use_tical,
@@ -640,6 +645,9 @@ def main(argv=None):
         raise ValueError("--fusion-variant oof-guided requires --oof-reliability-targets")
     if args.fusion_variant != "oof-guided" and args.oof_reliability_targets:
         raise ValueError("--oof-reliability-targets requires --fusion-variant oof-guided")
+    if (args.fusion_feature_source == "pure"
+            and args.fusion_variant != "sdt"):
+        raise ValueError("--fusion-feature-source pure requires --fusion-variant sdt")
     if args.use_tical and args.fusion_variant != "sdt":
         raise ValueError("--use-tical requires --fusion-variant sdt (COLD is disabled)")
     if args.use_emotion_wheel and not args.use_tical:
@@ -696,6 +704,7 @@ def main(argv=None):
         checkpoint = torch.load(args.eval_checkpoint, map_location="cpu", weights_only=True)
         args.dataset = checkpoint["model_config"]["dataset"]
         for name in ("temp", "n_head", "hidden_dim", "dropout", "fusion_variant",
+                     "fusion_feature_source",
                      "logvar_min", "logvar_max", "cold_eps", "distribution_init",
                      "initial_logvar", "use_tical", "tical_mode",
                      "tical_warmup_epochs", "anchor_size", "anchor_balance",
@@ -761,6 +770,8 @@ def main(argv=None):
         init_tag = "no_distribution"
     method_tag = ("tical_" + model_config["tical_mode"]
                   if model_config.get("use_tical") else model_config["fusion_variant"])
+    if model_config.get("fusion_feature_source", "enhanced") == "pure":
+        method_tag += "_purefusion"
     if (model_config.get("use_tical")
             and model_config.get("anchor_balance", "none") != "none"):
         method_tag += "_anchors_" + model_config["anchor_balance"]

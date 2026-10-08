@@ -35,6 +35,7 @@ esac
 # is the uncertainty-aware residual gate selected above.
 export TICAL_MODE=observe
 exec bash "$SCRIPT_DIR/exec_iemocap_tical.sh" \
+  --tical-warmup-epochs 10 \
   --use-emotion-wheel --wheel-geometry poincare \
   --wheel-radius-mode free \
   --hyperbolic-dim 16 \

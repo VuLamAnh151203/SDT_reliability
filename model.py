@@ -12,6 +12,7 @@ from tical import MODALITIES as TICAL_MODALITIES, TiCALModule
 
 MODALITIES = ("t", "a", "v")
 FUSION_VARIANTS = ("guided", "replace", "oof-guided", "sdt")
+FUSION_FEATURE_SOURCES = ("enhanced", "pure")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 WHEEL_UNCERTAINTY_MODES = ("none", "gate", "supervise", "full")
 
@@ -121,9 +122,15 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_uncertainty_temperature=1.0,
                  wheel_uncertainty_gate_strength=0.5,
                  wheel_uncertainty_warmup_epochs=10,
-                 wheel_uncertainty_ramp_epochs=5):
+                 wheel_uncertainty_ramp_epochs=5,
+                 fusion_feature_source="enhanced"):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
+        if fusion_feature_source not in FUSION_FEATURE_SOURCES:
+            raise ValueError("unknown fusion feature source: {}".format(
+                fusion_feature_source))
+        if fusion_feature_source == "pure" and fusion_variant != "sdt":
+            raise ValueError("pure fusion requires --fusion-variant sdt")
         if not math.isfinite(temp) or temp <= 0:
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(cold_eps) or cold_eps <= 0:
@@ -163,6 +170,7 @@ class Transformer_Based_Model(SDTBackbone):
         super().__init__(dataset, temp, D_text, D_visual, D_audio, n_head,
                          n_classes, hidden_dim, n_speakers, dropout)
         self.fusion_variant = fusion_variant
+        self.fusion_feature_source = fusion_feature_source
         self.cold_eps = cold_eps
         self.distribution_init = distribution_init
         self.initial_logvar = initial_logvar
@@ -222,13 +230,15 @@ class Transformer_Based_Model(SDTBackbone):
 
     def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len):
         """Label-free forward. qmask is [B,L,S]; inputs are [L,B,D_m]."""
-        if self.use_tical:
+        if self.use_tical or self.fusion_feature_source == "pure":
             enhanced, pure = self.encode_modalities(
                 textf, visuf, acouf, u_mask, qmask, dia_len, return_pure=True)
         else:
             enhanced = self.encode_modalities(textf, visuf, acouf, u_mask, qmask, dia_len)
             pure = None
         features = torch.stack(enhanced, dim=-2)
+        pure_features = (torch.stack(pure, dim=-2)
+                         if pure is not None else None)
         distributions = {}
         variance_norm = confidence = reliability_logits = reliability = None
         tical_output = None
@@ -237,8 +247,12 @@ class Transformer_Based_Model(SDTBackbone):
         wheel_uncertainty_scales = None
         wheel_uncertainty_progress = self.wheel_uncertainty_progress()
         if self.fusion_variant == "sdt":
-            latents = features
-            sdt_weights = torch.softmax(self.last_gate.fc(features), dim=-2)
+            fusion_features = (pure_features
+                               if self.fusion_feature_source == "pure"
+                               else features)
+            latents = fusion_features
+            sdt_weights = torch.softmax(
+                self.last_gate.fc(fusion_features), dim=-2)
             fusion_weights = sdt_weights
             if self.use_tical:
                 tical_output = self.tical(
@@ -261,8 +275,9 @@ class Transformer_Based_Model(SDTBackbone):
                         dim=-1)
                 if self.tical_mode in ("fusion", "full") and tical_output["ready"]:
                     valid = u_mask.bool()
-                    tau_full = features.new_ones(*u_mask.shape, len(MODALITIES))
-                    kappa_full = features.new_ones(*u_mask.shape)
+                    tau_full = fusion_features.new_ones(
+                        *u_mask.shape, len(MODALITIES))
+                    kappa_full = fusion_features.new_ones(*u_mask.shape)
                     tau_full[valid] = torch.stack(
                         [tical_output["tau"][name] for name in MODALITIES], dim=-1)
                     kappa_full[valid] = tical_output["kappa"]
@@ -287,7 +302,7 @@ class Transformer_Based_Model(SDTBackbone):
                 fusion_weights = fusion_weights / fusion_weights.sum(
                     dim=-2, keepdim=True).clamp_min(
                         self.tical.typicality_eps)
-            fused = (fusion_weights * features).sum(dim=-2)
+            fused = (fusion_weights * fusion_features).sum(dim=-2)
         elif self.fusion_variant == "oof-guided":
             # No Gaussian bottleneck and no sampling: classifiers and fusion
             # retain SDT's enhanced representations H'.
@@ -335,7 +350,9 @@ class Transformer_Based_Model(SDTBackbone):
             "student_kl_log_prob": {m: F.log_softmax(student_logits[m] / self.temp, dim=-1) for m in MODALITIES},
             "teacher_kl_prob": F.softmax(logits / self.temp, dim=-1),
             "enhanced": features,
-            "pure": (torch.stack(pure, dim=-2) if pure is not None else None),
+            "pure": pure_features,
+            "fusion_feature_source": self.fusion_feature_source,
+            "fusion_features": latents,
             "distributions": distributions,
             "latents": latents,
             "variance_norm": variance_norm,

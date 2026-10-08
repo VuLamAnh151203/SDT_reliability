@@ -408,6 +408,9 @@ def infer_experiment_id(config, args):
         run_id += "-zerores"
     if dimension != 16:
         run_id += "-d{}".format(dimension)
+    uncertainty_mode = config.get("wheel_uncertainty_mode", "none")
+    if uncertainty_mode != "none":
+        run_id += "-unc-" + uncertainty_mode
     return run_id
 
 
@@ -726,6 +729,8 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
         "radius_mode": config.get("wheel_radius_mode", "free"),
         "fixed_radius": float(config.get("wheel_fixed_radius", 0.75)),
         "zero_residual": bool(config.get("wheel_zero_residual", False)),
+        "wheel_uncertainty_mode": config.get(
+            "wheel_uncertainty_mode", "none"),
         "lambda_proto": float(saved_args.get("lambda_wheel_proto", 0.0)),
         "lambda_cpcc": float(saved_args.get("lambda_wheel_cpcc", 0.0)),
         "n_utterances": int(labels.size),
@@ -782,6 +787,8 @@ def write_markdown(path, report):
         "- Geometry: `{}` ({}D); radius: `{}`; zero residual: `{}`".format(
             report["geometry"], report["dimension"],
             report["radius_mode"], report["zero_residual"]),
+        "- Wheel uncertainty mode: `{}`".format(
+            report["wheel_uncertainty_mode"]),
         "- Split: `{}`; utterances: {}; pairwise subset: {}".format(
             report["split"], report["n_utterances"],
             report["n_pairwise_utterances"]),
@@ -996,6 +1003,7 @@ def flattened_report_row(report):
         "radius_mode": report["radius_mode"],
         "fixed_radius": report["fixed_radius"],
         "zero_residual": report["zero_residual"],
+        "wheel_uncertainty_mode": report["wheel_uncertainty_mode"],
         "weighted_f1": report["classification"]["weighted_f1"],
         "macro_f1": report["classification"]["macro_f1"],
         "accuracy": report["classification"]["accuracy"],

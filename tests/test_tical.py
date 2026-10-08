@@ -8,7 +8,8 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from losses import SDTCOLDLoss, masked_kl_per_utterance
+from losses import (SDTCOLDLoss, masked_kl_per_utterance,
+                    wheel_uncertainty_target)
 from model import MODALITIES, Transformer_Based_Model
 from tical import (AnchorBank, HyperbolicProjector, TiCALModule, compute_consistency,
                    blend_typicality, circular_class_distance_matrix,
@@ -251,6 +252,95 @@ class TiCALTests(unittest.TestCase):
             self.assertEqual(
                 two_dimensional_output["tical"]["projected"][name].shape[-1],
                 2)
+
+    def test_wheel_uncertainty_target_respects_semantic_error(self):
+        class_distances = torch.tensor([
+            [0.0, 0.25, 1.0],
+            [0.25, 0.0, 0.75],
+            [1.0, 0.75, 0.0],
+        ])
+        logits = torch.tensor([
+            [10.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, 0.0, 10.0],
+        ], requires_grad=True)
+        target = wheel_uncertainty_target(
+            logits, torch.zeros(3, dtype=torch.long), class_distances)
+        self.assertFalse(target.requires_grad)
+        self.assertLess(target[0].item(), target[1].item())
+        self.assertLess(target[1].item(), target[2].item())
+
+    def test_wheel_uncertainty_warmup_preserves_baseline_and_loss_trains_head(self):
+        common = dict(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_geometry="poincare", wheel_prototype_radius=0.7)
+        baseline = Transformer_Based_Model(**common).eval()
+        uncertainty = Transformer_Based_Model(
+            **common, wheel_uncertainty_mode="full",
+            wheel_uncertainty_hidden_dim=6,
+            wheel_uncertainty_warmup_epochs=2,
+            wheel_uncertainty_ramp_epochs=2,
+            wheel_uncertainty_gate_strength=1.0).eval()
+        result = uncertainty.load_state_dict(
+            baseline.state_dict(), strict=False)
+        self.assertFalse(result.unexpected_keys)
+
+        uncertainty.set_tical_epoch(2)
+        expected = baseline(*self.inputs)
+        warmup = uncertainty(*self.inputs)
+        torch.testing.assert_close(
+            warmup["logits"], expected["logits"], atol=0, rtol=0)
+        torch.testing.assert_close(
+            warmup["wheel_uncertainty_weights"],
+            torch.full_like(warmup["wheel_uncertainty_weights"], 1 / 3),
+            atol=1e-7, rtol=0)
+        self.assertEqual(warmup["wheel_uncertainty_progress"], 0.0)
+
+        uncertainty.train()
+        uncertainty.set_tical_epoch(4)
+        output = uncertainty(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_hyp=0, wheel_uncertainty_mode="full",
+            lambda_wheel_uncertainty=1.0)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertEqual(output["wheel_uncertainty_progress"], 1.0)
+        self.assertGreater(parts["wheel_uncertainty"].item(), 0.0)
+        torch.testing.assert_close(
+            loss, parts["weighted_wheel_uncertainty"])
+        loss.backward()
+        gradient = uncertainty.wheel_uncertainty_heads[
+            "t"].network[-1].weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_wheel_uncertainty_gate_reweights_original_sdt_gate(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_geometry="poincare", wheel_uncertainty_mode="gate",
+            wheel_uncertainty_warmup_epochs=0,
+            wheel_uncertainty_ramp_epochs=0,
+            wheel_uncertainty_gate_strength=1.0).eval()
+        biases = {"t": -4.0, "a": 0.0, "v": 4.0}
+        with torch.no_grad():
+            for name, bias in biases.items():
+                model.wheel_uncertainty_heads[name].network[-1].bias.fill_(
+                    bias)
+        model.set_tical_epoch(1)
+        output = model(*self.inputs)
+        weights = output["wheel_uncertainty_weights"]
+        self.assertTrue((weights[..., 0] > weights[..., 1]).all())
+        self.assertTrue((weights[..., 1] > weights[..., 2]).all())
+        torch.testing.assert_close(
+            weights.sum(dim=-1), torch.ones_like(weights[..., 0]))
+        torch.testing.assert_close(
+            output["fusion_weights"].sum(dim=-2),
+            torch.ones_like(output["fusion_weights"].sum(dim=-2)),
+            atol=1e-6, rtol=0)
 
     def test_tical_queries_old_bank_and_ca_kd_matches_formula(self):
         model = Transformer_Based_Model(

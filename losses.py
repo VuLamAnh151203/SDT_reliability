@@ -86,6 +86,19 @@ def reliability_kl(predicted_logits, target_probabilities, mask):
     return (targets * (log_targets - log_predictions)).sum(dim=-1).mean()
 
 
+def wheel_uncertainty_target(wheel_logits, labels, class_distances):
+    """Expected wheel distance to the true class; target is stop-gradient."""
+    if wheel_logits.ndim != 2 or labels.ndim != 1:
+        raise ValueError("wheel uncertainty expects [N,K] logits and [N] labels")
+    if wheel_logits.size(0) != labels.numel():
+        raise ValueError("wheel uncertainty logit/label counts differ")
+    if class_distances.shape != (wheel_logits.size(1), wheel_logits.size(1)):
+        raise ValueError("wheel class-distance matrix has the wrong shape")
+    probabilities = wheel_logits.softmax(dim=-1)
+    targets = (probabilities * class_distances[labels]).sum(dim=-1)
+    return targets.detach()
+
+
 class COLDLoss(nn.Module):
     def __init__(self, detach_errors=True):
         super().__init__()
@@ -132,11 +145,13 @@ class SDTCOLDLoss(nn.Module):
                  gamma_3=1.0, lambda_co=0.1, lambda_reg=0.1,
                  detach_errors=True, lambda_reliability=1.0,
                  tical_mode=None, lambda_hyp=0.1,
-                 lambda_wheel_proto=0.0, lambda_wheel_cpcc=0.0):
+                 lambda_wheel_proto=0.0, lambda_wheel_cpcc=0.0,
+                 wheel_uncertainty_mode="none",
+                 lambda_wheel_uncertainty=0.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
-                   lambda_wheel_cpcc)
+                   lambda_wheel_cpcc, lambda_wheel_uncertainty)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -148,6 +163,12 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_hyp = lambda_hyp
         self.lambda_wheel_proto = lambda_wheel_proto
         self.lambda_wheel_cpcc = lambda_wheel_cpcc
+        if wheel_uncertainty_mode not in (
+                "none", "gate", "supervise", "full"):
+            raise ValueError("unknown wheel uncertainty mode: {}".format(
+                wheel_uncertainty_mode))
+        self.wheel_uncertainty_mode = wheel_uncertainty_mode
+        self.lambda_wheel_uncertainty = lambda_wheel_uncertainty
         self.ce = MaskedNLLLoss(class_weights)
         self.kl = MaskedKLDivLoss()
         self.cold = COLDLoss(detach_errors=detach_errors)
@@ -249,9 +270,48 @@ class SDTCOLDLoss(nn.Module):
             ) / len(MODALITIES)
         weighted_wheel_proto = self.lambda_wheel_proto * wheel_proto
         weighted_wheel_cpcc = self.lambda_wheel_cpcc * wheel_cpcc
+        wheel_uncertainty = zero
+        wheel_uncertainty_by_modality = {
+            name: zero for name in MODALITIES}
+        uncertainty_target_means = {name: zero for name in MODALITIES}
+        uncertainty_prediction_means = {name: zero for name in MODALITIES}
+        uncertainty_weight_means = {name: zero for name in MODALITIES}
+        uncertainty_weight_entropy = zero
+        uncertainty_output = outputs.get("wheel_uncertainty")
+        if (wheel_ready
+                and self.wheel_uncertainty_mode in ("supervise", "full")):
+            if uncertainty_output is None:
+                raise ValueError("wheel uncertainty outputs are missing")
+            for name in MODALITIES:
+                prediction = uncertainty_output[name][valid]
+                target = wheel_uncertainty_target(
+                    tical_output["wheel_logits"][name], valid_targets,
+                    class_distances)
+                wheel_uncertainty_by_modality[name] = F.mse_loss(
+                    prediction, target)
+                uncertainty_target_means[name] = target.mean()
+                uncertainty_prediction_means[name] = prediction.mean()
+            wheel_uncertainty = sum(
+                wheel_uncertainty_by_modality.values()) / len(MODALITIES)
+        if outputs.get("wheel_uncertainty_weights") is not None:
+            valid_uncertainty_weights = outputs[
+                "wheel_uncertainty_weights"][valid]
+            uncertainty_weight_entropy = -(
+                valid_uncertainty_weights
+                * valid_uncertainty_weights.clamp_min(1e-12).log()
+            ).sum(dim=-1).mean()
+            for index, name in enumerate(MODALITIES):
+                uncertainty_weight_means[name] = valid_uncertainty_weights[
+                    ..., index].mean()
+        uncertainty_progress = float(outputs.get(
+            "wheel_uncertainty_progress", 0.0))
+        weighted_wheel_uncertainty = (
+            self.lambda_wheel_uncertainty * uncertainty_progress
+            * wheel_uncertainty)
         total = (sdt + weighted_cold + weighted_reg
                  + weighted_reliability + weighted_hyp
-                 + weighted_wheel_proto + weighted_wheel_cpcc)
+                 + weighted_wheel_proto + weighted_wheel_cpcc
+                 + weighted_wheel_uncertainty)
         sample_keep_rate = (torch.ones((), device=total.device) if sample_keep_mask is None
                             else sample_keep_mask[valid].float().mean())
         modality_keep_rate = (torch.ones((), device=total.device) if modality_keep_mask is None
@@ -264,9 +324,23 @@ class SDTCOLDLoss(nn.Module):
                  "weighted_wheel_proto": weighted_wheel_proto,
                  "wheel_cpcc": wheel_cpcc,
                  "weighted_wheel_cpcc": weighted_wheel_cpcc,
+                 "wheel_uncertainty": wheel_uncertainty,
+                 "weighted_wheel_uncertainty": weighted_wheel_uncertainty,
+                 "wheel_uncertainty_progress": zero + uncertainty_progress,
+                 "wheel_uncertainty_weight_entropy": (
+                     uncertainty_weight_entropy),
                  "weighted_cold": weighted_cold, "weighted_reg": weighted_reg,
                  "reliability_loss": reliability,
                  "weighted_reliability": weighted_reliability,
                  "sample_keep_rate": sample_keep_rate,
                  "modality_keep_rate": modality_keep_rate}
+        for name in MODALITIES:
+            parts["wheel_uncertainty_" + name] = (
+                wheel_uncertainty_by_modality[name])
+            parts["wheel_uncertainty_target_" + name] = (
+                uncertainty_target_means[name])
+            parts["wheel_uncertainty_prediction_" + name] = (
+                uncertainty_prediction_means[name])
+            parts["wheel_uncertainty_weight_" + name] = (
+                uncertainty_weight_means[name])
         return total, parts, errors

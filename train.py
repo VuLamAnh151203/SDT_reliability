@@ -13,9 +13,9 @@ import torch
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
 from dataloader import BASE_DIR, DialogueDataset, make_loaders, split_dialogues
-from losses import SDTCOLDLoss
+from losses import SDTCOLDLoss, wheel_uncertainty_target
 from model import (DISTRIBUTION_INIT_MODES, FUSION_VARIANTS, MODALITIES,
-                   Transformer_Based_Model)
+                   WHEEL_UNCERTAINTY_MODES, Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
 
@@ -71,6 +71,18 @@ def build_parser():
                         help="0=anchor typicality, 1=prototype typicality")
     parser.add_argument("--lambda-wheel-proto", type=float, default=0.0)
     parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
+    parser.add_argument("--wheel-uncertainty-mode",
+                        choices=WHEEL_UNCERTAINTY_MODES, default="none",
+                        help="none/gate/supervise/full uncertainty-aware fusion ablation")
+    parser.add_argument("--lambda-wheel-uncertainty", type=float, default=0.0)
+    parser.add_argument("--wheel-uncertainty-hidden-dim", type=int, default=32)
+    parser.add_argument("--wheel-uncertainty-temperature", type=float, default=1.0)
+    parser.add_argument("--wheel-uncertainty-gate-strength", type=float,
+                        default=0.5)
+    parser.add_argument("--wheel-uncertainty-warmup-epochs", type=int,
+                        default=10)
+    parser.add_argument("--wheel-uncertainty-ramp-epochs", type=int,
+                        default=5)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--hidden-dim", "--hidden_dim", dest="hidden_dim", type=int, default=1024)
@@ -167,7 +179,16 @@ def make_model_config(args, dataset):
             "wheel_zero_residual": args.wheel_zero_residual,
             "wheel_prototype_radius": args.wheel_prototype_radius,
             "wheel_temperature": args.wheel_temperature,
-            "wheel_anchor_mix": args.wheel_anchor_mix}
+            "wheel_anchor_mix": args.wheel_anchor_mix,
+            "wheel_uncertainty_mode": args.wheel_uncertainty_mode,
+            "wheel_uncertainty_hidden_dim": args.wheel_uncertainty_hidden_dim,
+            "wheel_uncertainty_temperature": args.wheel_uncertainty_temperature,
+            "wheel_uncertainty_gate_strength": (
+                args.wheel_uncertainty_gate_strength),
+            "wheel_uncertainty_warmup_epochs": (
+                args.wheel_uncertainty_warmup_epochs),
+            "wheel_uncertainty_ramp_epochs": (
+                args.wheel_uncertainty_ramp_epochs)}
 
 
 def make_criterion(args, device):
@@ -180,7 +201,9 @@ def make_criterion(args, device):
                        args.lambda_reliability,
                        args.tical_mode if args.use_tical else None,
                        args.lambda_hyp, args.lambda_wheel_proto,
-                       args.lambda_wheel_cpcc).to(device)
+                       args.lambda_wheel_cpcc,
+                       args.wheel_uncertainty_mode,
+                       args.lambda_wheel_uncertainty).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -207,6 +230,25 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
                 correct_distance.detach().cpu())
             storage["prototype_margin_" + name].append(
                 (nearest_wrong - correct_distance).detach().cpu())
+            if output.get("wheel_uncertainty") is not None:
+                target = wheel_uncertainty_target(
+                    tical["wheel_logits"][name], valid_labels,
+                    tical["wheel_class_distances"])
+                storage.setdefault(
+                    "wheel_uncertainty_prediction_" + name, []).append(
+                        output["wheel_uncertainty"][name][valid].detach().cpu())
+                storage.setdefault(
+                    "wheel_uncertainty_target_" + name, []).append(
+                        target.cpu())
+                modality_index = MODALITIES.index(name)
+                storage.setdefault(
+                    "wheel_uncertainty_weight_" + name, []).append(
+                        output["wheel_uncertainty_weights"][..., modality_index][
+                            valid].detach().cpu())
+                storage.setdefault(
+                    "wheel_uncertainty_correct_" + name, []).append(
+                        output["student_logits"][name][valid].argmax(dim=-1)
+                        .eq(valid_labels).detach().cpu())
     if not tical["ready"]:
         return
     for name in MODALITIES:
@@ -251,6 +293,13 @@ def _tical_epoch_metrics(storage, model, utterance_count):
             result["geometry_{}_off_plane_norm_mean".format(name)] = 0.0
             result["wheel_{}_correct_distance_mean".format(name)] = 0.0
             result["wheel_{}_prototype_margin_mean".format(name)] = 0.0
+            if getattr(model, "wheel_uncertainty_mode", "none") != "none":
+                for statistic in (
+                        "prediction_mean", "prediction_std", "target_mean",
+                        "target_std", "mae", "target_pearson", "weight_mean",
+                        "weight_std", "correct_mean", "incorrect_mean"):
+                    result["wheel_uncertainty_{}_{}".format(
+                        name, statistic)] = 0.0
     if getattr(model, "use_emotion_wheel", False):
         result["categorical_discrepancy_mean"] = 0.0
         result["wheel_discrepancy_mean"] = 0.0
@@ -282,6 +331,44 @@ def _tical_epoch_metrics(storage, model, utterance_count):
                 "wheel_{}_prototype_margin_mean".format(name): values[
                     "prototype_margin_" + name].float().mean().item(),
             })
+            uncertainty_key = "wheel_uncertainty_prediction_" + name
+            if uncertainty_key in values:
+                uncertainty = values[uncertainty_key].float()
+                target = values["wheel_uncertainty_target_" + name].float()
+                weight = values["wheel_uncertainty_weight_" + name].float()
+                correct = values[
+                    "wheel_uncertainty_correct_" + name].bool()
+                centered_uncertainty = uncertainty - uncertainty.mean()
+                centered_target = target - target.mean()
+                denominator = (centered_uncertainty.square().sum().sqrt()
+                               * centered_target.square().sum().sqrt())
+                correlation = ((centered_uncertainty * centered_target).sum()
+                               / denominator.clamp_min(1e-12))
+                result.update({
+                    "wheel_uncertainty_{}_prediction_mean".format(name):
+                        uncertainty.mean().item(),
+                    "wheel_uncertainty_{}_prediction_std".format(name):
+                        uncertainty.std(unbiased=False).item(),
+                    "wheel_uncertainty_{}_target_mean".format(name):
+                        target.mean().item(),
+                    "wheel_uncertainty_{}_target_std".format(name):
+                        target.std(unbiased=False).item(),
+                    "wheel_uncertainty_{}_mae".format(name):
+                        (uncertainty - target).abs().mean().item(),
+                    "wheel_uncertainty_{}_target_pearson".format(name):
+                        (correlation.item() if denominator.item() > 1e-12
+                         else 0.0),
+                    "wheel_uncertainty_{}_weight_mean".format(name):
+                        weight.mean().item(),
+                    "wheel_uncertainty_{}_weight_std".format(name):
+                        weight.std(unbiased=False).item(),
+                    "wheel_uncertainty_{}_correct_mean".format(name):
+                        (uncertainty[correct].mean().item()
+                         if correct.any() else 0.0),
+                    "wheel_uncertainty_{}_incorrect_mean".format(name):
+                        (uncertainty[~correct].mean().item()
+                         if (~correct).any() else 0.0),
+                })
     if not storage["kappa"]:
         return result
     n_ready = int(values["kappa"].numel())
@@ -407,10 +494,21 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
     gate = output["fusion_weights"].detach().mean(dim=-1).cpu()
     reliability = output["reliability"]
     variance_norm = output["variance_norm"]
+    wheel_uncertainty = output.get("wheel_uncertainty")
+    wheel_uncertainty_weights = output.get("wheel_uncertainty_weights")
+    wheel_uncertainty_scales = output.get("wheel_uncertainty_scales")
     if reliability is not None:
         reliability = reliability.detach().cpu()
     if variance_norm is not None:
         variance_norm = variance_norm.detach().cpu()
+    if wheel_uncertainty is not None:
+        wheel_uncertainty = {
+            name: value.detach().cpu()
+            for name, value in wheel_uncertainty.items()}
+    if wheel_uncertainty_weights is not None:
+        wheel_uncertainty_weights = wheel_uncertainty_weights.detach().cpu()
+    if wheel_uncertainty_scales is not None:
+        wheel_uncertainty_scales = wheel_uncertainty_scales.detach().cpu()
     students = {m: output["student_logits"][m].detach().argmax(dim=-1).cpu() for m in MODALITIES}
     errors = {m: value.detach().cpu() for m, value in errors.items()}
     tical = output.get("tical")
@@ -471,6 +569,16 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
                     row[name + "_reliability"] = float(reliability[batch_index, index, modal_index])
                 if variance_norm is not None:
                     row[name + "_variance_norm"] = float(variance_norm[batch_index, index, modal_index])
+                if wheel_uncertainty is not None:
+                    row[name + "_wheel_uncertainty"] = float(
+                        wheel_uncertainty[name][batch_index, index])
+                    row[name + "_wheel_uncertainty_weight"] = float(
+                        wheel_uncertainty_weights[
+                            batch_index, index, modal_index])
+                    if wheel_uncertainty_scales is not None:
+                        row[name + "_wheel_uncertainty_scale"] = float(
+                            wheel_uncertainty_scales[
+                                batch_index, index, modal_index])
                 if reliability is not None:
                     if name in errors:
                         row[name + "_ce_error"] = float(errors[name][offset])
@@ -517,7 +625,11 @@ def main(argv=None):
             or args.hyperbolic_dim < 1 or args.lambda_hyp < 0
             or args.beta_gate < 0 or args.consistency_t < 0
             or args.consistency_k < 0 or args.lambda_wheel_proto < 0
-            or args.lambda_wheel_cpcc < 0):
+            or args.lambda_wheel_cpcc < 0
+            or args.lambda_wheel_uncertainty < 0
+            or args.wheel_uncertainty_hidden_dim < 1
+            or args.wheel_uncertainty_warmup_epochs < 0
+            or args.wheel_uncertainty_ramp_epochs < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
     if not 0 <= args.anchor_conf_threshold <= 1:
         raise ValueError("--anchor-conf-threshold must be in [0,1]")
@@ -533,8 +645,29 @@ def main(argv=None):
     if args.use_emotion_wheel and not args.use_tical:
         raise ValueError("--use-emotion-wheel requires --use-tical")
     if not args.use_emotion_wheel and (
-            args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0):
+            args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0
+            or args.wheel_uncertainty_mode != "none"
+            or args.lambda_wheel_uncertainty > 0):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
+    if args.wheel_uncertainty_mode != "none":
+        if args.wheel_geometry != "poincare":
+            raise ValueError("wheel uncertainty requires Poincare geometry")
+        if args.tical_mode != "observe":
+            raise ValueError(
+                "wheel uncertainty must use --tical-mode observe")
+        if args.wheel_uncertainty_temperature <= 0:
+            raise ValueError("wheel uncertainty temperature must be positive")
+        if not 0 <= args.wheel_uncertainty_gate_strength <= 1:
+            raise ValueError(
+                "wheel uncertainty gate strength must be in [0,1]")
+        if (args.wheel_uncertainty_mode in ("supervise", "full")
+                and args.lambda_wheel_uncertainty <= 0):
+            raise ValueError(
+                "supervised wheel uncertainty requires a positive loss weight")
+    if (args.wheel_uncertainty_mode in ("none", "gate")
+            and args.lambda_wheel_uncertainty != 0):
+        raise ValueError(
+            "none/gate uncertainty modes require zero uncertainty loss weight")
     if args.use_emotion_wheel:
         if args.hyperbolic_dim < 2:
             raise ValueError("emotion wheel requires --hyperbolic-dim >= 2")
@@ -573,7 +706,13 @@ def main(argv=None):
                      "use_emotion_wheel", "wheel_prototype_radius",
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
-                     "wheel_fixed_radius", "wheel_zero_residual"):
+                     "wheel_fixed_radius", "wheel_zero_residual",
+                     "wheel_uncertainty_mode",
+                     "wheel_uncertainty_hidden_dim",
+                     "wheel_uncertainty_temperature",
+                     "wheel_uncertainty_gate_strength",
+                     "wheel_uncertainty_warmup_epochs",
+                     "wheel_uncertainty_ramp_epochs"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -586,7 +725,13 @@ def main(argv=None):
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
                      "wheel_anchor_mix", "lambda_wheel_proto",
-                     "lambda_wheel_cpcc"):
+                     "lambda_wheel_cpcc", "wheel_uncertainty_mode",
+                     "lambda_wheel_uncertainty",
+                     "wheel_uncertainty_hidden_dim",
+                     "wheel_uncertainty_temperature",
+                     "wheel_uncertainty_gate_strength",
+                     "wheel_uncertainty_warmup_epochs",
+                     "wheel_uncertainty_ramp_epochs"):
             if name in checkpoint["args"]:
                 setattr(args, name, checkpoint["args"][name])
         if args.feature_path is None:
@@ -635,6 +780,9 @@ def main(argv=None):
         if model_config.get("wheel_zero_residual", False):
             method_tag += "_zerores"
         method_tag += "_d{}".format(model_config["hyperbolic_dim"])
+        if model_config.get("wheel_uncertainty_mode", "none") != "none":
+            method_tag += "_unc_{}".format(
+                model_config["wheel_uncertainty_mode"])
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
@@ -687,12 +835,18 @@ def main(argv=None):
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
                   "wheel(proto/cpcc)={:.4f}/{:.4f}; "
+                  "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
                 selected_metrics["weighted_f1"], train_metrics["original_distillation"],
                 train_metrics["ca_distillation"], train_metrics["weighted_hyp"],
                 train_metrics["weighted_wheel_proto"],
                 train_metrics["weighted_wheel_cpcc"],
+                train_metrics.get("weighted_wheel_uncertainty", 0.0),
+                train_metrics.get("wheel_uncertainty_progress", 0.0),
+                train_metrics.get("wheel_uncertainty_weight_t", 0.0),
+                train_metrics.get("wheel_uncertainty_weight_a", 0.0),
+                train_metrics.get("wheel_uncertainty_weight_v", 0.0),
                 train_metrics.get("kappa_mean", 0.0), train_metrics["tical_ready_rate"],
                 train_metrics["anchor_t_size"], train_metrics["anchor_a_size"],
                 train_metrics["anchor_v_size"], row["seconds"]), flush=True)

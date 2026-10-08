@@ -13,6 +13,38 @@ from tical import MODALITIES as TICAL_MODALITIES, TiCALModule
 MODALITIES = ("t", "a", "v")
 FUSION_VARIANTS = ("guided", "replace", "oof-guided", "sdt")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
+WHEEL_UNCERTAINTY_MODES = ("none", "gate", "supervise", "full")
+
+
+def poincare_log_map_zero(points, eps=1e-5):
+    """Map unit-ball points to the tangent space at the origin."""
+    norm = points.norm(p=2, dim=-1, keepdim=True)
+    safe_norm = norm.clamp_min(eps)
+    radius = norm.clamp(max=1.0 - eps)
+    tangent = torch.atanh(radius) * points / safe_norm
+    return torch.where(norm > eps, tangent, torch.zeros_like(tangent))
+
+
+class WheelUncertaintyHead(nn.Module):
+    """Predict a scalar wheel-error proxy in [0, 1] for one modality."""
+
+    def __init__(self, input_dim, hidden_dim, dropout):
+        super().__init__()
+        if input_dim < 1 or hidden_dim < 1:
+            raise ValueError("uncertainty head dimensions must be positive")
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        # sigmoid(0)=0.5 for all modalities, hence uniform fusion weights and
+        # an exact SDT fusion baseline before the warm-up finishes.
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.zeros_(self.network[-1].bias)
+
+    def forward(self, tangent_features):
+        return torch.sigmoid(self.network(tangent_features).squeeze(-1))
 
 
 class DistributionHead(nn.Module):
@@ -83,7 +115,13 @@ class Transformer_Based_Model(SDTBackbone):
                  anchor_balance="none", anchor_min_per_class=0,
                  anchor_admission="teacher", wheel_geometry="poincare",
                  wheel_radius_mode="free", wheel_fixed_radius=0.75,
-                 wheel_zero_residual=False):
+                 wheel_zero_residual=False,
+                 wheel_uncertainty_mode="none",
+                 wheel_uncertainty_hidden_dim=32,
+                 wheel_uncertainty_temperature=1.0,
+                 wheel_uncertainty_gate_strength=0.5,
+                 wheel_uncertainty_warmup_epochs=10,
+                 wheel_uncertainty_ramp_epochs=5):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if not math.isfinite(temp) or temp <= 0:
@@ -98,6 +136,26 @@ class Transformer_Based_Model(SDTBackbone):
             raise ValueError("TiCAL must use --fusion-variant sdt; COLD cannot run with TiCAL")
         if use_emotion_wheel and not use_tical:
             raise ValueError("emotion wheel requires TiCAL")
+        if wheel_uncertainty_mode not in WHEEL_UNCERTAINTY_MODES:
+            raise ValueError("unknown wheel uncertainty mode: {}".format(
+                wheel_uncertainty_mode))
+        if wheel_uncertainty_mode != "none":
+            if not use_emotion_wheel or wheel_geometry != "poincare":
+                raise ValueError(
+                    "wheel uncertainty requires Poincare emotion-wheel mode")
+            if tical_mode != "observe":
+                raise ValueError(
+                    "wheel uncertainty is isolated with --tical-mode observe")
+        if (not math.isfinite(wheel_uncertainty_temperature)
+                or wheel_uncertainty_temperature <= 0):
+            raise ValueError("wheel uncertainty temperature must be positive")
+        if (not math.isfinite(wheel_uncertainty_gate_strength)
+                or not 0.0 <= wheel_uncertainty_gate_strength <= 1.0):
+            raise ValueError("wheel uncertainty gate strength must be in [0,1]")
+        if (wheel_uncertainty_hidden_dim < 1
+                or wheel_uncertainty_warmup_epochs < 0
+                or wheel_uncertainty_ramp_epochs < 0):
+            raise ValueError("invalid wheel uncertainty dimensions/schedule")
         if tical_warmup_epochs < 0 or not math.isfinite(beta_gate) or beta_gate < 0:
             raise ValueError("TiCAL warmup and beta_gate must be nonnegative")
         if TICAL_MODALITIES != MODALITIES:
@@ -117,6 +175,15 @@ class Transformer_Based_Model(SDTBackbone):
         self.wheel_radius_mode = wheel_radius_mode
         self.wheel_fixed_radius = wheel_fixed_radius
         self.wheel_zero_residual = bool(wheel_zero_residual)
+        self.wheel_uncertainty_mode = wheel_uncertainty_mode
+        self.wheel_uncertainty_temperature = float(
+            wheel_uncertainty_temperature)
+        self.wheel_uncertainty_gate_strength = float(
+            wheel_uncertainty_gate_strength)
+        self.wheel_uncertainty_warmup_epochs = int(
+            wheel_uncertainty_warmup_epochs)
+        self.wheel_uncertainty_ramp_epochs = int(
+            wheel_uncertainty_ramp_epochs)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -128,6 +195,12 @@ class Transformer_Based_Model(SDTBackbone):
                 anchor_min_per_class, anchor_admission, wheel_geometry,
                 wheel_radius_mode, wheel_fixed_radius,
                 wheel_zero_residual)
+        if wheel_uncertainty_mode != "none":
+            self.wheel_uncertainty_heads = nn.ModuleDict({
+                name: WheelUncertaintyHead(
+                    hyperbolic_dim, wheel_uncertainty_hidden_dim, dropout)
+                for name in MODALITIES
+            })
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(
@@ -159,6 +232,10 @@ class Transformer_Based_Model(SDTBackbone):
         distributions = {}
         variance_norm = confidence = reliability_logits = reliability = None
         tical_output = None
+        wheel_uncertainty = None
+        wheel_uncertainty_weights = None
+        wheel_uncertainty_scales = None
+        wheel_uncertainty_progress = self.wheel_uncertainty_progress()
         if self.fusion_variant == "sdt":
             latents = features
             sdt_weights = torch.softmax(self.last_gate.fc(features), dim=-2)
@@ -167,6 +244,21 @@ class Transformer_Based_Model(SDTBackbone):
                 tical_output = self.tical(
                     pure, u_mask.bool(),
                     query_enabled=self.tical_epoch > self.tical_warmup_epochs)
+                if self.wheel_uncertainty_mode != "none":
+                    wheel_uncertainty = {
+                        name: self.wheel_uncertainty_heads[name](
+                            poincare_log_map_zero(
+                                tical_output["projected"][name],
+                                tical_output["hyp_eps"]))
+                        for name in MODALITIES
+                    }
+                    uncertainty_stack = torch.stack(
+                        [wheel_uncertainty[name] for name in MODALITIES],
+                        dim=-1)
+                    wheel_uncertainty_weights = torch.softmax(
+                        -uncertainty_stack
+                        / self.wheel_uncertainty_temperature,
+                        dim=-1)
                 if self.tical_mode in ("fusion", "full") and tical_output["ready"]:
                     valid = u_mask.bool()
                     tau_full = features.new_ones(*u_mask.shape, len(MODALITIES))
@@ -180,6 +272,21 @@ class Transformer_Based_Model(SDTBackbone):
                     fusion_weights = sdt_weights * factor
                     fusion_weights = fusion_weights / fusion_weights.sum(
                         dim=-2, keepdim=True).clamp_min(self.tical.typicality_eps)
+            if (self.wheel_uncertainty_mode in ("gate", "full")
+                    and wheel_uncertainty_weights is not None
+                    and wheel_uncertainty_progress > 0.0):
+                gate_strength = (self.wheel_uncertainty_gate_strength
+                                 * wheel_uncertainty_progress)
+                wheel_uncertainty_scales = (
+                    (1.0 - gate_strength)
+                    + gate_strength * len(MODALITIES)
+                    * wheel_uncertainty_weights)
+                fusion_weights = (
+                    fusion_weights
+                    * wheel_uncertainty_scales.unsqueeze(-1))
+                fusion_weights = fusion_weights / fusion_weights.sum(
+                    dim=-2, keepdim=True).clamp_min(
+                        self.tical.typicality_eps)
             fused = (fusion_weights * features).sum(dim=-2)
         elif self.fusion_variant == "oof-guided":
             # No Gaussian bottleneck and no sampling: classifiers and fusion
@@ -242,10 +349,24 @@ class Transformer_Based_Model(SDTBackbone):
             "fusion_weights": fusion_weights,
             "fused": fused,
             "tical": tical_output,
+            "wheel_uncertainty": wheel_uncertainty,
+            "wheel_uncertainty_weights": wheel_uncertainty_weights,
+            "wheel_uncertainty_scales": wheel_uncertainty_scales,
+            "wheel_uncertainty_progress": wheel_uncertainty_progress,
         }
 
     def set_tical_epoch(self, epoch):
         self.tical_epoch = int(epoch)
+
+    def wheel_uncertainty_progress(self):
+        if self.wheel_uncertainty_mode == "none":
+            return 0.0
+        elapsed = self.tical_epoch - self.wheel_uncertainty_warmup_epochs
+        if elapsed <= 0:
+            return 0.0
+        if self.wheel_uncertainty_ramp_epochs == 0:
+            return 1.0
+        return min(1.0, elapsed / self.wheel_uncertainty_ramp_epochs)
 
     @torch.no_grad()
     def update_tical_anchors(self, outputs, labels, valid_mask):

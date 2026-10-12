@@ -67,11 +67,31 @@ results/summary_by_modality.csv
 results/summary_by_distance.csv
 results/summary_by_speaker_relation.csv
 results/masking_robustness.csv
+results/ablation_classification_metrics.csv
 figures/impact_distribution_by_modality.png
 figures/impact_vs_distance.png
 figures/impact_by_speaker_relation.png
 figures/zero_vs_mean_scatter.png
 report.md
+```
+
+`run_analysis.sh` creates `ablation_classification_metrics.csv` automatically.
+These ACC/F1 values are pair-weighted intervention metrics: every target is
+repeated once per ablated source. They are not the ordinary utterance-level
+test metrics from `baseline/baseline_metrics.json`.
+
+To calculate the file separately from one completed strategy:
+
+```bash
+python SDT_new/experiment/cross_utterance/compute_ablation_classification_metrics.py \
+  --input /path/to/results/impact_pairs_train_mean.csv
+```
+
+To include every completed strategy found under a run directory:
+
+```bash
+python SDT_new/experiment/cross_utterance/compute_ablation_classification_metrics.py \
+  --run-dir /path/to/outputs/full_run
 ```
 
 ## Tests

@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 # Shared configuration for the four independent entry points.
-# Prefer environment overrides, for example:
-#   CHECKPOINT=/path/to/best_checkpoint.pt DEVICE=cuda bash run_task_a_baseline.sh
+# Edit the defaults here once; environment variables can still override them.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SDT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 
-: "${CHECKPOINT:?Set CHECKPOINT to a fully trained SDT_new best_checkpoint.pt}"
-
 PYTHON="${PYTHON:-python}"
-FEATURE_PATH="${FEATURE_PATH:-$SDT_ROOT/../SDT/data/iemocap_multimodal_features.pkl}"
+CHECKPOINT="${CHECKPOINT:-C:/path/to/fully_trained/best_checkpoint.pt}"
+FEATURE_PATH="${FEATURE_PATH:-C:/study/Master_papers/code/ERC/SDT/data/iemocap_multimodal_features.pkl}"
+RUN_DIR="${RUN_DIR:-C:/study/Master_papers/code/ERC/SDT_new/experiment/cross_utterance/outputs/full_run}"
 SPLIT="${SPLIT:-test}"
-DEVICE="${DEVICE:-auto}"
+DEVICE="${DEVICE:-cuda}"
 GPU_ID="${GPU_ID:-0}"
 SEED="${SEED:-2024}"
 NUM_THREADS="${NUM_THREADS:-0}"
 MAX_CONVERSATIONS="${MAX_CONVERSATIONS:-0}"
 ALLOW_SMOKE_CHECKPOINT="${ALLOW_SMOKE_CHECKPOINT:-0}"
 
-checkpoint_name="$(basename -- "$CHECKPOINT")"
-checkpoint_name="${checkpoint_name%.*}"
-RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/outputs/${checkpoint_name}_${SPLIT}}"
+if [[ "$CHECKPOINT" == "C:/path/to/fully_trained/best_checkpoint.pt" ]]; then
+  echo "ERROR: Edit CHECKPOINT in $SCRIPT_DIR/experiment_config.sh to the real fully trained checkpoint." >&2
+  exit 2
+fi
 
 COMMON_ARGS=(
   --checkpoint "$CHECKPOINT"

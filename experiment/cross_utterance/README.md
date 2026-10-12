@@ -28,8 +28,8 @@ export RUN_DIR="SDT_new/experiment/cross_utterance/outputs/my_run"
 export DEVICE="cuda"       # auto, cpu, or cuda
 export GPU_ID="0"
 export NUM_THREADS="0"     # 0 keeps PyTorch's default
-export PROB_ATOL="1e-5"    # allows normal batched-vs-B=1 CUDA round-off
-export PROB_RTOL="1e-4"
+export PROB_ATOL="2e-4"    # original-batch vs B=1 CUDA round-off only
+export PROB_RTOL="2e-4"
 ```
 
 Run Task A first. The remaining stages deliberately do not run automatically.

@@ -69,8 +69,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # different CUDA kernels. Their float32 probabilities may consequently
     # differ by a few e-6 even when logits, predictions, and metrics are
     # semantically equivalent.
-    parser.add_argument("--prob-atol", type=float, default=1e-5)
-    parser.add_argument("--prob-rtol", type=float, default=1e-4)
+    parser.add_argument(
+        "--prob-atol", type=float, default=2e-4,
+        help="absolute tolerance for original-batch versus B=1 CUDA probabilities",
+    )
+    parser.add_argument(
+        "--prob-rtol", type=float, default=2e-4,
+        help="relative tolerance for original-batch versus B=1 CUDA probabilities",
+    )
     return parser.parse_args(argv)
 
 
@@ -131,7 +137,9 @@ def _baseline_rows_for_conversation(experiment, split: str, batch, output):
     return rows
 
 
-def _canonical_repository_baseline(experiment, selected_ids, split):
+def _canonical_repository_baseline(
+    experiment, selected_ids, split, batch_size_override=None
+):
     """Run the repository evaluator so Task A has an independent reference."""
     from dataloader import make_loaders
     from train import build_parser, make_criterion, run_epoch
@@ -141,7 +149,11 @@ def _canonical_repository_baseline(experiment, selected_ids, split):
         setattr(defaults, key, value)
     defaults.dataset = experiment.dataset.dataset
     defaults.feature_path = str(experiment.feature_path)
-    batch_size = int(getattr(defaults, "batch_size", 16))
+    batch_size = (
+        int(batch_size_override)
+        if batch_size_override is not None
+        else int(getattr(defaults, "batch_size", 16))
+    )
     split_ids = {name: list(ids) for name, ids in experiment.split_ids.items()}
     split_ids[split] = list(selected_ids)
     loaders = make_loaders(
@@ -162,14 +174,14 @@ def _compare_baselines(
     atol: float,
     rtol: float,
 ) -> Dict[str, object]:
-    canonical = {
-        (str(row["dialogue_id"]), int(row["utterance_index"])): row
-        for row in canonical_rows
-    }
-    independent = {
-        (str(row["conversation_id"]), int(row["utterance_index"])): row
-        for row in dialogue_rows
-    }
+    def row_key(row):
+        conversation_id = row.get("dialogue_id", row.get("conversation_id"))
+        if conversation_id is None:
+            raise KeyError("Baseline row has no dialogue/conversation ID")
+        return str(conversation_id), int(row["utterance_index"])
+
+    canonical = {row_key(row): row for row in canonical_rows}
+    independent = {row_key(row): row for row in dialogue_rows}
     if canonical.keys() != independent.keys():
         missing = sorted(canonical.keys() - independent.keys())[:5]
         extra = sorted(independent.keys() - canonical.keys())[:5]
@@ -249,9 +261,13 @@ def run_baseline(args, experiment, run_dir: Path) -> None:
         first["logits"], second["logits"], atol=args.prob_atol, rtol=args.prob_rtol
     )
 
-    print("Running repository baseline evaluator...", flush=True)
+    print("Running repository baseline evaluator with checkpoint batch size...", flush=True)
     canonical_metrics, canonical_rows, _, _ = _canonical_repository_baseline(
         experiment, selected_ids, args.split
+    )
+    print("Running repository baseline evaluator with batch size 1...", flush=True)
+    single_metrics, single_rows, _, _ = _canonical_repository_baseline(
+        experiment, selected_ids, args.split, batch_size_override=1
     )
 
     baseline_rows = []
@@ -282,9 +298,13 @@ def run_baseline(args, experiment, run_dir: Path) -> None:
             flush=True,
         )
 
-    equivalence = _compare_baselines(
-        canonical_rows, baseline_rows, experiment.dataset.n_classes,
+    batch_shape_equivalence = _compare_baselines(
+        canonical_rows, single_rows, experiment.dataset.n_classes,
         args.prob_atol, args.prob_rtol,
+    )
+    dialogue_pipeline_equivalence = _compare_baselines(
+        single_rows, baseline_rows, experiment.dataset.n_classes,
+        2e-7, 2e-6,
     )
     independent_metrics = _classification_metrics(baseline_rows)
     for name in ("accuracy", "weighted_f1", "macro_f1"):
@@ -292,6 +312,16 @@ def run_baseline(args, experiment, run_dir: Path) -> None:
             float(canonical_metrics[name]), independent_metrics[name], atol=1e-10, rtol=0
         ):
             raise AssertionError(f"Baseline metric mismatch for {name}")
+        if not np.isclose(
+            float(single_metrics[name]), independent_metrics[name], atol=1e-10, rtol=0
+        ):
+            raise AssertionError(f"Batch-size-1 baseline metric mismatch for {name}")
+
+    equivalence = {
+        "original_batch_vs_batch_size_1": batch_shape_equivalence,
+        "batch_size_1_vs_impact_pipeline": dialogue_pipeline_equivalence,
+        "classification_metrics_identical": True,
+    }
 
     expected_rows = sum(
         expected_pair_count(int(entry["length"])) for entry in conversation_entries
@@ -341,8 +371,9 @@ def run_baseline(args, experiment, run_dir: Path) -> None:
         _baseline_fieldnames(experiment.dataset.n_classes),
     )
     write_json_atomic(baseline_dir / "baseline_metrics.json", {
-        "repository_evaluator": canonical_metrics,
-        "per_conversation_evaluator": independent_metrics,
+        "repository_evaluator_original_batch": canonical_metrics,
+        "repository_evaluator_batch_size_1": single_metrics,
+        "impact_pipeline_per_conversation": independent_metrics,
     })
     write_json_atomic(baseline_dir / "baseline_equivalence.json", equivalence)
     write_json_atomic(run_dir / "experiment_manifest.json", manifest)

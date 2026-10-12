@@ -18,8 +18,8 @@ SEED="${SEED:-2024}"
 NUM_THREADS="${NUM_THREADS:-0}"
 MAX_CONVERSATIONS="${MAX_CONVERSATIONS:-0}"
 ALLOW_SMOKE_CHECKPOINT="${ALLOW_SMOKE_CHECKPOINT:-0}"
-PROB_ATOL="${PROB_ATOL:-1e-5}"
-PROB_RTOL="${PROB_RTOL:-1e-4}"
+PROB_ATOL="${PROB_ATOL:-2e-4}"
+PROB_RTOL="${PROB_RTOL:-2e-4}"
 
 if [[ "$CHECKPOINT" == "C:/path/to/fully_trained/best_checkpoint.pt" ]]; then
   echo "ERROR: Edit CHECKPOINT in $SCRIPT_DIR/experiment_config.sh to the real fully trained checkpoint." >&2

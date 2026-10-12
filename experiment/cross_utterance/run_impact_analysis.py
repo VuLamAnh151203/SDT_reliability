@@ -65,8 +65,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--max-conversations", type=int, default=0)
     parser.add_argument("--allow-smoke-checkpoint", action="store_true")
-    parser.add_argument("--prob-atol", type=float, default=2e-6)
-    parser.add_argument("--prob-rtol", type=float, default=2e-5)
+    # Batched padded evaluation and B=1 dialogue evaluation can select
+    # different CUDA kernels. Their float32 probabilities may consequently
+    # differ by a few e-6 even when logits, predictions, and metrics are
+    # semantically equivalent.
+    parser.add_argument("--prob-atol", type=float, default=1e-5)
+    parser.add_argument("--prob-rtol", type=float, default=1e-4)
     return parser.parse_args(argv)
 
 

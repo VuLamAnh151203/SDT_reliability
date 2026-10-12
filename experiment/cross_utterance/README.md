@@ -68,6 +68,7 @@ results/summary_by_distance.csv
 results/summary_by_speaker_relation.csv
 results/masking_robustness.csv
 results/ablation_classification_metrics.csv
+results/test_classification_metrics.csv
 figures/impact_distribution_by_modality.png
 figures/impact_vs_distance.png
 figures/impact_by_speaker_relation.png
@@ -79,6 +80,18 @@ report.md
 These ACC/F1 values are pair-weighted intervention metrics: every target is
 repeated once per ablated source. They are not the ordinary utterance-level
 test metrics from `baseline/baseline_metrics.json`.
+
+It also creates `test_classification_metrics.csv` by deduplicating `pred_full`
+on `(conversation_id, target_idx)`. Therefore, every test utterance contributes
+exactly once. The script validates that repeated labels and baseline predictions
+are consistent and that every target index in each conversation is present.
+
+To calculate only the standard test metrics from an existing impact file:
+
+```bash
+python SDT_new/experiment/cross_utterance/compute_test_classification_metrics.py \
+  --input /path/to/results/impact_pairs_train_mean.csv
+```
 
 To calculate the file separately from one completed strategy:
 

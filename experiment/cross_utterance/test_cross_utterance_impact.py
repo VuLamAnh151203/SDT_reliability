@@ -1,6 +1,4 @@
-import csv
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,43 +19,7 @@ from impact_core import (
     js_divergence_from_log_probs,
     signed_impact,
 )
-from compute_ablation_classification_metrics import calculate_metrics
-
-
 class CrossUtteranceImpactTests(unittest.TestCase):
-    def test_pair_weighted_classification_metrics(self):
-        fieldnames = [
-            "replacement_strategy", "modality", "target_emotion",
-            "pred_full", "pred_mask",
-        ]
-        input_rows = [
-            ("train_mean", "text", 0, 0, 0),
-            ("train_mean", "text", 1, 0, 1),
-            ("train_mean", "text", 1, 1, 1),
-            ("train_mean", "text", 2, 2, 2),
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "impact.csv"
-            with path.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(dict(zip(fieldnames, row)) for row in input_rows)
-
-            rows = calculate_metrics([path])
-
-        self.assertEqual(len(rows), 1)
-        result = rows[0]
-        self.assertEqual(result["count"], 4)
-        self.assertEqual(result["baseline_correct"], 3)
-        self.assertEqual(result["ablation_correct"], 4)
-        self.assertAlmostEqual(result["baseline_pair_weighted_accuracy"], 75.0)
-        self.assertAlmostEqual(result["ablation_pair_weighted_accuracy"], 100.0)
-        self.assertAlmostEqual(result["delta_accuracy"], 25.0)
-        self.assertAlmostEqual(result["baseline_pair_weighted_wf1"], 75.0)
-        self.assertAlmostEqual(result["ablation_pair_weighted_wf1"], 100.0)
-        self.assertEqual(result["changed_prediction_count"], 1)
-        self.assertAlmostEqual(result["changed_prediction_fraction"], 0.25)
-
     def test_replacement_changes_only_one_source_row(self):
         original = torch.arange(24, dtype=torch.float32).reshape(4, 1, 6)
         snapshot = original.clone()

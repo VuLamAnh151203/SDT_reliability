@@ -1,0 +1,91 @@
+# Frozen SDT cross-utterance impact analysis
+
+This directory implements Phase 1 from
+`SDT_Experiment1_Cross_Utterance_Impact_Plan.md`. It never trains or updates
+the checkpoint. A single intervention replaces one raw source-utterance
+feature vector in one modality, before SDT's Conv1D projection.
+
+The model receives the complete dialogue. Every valid ordered source-target
+pair is analyzed, except self-pairs (`source_idx == target_idx`).
+
+## Requirements
+
+- A fully trained checkpoint written by `SDT_new/train.py`.
+- The matching IEMOCAP or MELD feature pickle.
+- The packages in `SDT_new/requirements.txt`.
+- Bash (Git Bash, WSL, or Linux/macOS shell).
+
+Smoke checkpoints made with `--max-batches` are rejected by default.
+
+## Run the four independent stages
+
+Set shared environment variables once. Paths with spaces must remain quoted.
+
+```bash
+export CHECKPOINT="/absolute/path/to/best_checkpoint.pt"
+export FEATURE_PATH="/absolute/path/to/iemocap_multimodal_features.pkl"
+export RUN_DIR="SDT_new/experiment/cross_utterance/outputs/my_run"
+export DEVICE="cuda"       # auto, cpu, or cuda
+export GPU_ID="0"
+export NUM_THREADS="0"     # 0 keeps PyTorch's default
+```
+
+Run Task A first. The remaining stages deliberately do not run automatically.
+
+```bash
+bash SDT_new/experiment/cross_utterance/run_task_a_baseline.sh
+bash SDT_new/experiment/cross_utterance/run_task_b_zero_replacement.sh
+bash SDT_new/experiment/cross_utterance/run_task_c_train_mean_replacement.sh
+bash SDT_new/experiment/cross_utterance/run_analysis.sh
+```
+
+Task B and Task C require Task A's `experiment_manifest.json` and refuse to
+run when the checkpoint, feature file, split, or seed differs. Intervention
+tasks write one validated shard per dialogue and safely resume valid shards.
+
+For an implementation-only smoke test:
+
+```bash
+export ALLOW_SMOKE_CHECKPOINT=1
+export MAX_CONVERSATIONS=1
+```
+
+Never interpret a smoke-checkpoint result as a research result.
+
+## Main outputs
+
+```text
+baseline/baseline_predictions.csv
+baseline/baseline_metrics.json
+feature_means/train_feature_means.npz
+results/impact_pairs_zero.csv
+results/impact_pairs_train_mean.csv
+results/impact_pairs.csv
+results/summary_by_modality.csv
+results/summary_by_distance.csv
+results/summary_by_speaker_relation.csv
+results/masking_robustness.csv
+figures/impact_distribution_by_modality.png
+figures/impact_vs_distance.png
+figures/impact_by_speaker_relation.png
+figures/zero_vs_mean_scatter.png
+report.md
+```
+
+## Tests
+
+```bash
+python -m unittest \
+  SDT_new/experiment/cross_utterance/test_cross_utterance_impact.py -v
+```
+
+The primary signed impact is
+
+```text
+CE_mask(target) - CE_full(target)
+```
+
+Positive impact means that replacing the source-modality feature increased the
+target's true-class loss under that intervention. It is not a real-world causal
+effect or an intrinsic measure of modality reliability.
+

@@ -9,6 +9,9 @@ source "$SCRIPT_DIR/experiment_config.sh"
   --seed "$SEED" \
   "$@"
 
+"$PYTHON" "$SCRIPT_DIR/analyze_prediction_changes.py" \
+  --run-dir "$RUN_DIR"
+
 exec "$PYTHON" "$SCRIPT_DIR/compute_ablation_classification_metrics.py" \
   --run-dir "$RUN_DIR"
 

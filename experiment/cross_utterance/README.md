@@ -69,6 +69,17 @@ results/summary_by_speaker_relation.csv
 results/masking_robustness.csv
 results/ablation_classification_metrics.csv
 results/test_classification_metrics.csv
+results/changed_prediction_summary.csv
+results/flip_rate_by_distance.csv
+results/flip_rate_by_speaker_relation.csv
+results/flip_rate_by_source_direction.csv
+results/flip_rate_by_target_emotion.csv
+results/flip_rate_by_source_emotion.csv
+results/flip_rate_by_baseline_margin.csv
+results/flip_class_transitions.csv
+results/flip_target_susceptibility.csv
+results/flip_robustness_zero_vs_mean.csv
+results/top_changed_cases.csv
 figures/impact_distribution_by_modality.png
 figures/impact_vs_distance.png
 figures/impact_by_speaker_relation.png
@@ -93,6 +104,18 @@ python SDT_new/experiment/cross_utterance/compute_test_classification_metrics.py
   --input /path/to/results/impact_pairs_train_mean.csv
 ```
 
+To analyze the small subset of interventions that change the predicted class:
+
+```bash
+bash SDT_new/experiment/cross_utterance/run_prediction_change_analysis.sh
+```
+
+This joins impact rows to `baseline/baseline_predictions.csv`, derives baseline
+top-1 confidence, top-1/top-2 margin, and entropy, and reports normalized flip
+rates rather than raw counts alone. `top_changed_cases.csv` retains the 100
+largest-JS-divergence flips per strategy and modality; override this with
+`--top-k`.
+
 To calculate the file separately from one completed strategy:
 
 ```bash
@@ -111,7 +134,10 @@ python SDT_new/experiment/cross_utterance/compute_ablation_classification_metric
 
 ```bash
 python -m unittest \
-  SDT_new/experiment/cross_utterance/test_cross_utterance_impact.py -v
+  SDT_new/experiment/cross_utterance/test_cross_utterance_impact.py \
+  SDT_new/experiment/cross_utterance/test_classification_metrics.py \
+  SDT_new/experiment/cross_utterance/test_prediction_change_analysis.py \
+  -v
 ```
 
 The primary signed impact is

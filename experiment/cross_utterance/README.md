@@ -696,3 +696,6 @@ python -m unittest \
 ```
 
 Các kiểm tra quan trọng gồm: đúng dấu impact, không có self-pair, đúng số dòng, không sửa tensor gốc, zero/mean join theo đúng key, deduplicate target đúng cách và tính flip rate bằng count đã chuẩn hóa.
+
+> Pipeline **Experiment 3 ETCR** (previous-same-speaker emotion transition,
+> Phase A–B–C) nằm tại [`etcr/README.md`](etcr/README.md).

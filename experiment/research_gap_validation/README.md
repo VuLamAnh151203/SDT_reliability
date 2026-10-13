@@ -104,9 +104,24 @@ SOURCE_RUN_DIR/results/impact_pairs_zero.csv
 ```
 
 Training-distribution donor được sinh bởi `generate_donor_impacts.py`. Teacher
-cho B4 được sinh riêng trên checkpoint `train` split bởi
-`generate_train_impact_teacher.py`; script từ chối mọi conversation không nằm
-trong train IDs.
+chính cho B4 được sinh bằng `generate_train_edge_teacher.py`: script quét gate
+trên đúng propagation edge và đúng attention hooks mà B4 sử dụng. Teacher chỉ
+dùng train conversations, lưu continuous `teacher_gate` cùng confidence
+`teacher_weight`, và từ chối cross-split leakage. File input-replacement cũ từ
+`generate_train_impact_teacher.py` vẫn được hỗ trợ theo chế độ legacy, nhưng
+được đổi thành soft magnitude-aware targets thay vì hard BCE 0/1.
+
+Chạy lại B3/B4 với teacher đã sửa:
+
+```bash
+cd /home/ubuntu/26anh.vl/SDT_reliability/experiment/research_gap_validation
+bash scripts/run_e3_b4_fixed.sh
+```
+
+Teacher edge khởi tạo có thể mất nhiều thời gian như E2 vì phải quét từng
+source-target edge. Các lần sau script tự reuse
+`outputs/full_run/manifests/train_edge_impact_teacher.csv`. Đặt
+`B4_REGENERATE_TEACHER=1` nếu cần sinh lại.
 
 ## Outputs
 
@@ -126,6 +141,7 @@ outputs/full_run/
     layer_path_sensitivity.csv
   E3/
     model_comparison.csv
+    epoch_history.csv
     paired_deltas.csv
     transition_subset_metrics.csv
     classwise_f1.csv

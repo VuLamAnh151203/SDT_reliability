@@ -15,16 +15,27 @@ DIAGNOSTIC_PATIENCE="${DIAGNOSTIC_PATIENCE:-7}"
 DIAGNOSTIC_GATE_LR="${DIAGNOSTIC_GATE_LR:-0.0003}"
 DIAGNOSTIC_SELECTION_SPLIT="${DIAGNOSTIC_SELECTION_SPLIT:-test}"
 DIAGNOSTIC_SELECTION_METRIC="${DIAGNOSTIC_SELECTION_METRIC:-weighted_f1}"
+DIAGNOSTIC_LAMBDA_IMPACT="${DIAGNOSTIC_LAMBDA_IMPACT:-0.01}"
+DIAGNOSTIC_IMPACT_LOSS="${DIAGNOSTIC_IMPACT_LOSS:-soft_mse}"
+DIAGNOSTIC_TEACHER_GATES="${DIAGNOSTIC_TEACHER_GATES:-0 0.25 0.5 0.75 1}"
+DIAGNOSTIC_TEACHER_WEIGHT_SCALE="${DIAGNOSTIC_TEACHER_WEIGHT_SCALE:-0.01}"
+DIAGNOSTIC_TEACHER_MARGIN_EPS="${DIAGNOSTIC_TEACHER_MARGIN_EPS:-0.0001}"
 
-TEACHER_FILE="$OUTPUT_DIR/manifests/train_impact_teacher.csv"
+TEACHER_FILE="$OUTPUT_DIR/manifests/train_edge_impact_teacher.csv"
 mkdir -p "$DIAGNOSTIC_OUTPUT_DIR" "$OUTPUT_DIR/manifests"
+read -r -a TEACHER_GATE_ARRAY <<< "$DIAGNOSTIC_TEACHER_GATES"
 
 if [[ ! -s "$TEACHER_FILE" ]]; then
-  echo "[diagnostic 1/2] Generating train-only impact teacher..."
-  "$PYTHON" "$SCRIPT_DIR/generate_train_impact_teacher.py" \
+  echo "[diagnostic 1/2] Generating train-only propagation-edge teacher..."
+  "$PYTHON" "$SCRIPT_DIR/generate_train_edge_teacher.py" \
     "${MODEL_ARGS[@]}" \
+    "${ATTENTION_ARGS[@]}" \
     --output-dir "$OUTPUT_DIR" \
     --modalities text \
+    --gates "${TEACHER_GATE_ARRAY[@]}" \
+    --intervention-batch-size "$INTERVENTION_BATCH_SIZE" \
+    --teacher-weight-scale "$DIAGNOSTIC_TEACHER_WEIGHT_SCALE" \
+    --teacher-margin-eps "$DIAGNOSTIC_TEACHER_MARGIN_EPS" \
     --seed "$SEED" \
     --max-conversations "$MAX_CONVERSATIONS"
 else
@@ -51,6 +62,9 @@ echo "Gate LR: $DIAGNOSTIC_GATE_LR"
   --batch-size "$BATCH_SIZE" \
   --lr "$DIAGNOSTIC_GATE_LR" \
   --gate-lr "$DIAGNOSTIC_GATE_LR" \
+  --lambda-impact "$DIAGNOSTIC_LAMBDA_IMPACT" \
+  --impact-loss "$DIAGNOSTIC_IMPACT_LOSS" \
+  --impact-scale "$DIAGNOSTIC_TEACHER_WEIGHT_SCALE" \
   --impact-eps "$IMPACT_EPS" \
   --bootstrap-reps "$BOOTSTRAP_REPS" \
   --max-batches "$MAX_BATCHES" \

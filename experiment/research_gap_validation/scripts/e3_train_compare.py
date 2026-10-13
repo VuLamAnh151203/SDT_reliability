@@ -59,9 +59,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="0 chooses the closest B5 residual width to B3 gate parameters")
     parser.add_argument("--initial-gate", type=float, default=0.99)
     parser.add_argument("--lambda-identity", type=float, default=1e-3)
-    parser.add_argument("--lambda-impact", type=float, default=0.2)
+    parser.add_argument(
+        "--lambda-impact", type=float, default=0.02,
+        help="Weight of B4 edge-teacher supervision; kept below emotion loss by default",
+    )
     parser.add_argument("--lambda-relevance", type=float, default=0.2)
     parser.add_argument("--impact-eps", type=float, default=1e-4)
+    parser.add_argument(
+        "--impact-loss", choices=("soft_mse", "bce"), default="soft_mse",
+        help=("B4 teacher objective. soft_mse is recommended for continuous "
+              "edge-gate teachers; bce is retained for compatibility."),
+    )
+    parser.add_argument(
+        "--impact-gate-floor", type=float, default=0.75,
+        help=("Lowest soft gate target assigned to a harmful legacy input-"
+              "replacement teacher row."),
+    )
+    parser.add_argument(
+        "--impact-scale", type=float, default=1e-2,
+        help=("Impact magnitude that receives unit teacher weight when a legacy "
+              "signed-impact file is used."),
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -92,8 +110,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 class ImpactTeacher:
-    def __init__(self, path: Path | None, train_ids: set[str], epsilon: float):
-        self.values: dict[tuple[str, int, int, int], int] = {}
+    """Train-only edge-gate targets.
+
+    New propagation-edge teachers provide ``teacher_gate`` and
+    ``teacher_weight`` directly. Legacy singleton input-replacement teachers are
+    still accepted, but are converted to conservative magnitude-aware targets
+    instead of the former hard 0/1 labels.
+    """
+
+    def __init__(self, path: Path | None, train_ids: set[str], epsilon: float,
+                 gate_floor: float, impact_scale: float):
+        self.values: dict[tuple[str, int, int, int], tuple[float, float]] = {}
+        self.teacher_kind = "none"
+        self.target_counts = {"suppressed": 0, "identity": 0, "intermediate": 0}
         if path is None:
             return
         for row in read_csv(path):
@@ -102,18 +131,40 @@ class ImpactTeacher:
                 raise ValueError(
                     f"Impact teacher contains non-train conversation: {conversation}"
                 )
-            impact = float(row["signed_impact"])
-            if abs(impact) <= epsilon:
-                continue
             modality = MODALITY_INDEX[row["modality"]]
             key = (conversation, int(row["target_idx"]), int(row["source_idx"]), modality)
             if key in self.values:
                 raise ValueError(f"Duplicate impact-teacher key: {key}")
-            self.values[key] = int(impact > epsilon)  # keep beneficial, suppress harmful
+            if row.get("teacher_gate", "") != "":
+                self.teacher_kind = "propagation_edge_grid"
+                target = float(row["teacher_gate"])
+                weight = float(row.get("teacher_weight", 1.0) or 1.0)
+            else:
+                if self.teacher_kind == "none":
+                    self.teacher_kind = "legacy_input_replacement"
+                impact = float(row["signed_impact"])
+                if abs(impact) <= epsilon:
+                    continue
+                strength = min(abs(impact) / impact_scale, 1.0)
+                target = 1.0 if impact > epsilon else 1.0 - (
+                    (1.0 - gate_floor) * strength
+                )
+                weight = strength
+            if not 0.0 <= target <= 1.0:
+                raise ValueError(f"Teacher gate outside [0,1] for {key}: {target}")
+            if not np.isfinite(weight) or weight < 0.0:
+                raise ValueError(f"Invalid teacher weight for {key}: {weight}")
+            if weight == 0.0:
+                continue
+            self.values[key] = (target, weight)
+            category = ("suppressed" if target <= 1e-6 else "identity"
+                        if target >= 0.999999 else "intermediate")
+            self.target_counts[category] += 1
 
     def batch(self, dialogue_ids, lengths, max_length, device):
-        targets = torch.zeros(len(dialogue_ids), max_length, max_length, 3,
-                              device=device)
+        targets = torch.ones(len(dialogue_ids), max_length, max_length, 3,
+                             device=device)
+        weights = torch.zeros_like(targets)
         mask = torch.zeros_like(targets, dtype=torch.bool)
         for batch_index, (conversation, length) in enumerate(zip(dialogue_ids, lengths)):
             for target in range(length):
@@ -123,9 +174,23 @@ class ImpactTeacher:
                     for modality in range(3):
                         key = (conversation, target, source, modality)
                         if key in self.values:
-                            targets[batch_index, target, source, modality] = self.values[key]
+                            value, weight = self.values[key]
+                            targets[batch_index, target, source, modality] = value
+                            weights[batch_index, target, source, modality] = weight
                             mask[batch_index, target, source, modality] = True
-        return targets, mask
+        return targets, weights, mask
+
+    def summary(self) -> dict[str, object]:
+        weights = [value[1] for value in self.values.values()]
+        targets = [value[0] for value in self.values.values()]
+        return {
+            "teacher_kind": self.teacher_kind,
+            "teacher_pair_count": len(self.values),
+            "teacher_mean_target": float(np.mean(targets)) if targets else None,
+            "teacher_mean_weight": float(np.mean(weights)) if weights else None,
+            **{f"teacher_{key}_count": value
+               for key, value in self.target_counts.items()},
+        }
 
 
 def _class_weights(experiment):
@@ -166,11 +231,20 @@ def _loss(model_id, output, labels, valid, class_weights, args, teacher,
         pair_mask = _valid_pair_mask(valid).unsqueeze(-1).expand_as(gates)
         identity = ((1.0 - gates[pair_mask]) ** 2).mean()
         if model_id == "B4":
-            targets, teacher_mask = teacher.batch(
+            targets, teacher_weights, teacher_mask = teacher.batch(
                 dialogue_ids, lengths, valid.size(1), valid.device
             )
             if teacher_mask.any():
-                auxiliary = F.binary_cross_entropy(gates[teacher_mask], targets[teacher_mask])
+                predicted = gates[teacher_mask]
+                expected = targets[teacher_mask]
+                weights = teacher_weights[teacher_mask]
+                if args.impact_loss == "bce":
+                    errors = F.binary_cross_entropy(
+                        predicted, expected, reduction="none"
+                    )
+                else:
+                    errors = (predicted - expected).square()
+                auxiliary = (errors * weights).sum() / weights.sum().clamp_min(1e-12)
         elif model_id == "B6":
             targets, relevance_mask = _relevance_proxy(speakers, valid)
             auxiliary = F.binary_cross_entropy(gates[relevance_mask],
@@ -198,6 +272,8 @@ def run_epoch(model, model_id, loader, experiment, args, teacher,
     model.train(training)
     labels_all, predictions_all, rows = [], [], []
     total_nll = total_loss = total_identity = total_auxiliary = 0.0
+    gate_sum = gate_items = 0
+    gate_minimum = 1.0
     utterances = batches = 0
     started = time.perf_counter()
     context = torch.enable_grad() if training else torch.inference_mode()
@@ -214,6 +290,20 @@ def run_epoch(model, model_id, loader, experiment, args, teacher,
             if training:
                 optimizer.zero_grad(set_to_none=True)
             output = model(text, visual, audio, mask, speakers, lengths)
+            pair_gate = output["reliability_pair_gate"]
+            modality_gate = output["reliability_modality_gate"]
+            if pair_gate is not None:
+                active_mask = _valid_pair_mask(valid).unsqueeze(-1).expand_as(pair_gate)
+                active_gates = pair_gate[active_mask].detach()
+            elif modality_gate is not None:
+                active_mask = valid.unsqueeze(-1).expand_as(modality_gate)
+                active_gates = modality_gate[active_mask].detach()
+            else:
+                active_gates = None
+            if active_gates is not None and active_gates.numel():
+                gate_sum += float(active_gates.sum().cpu())
+                gate_items += int(active_gates.numel())
+                gate_minimum = min(gate_minimum, float(active_gates.min().cpu()))
             valid_log_prob = output["log_prob"][valid]
             unweighted_nll = -valid_log_prob.gather(
                 1, labels[valid].unsqueeze(-1)
@@ -295,6 +385,8 @@ def run_epoch(model, model_id, loader, experiment, args, teacher,
         "nll": total_nll / utterances, "training_objective": total_loss / utterances,
         "identity_loss": total_identity / utterances,
         "auxiliary_loss": total_auxiliary / utterances,
+        "gate_mean": gate_sum / gate_items if gate_items else 1.0,
+        "gate_min": gate_minimum,
         "utterances": utterances, "seconds": time.perf_counter() - started,
         "batches": batches,
     })
@@ -465,9 +557,24 @@ def train(args: argparse.Namespace) -> None:
                 )
     if "B4" in args.models and args.impact_teacher is None:
         raise ValueError("B4 requires --impact-teacher generated only from train conversations")
-    teacher = ImpactTeacher(args.impact_teacher, sets["train"], args.impact_eps)
+    teacher = ImpactTeacher(
+        args.impact_teacher, sets["train"], args.impact_eps,
+        args.impact_gate_floor, args.impact_scale,
+    )
+    teacher_summary = teacher.summary()
+    if "B4" in args.models:
+        if not teacher.values:
+            raise ValueError("B4 impact teacher contains no usable weighted edge targets")
+        print(
+            "B4 teacher: "
+            f"kind={teacher_summary['teacher_kind']} "
+            f"pairs={teacher_summary['teacher_pair_count']} "
+            f"mean_target={teacher_summary['teacher_mean_target']:.4f} "
+            f"mean_weight={teacher_summary['teacher_mean_weight']:.4f}",
+            flush=True,
+        )
     output = args.output_dir.resolve() / "E3"
-    model_rows, transition_rows, classwise_rows = [], [], []
+    model_rows, transition_rows, classwise_rows, epoch_rows = [], [], [], []
     all_predictions, prediction_groups = [], {}
     run_manifest = []
     for run_seed in args.seeds:
@@ -482,6 +589,13 @@ def train(args: argparse.Namespace) -> None:
             initial_selection_metrics, _ = run_epoch(
                 model, model_id, loaders[args.selection_split], experiment, args, teacher,
             )
+            history_metadata = {
+                "fold": args.fold_name, "seed": run_seed, "model": model_id,
+            }
+            epoch_rows.append({
+                **history_metadata, "epoch": 0, "phase": "selection",
+                "split": args.selection_split, **initial_selection_metrics,
+            })
             best_state = copy.deepcopy(model.trainable_state_dict())
             best_score = _checkpoint_selection_score(
                 initial_selection_metrics, args.selection_metric
@@ -497,9 +611,17 @@ def train(args: argparse.Namespace) -> None:
                     model, model_id, loaders["train"], experiment, args, teacher,
                     optimizer=optimizer,
                 )
+                epoch_rows.append({
+                    **history_metadata, "epoch": epoch, "phase": "train",
+                    "split": "train", **train_metrics,
+                })
                 selection_metrics, _ = run_epoch(
                     model, model_id, loaders[args.selection_split], experiment, args, teacher,
                 )
+                epoch_rows.append({
+                    **history_metadata, "epoch": epoch, "phase": "selection",
+                    "split": args.selection_split, **selection_metrics,
+                })
                 train_seconds += train_metrics["seconds"]
                 selection_score = _checkpoint_selection_score(
                     selection_metrics, args.selection_metric
@@ -585,6 +707,13 @@ def train(args: argparse.Namespace) -> None:
                 "classifier_frozen": int(args.freeze_classifier),
                 "classifier_lr": 0.0 if args.freeze_classifier else args.lr,
                 "gate_lr": args.lr if args.gate_lr is None else args.gate_lr,
+                "impact_loss": args.impact_loss if model_id == "B4" else "",
+                "impact_teacher_kind": (
+                    teacher_summary["teacher_kind"] if model_id == "B4" else ""
+                ),
+                "impact_teacher_pairs": (
+                    teacher_summary["teacher_pair_count"] if model_id == "B4" else 0
+                ),
             })
             checkpoint_path = output / "checkpoints" / f"{fold}_{model_id}_seed{run_seed}.pt"
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,6 +736,7 @@ def train(args: argparse.Namespace) -> None:
                 flush=True,
             )
     write_csv(output / "model_comparison.csv", model_rows)
+    write_csv(output / "epoch_history.csv", epoch_rows)
     write_csv(output / "transition_subset_metrics.csv", transition_rows)
     write_csv(output / "classwise_f1.csv", classwise_rows)
     write_csv(output / "test_predictions.csv", all_predictions)
@@ -620,6 +750,10 @@ def train(args: argparse.Namespace) -> None:
                         "target_modality" if model_id in ("B1", "B2")
                         else "source_target_modality"),
         "impact_supervision": int(model_id == "B4"),
+        "impact_teacher_kind": (
+            teacher_summary["teacher_kind"] if model_id == "B4" else ""
+        ),
+        "impact_loss": args.impact_loss if model_id == "B4" else "",
         "relevance_supervision": int(model_id == "B6"),
         "capacity_control": int(model_id == "B5"),
     } for model_id in args.models])
@@ -645,6 +779,10 @@ def train(args: argparse.Namespace) -> None:
         "selection_split": args.selection_split,
         "selection_metric": args.selection_metric,
         "impact_teacher": str(args.impact_teacher.resolve()) if args.impact_teacher else None,
+        "impact_teacher_summary": teacher_summary,
+        "impact_loss": args.impact_loss,
+        "impact_gate_floor": args.impact_gate_floor,
+        "impact_scale": args.impact_scale,
         "test_labels_or_impacts_used_for_training_or_selection": (
             args.selection_split == "test"
         ),
@@ -658,7 +796,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if min(args.epochs, args.batch_size, args.gate_hidden) < 1 or args.capacity_hidden < 0:
         raise ValueError("Positive training dimensions and nonnegative capacity width required")
     if (args.lr <= 0 or (args.gate_lr is not None and args.gate_lr <= 0)
-            or args.impact_eps < 0 or not 0.5 < args.initial_gate < 1):
+            or args.impact_eps < 0 or args.impact_scale <= 0
+            or not 0.0 <= args.impact_gate_floor <= 1.0
+            or not 0.5 < args.initial_gate < 1):
         raise ValueError("Invalid learning rate, epsilon, or initial gate")
     if args.freeze_classifier and args.unfreeze_backbone:
         raise ValueError("--freeze-classifier and --unfreeze-backbone are incompatible")

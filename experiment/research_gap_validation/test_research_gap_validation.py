@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import csv
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,8 @@ for path in (HERE, SCRIPTS):
 
 from common import classification_metrics, distance_bin, margin_bin
 from e1_mixed_contribution import aggregate_pairs
+from e3_train_compare import ImpactTeacher
+from generate_train_edge_teacher import select_teacher_action
 
 
 class ResearchGapValidationTests(unittest.TestCase):
@@ -44,6 +48,64 @@ class ResearchGapValidationTests(unittest.TestCase):
         self.assertEqual(distance_bin(6), "06-10")
         self.assertEqual(margin_bin(0.049), "low_<0.05")
         self.assertEqual(margin_bin(0.2), "high_>=0.20")
+
+    def test_legacy_impact_teacher_uses_soft_magnitude_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "teacher.csv"
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=(
+                    "conversation_id", "target_idx", "source_idx", "modality",
+                    "signed_impact",
+                ))
+                writer.writeheader()
+                writer.writerows((
+                    {"conversation_id": "c", "target_idx": 1, "source_idx": 0,
+                     "modality": "text", "signed_impact": -0.02},
+                    {"conversation_id": "c", "target_idx": 0, "source_idx": 1,
+                     "modality": "text", "signed_impact": 0.02},
+                ))
+            teacher = ImpactTeacher(path, {"c"}, 1e-4, 0.75, 0.01)
+            self.assertEqual(teacher.values[("c", 1, 0, 0)], (0.75, 1.0))
+            self.assertEqual(teacher.values[("c", 0, 1, 0)], (1.0, 1.0))
+
+    def test_edge_teacher_preserves_continuous_gate_and_weight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "teacher.csv"
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=(
+                    "conversation_id", "target_idx", "source_idx", "modality",
+                    "teacher_gate", "teacher_weight",
+                ))
+                writer.writeheader()
+                writer.writerow({
+                    "conversation_id": "c", "target_idx": 1, "source_idx": 0,
+                    "modality": "text", "teacher_gate": 0.5,
+                    "teacher_weight": 0.4,
+                })
+            teacher = ImpactTeacher(path, {"c"}, 1e-4, 0.75, 0.01)
+            target, weight = teacher.values[("c", 1, 0, 0)]
+            self.assertAlmostEqual(target, 0.5)
+            self.assertAlmostEqual(weight, 0.4)
+
+    def test_edge_teacher_selects_aligned_suppression_action(self):
+        gate, weight, decision, margin = select_teacher_action(
+            {0.0: 0.75, 0.5: 0.70, 0.75: 0.72, 1.0: 0.80},
+            weight_scale=0.2, margin_epsilon=0.0,
+        )
+        self.assertEqual(gate, 0.5)
+        self.assertEqual(decision, "suppress")
+        self.assertAlmostEqual(margin, 0.1)
+        self.assertAlmostEqual(weight, 0.5)
+
+    def test_edge_teacher_prefers_identity_on_exact_tie(self):
+        gate, weight, decision, margin = select_teacher_action(
+            {0.0: 0.8, 0.5: 0.8, 1.0: 0.8},
+            weight_scale=0.1, margin_epsilon=1e-4,
+        )
+        self.assertEqual(gate, 1.0)
+        self.assertEqual(decision, "keep")
+        self.assertEqual(margin, 0.0)
+        self.assertEqual(weight, 0.0)
 
 
 if __name__ == "__main__":

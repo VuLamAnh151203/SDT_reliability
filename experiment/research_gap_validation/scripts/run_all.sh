@@ -7,6 +7,13 @@ source "$EXPERIMENT_DIR/configs/experiment_config.sh"
 
 mkdir -p "$OUTPUT_DIR/manifests"
 
+E3_IMPACT_LOSS="${E3_IMPACT_LOSS:-soft_mse}"
+E3_LAMBDA_IMPACT="${E3_LAMBDA_IMPACT:-0.01}"
+E3_TEACHER_GATES="${E3_TEACHER_GATES:-0 0.25 0.5 0.75 1}"
+E3_TEACHER_WEIGHT_SCALE="${E3_TEACHER_WEIGHT_SCALE:-0.01}"
+E3_TEACHER_MARGIN_EPS="${E3_TEACHER_MARGIN_EPS:-0.0001}"
+read -r -a TEACHER_GATE_ARRAY <<< "$E3_TEACHER_GATES"
+
 "$PYTHON" "$SCRIPT_DIR/audit_sdt_architecture.py" "${MODEL_ARGS[@]}" \
   --output-dir "$OUTPUT_DIR"
 
@@ -52,16 +59,23 @@ if [[ "$RUN_FULL_E3" != "1" ]]; then
   exit 0
 fi
 
-"$PYTHON" "$SCRIPT_DIR/generate_train_impact_teacher.py" "${MODEL_ARGS[@]}" \
-  --output-dir "$OUTPUT_DIR" --modalities text --seed "$SEED" \
+"$PYTHON" "$SCRIPT_DIR/generate_train_edge_teacher.py" "${MODEL_ARGS[@]}" \
+  "${ATTENTION_ARGS[@]}" \
+  --output-dir "$OUTPUT_DIR" --modalities text \
+  --gates "${TEACHER_GATE_ARRAY[@]}" \
+  --intervention-batch-size "$INTERVENTION_BATCH_SIZE" \
+  --teacher-weight-scale "$E3_TEACHER_WEIGHT_SCALE" \
+  --teacher-margin-eps "$E3_TEACHER_MARGIN_EPS" --seed "$SEED" \
   --max-conversations "$MAX_CONVERSATIONS"
 
 read -r -a SEED_ARRAY <<< "$SEEDS"
 "$PYTHON" "$SCRIPT_DIR/e3_train_compare.py" "${MODEL_ARGS[@]}" \
   "${ATTENTION_ARGS[@]}" \
   --output-dir "$OUTPUT_DIR" \
-  --impact-teacher "$OUTPUT_DIR/manifests/train_impact_teacher.csv" \
+  --impact-teacher "$OUTPUT_DIR/manifests/train_edge_impact_teacher.csv" \
   --seeds "${SEED_ARRAY[@]}" --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" \
+  --lambda-impact "$E3_LAMBDA_IMPACT" --impact-loss "$E3_IMPACT_LOSS" \
+  --impact-scale "$E3_TEACHER_WEIGHT_SCALE" \
   --impact-eps "$IMPACT_EPS" --bootstrap-reps "$BOOTSTRAP_REPS" \
   --max-batches "$MAX_BATCHES"
 

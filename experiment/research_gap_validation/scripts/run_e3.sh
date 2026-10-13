@@ -13,16 +13,27 @@ E3_SELECTION_SPLIT="${E3_SELECTION_SPLIT:-test}"
 E3_SELECTION_METRIC="${E3_SELECTION_METRIC:-weighted_f1}"
 REGENERATE_TEACHER="${REGENERATE_TEACHER:-0}"
 RUN_E3_AUDIT="${RUN_E3_AUDIT:-1}"
+E3_IMPACT_LOSS="${E3_IMPACT_LOSS:-soft_mse}"
+E3_LAMBDA_IMPACT="${E3_LAMBDA_IMPACT:-0.01}"
+E3_TEACHER_GATES="${E3_TEACHER_GATES:-0 0.25 0.5 0.75 1}"
+E3_TEACHER_WEIGHT_SCALE="${E3_TEACHER_WEIGHT_SCALE:-0.01}"
+E3_TEACHER_MARGIN_EPS="${E3_TEACHER_MARGIN_EPS:-0.0001}"
 
-TEACHER_FILE="$OUTPUT_DIR/manifests/train_impact_teacher.csv"
+TEACHER_FILE="$OUTPUT_DIR/manifests/train_edge_impact_teacher.csv"
 mkdir -p "$OUTPUT_DIR/manifests" "$OUTPUT_DIR/E3/checkpoints"
+read -r -a TEACHER_GATE_ARRAY <<< "$E3_TEACHER_GATES"
 
 if [[ "$REGENERATE_TEACHER" == "1" || ! -s "$TEACHER_FILE" ]]; then
-  echo "[E3 1/3] Generating train-only impact teacher..."
-  "$PYTHON" "$SCRIPT_DIR/generate_train_impact_teacher.py" \
+  echo "[E3 1/3] Generating train-only propagation-edge teacher..."
+  "$PYTHON" "$SCRIPT_DIR/generate_train_edge_teacher.py" \
     "${MODEL_ARGS[@]}" \
+    "${ATTENTION_ARGS[@]}" \
     --output-dir "$OUTPUT_DIR" \
     --modalities text \
+    --gates "${TEACHER_GATE_ARRAY[@]}" \
+    --intervention-batch-size "$INTERVENTION_BATCH_SIZE" \
+    --teacher-weight-scale "$E3_TEACHER_WEIGHT_SCALE" \
+    --teacher-margin-eps "$E3_TEACHER_MARGIN_EPS" \
     --seed "$SEED" \
     --max-conversations "$MAX_CONVERSATIONS"
 else
@@ -45,6 +56,9 @@ echo "[E3 2/3] Epoch-selection metric: $E3_SELECTION_METRIC"
   --seeds "${SEED_ARRAY[@]}" \
   --epochs "$EPOCHS" \
   --batch-size "$BATCH_SIZE" \
+  --lambda-impact "$E3_LAMBDA_IMPACT" \
+  --impact-loss "$E3_IMPACT_LOSS" \
+  --impact-scale "$E3_TEACHER_WEIGHT_SCALE" \
   --impact-eps "$IMPACT_EPS" \
   --bootstrap-reps "$BOOTSTRAP_REPS" \
   --max-batches "$MAX_BATCHES" \

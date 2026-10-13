@@ -39,7 +39,10 @@ input modality.
 - Secondary: `--unfreeze-backbone`, áp dụng giống nhau cho toàn bộ models.
 - B1/B2 dùng cùng kiến trúc `ModalityGateNetwork`.
 - B3/B4/B6 dùng cùng kiến trúc `PairGateNetwork`.
-- B4 teacher chỉ lấy raw interventions của train conversations.
+- B4 teacher chỉ lấy propagation-edge interventions của train conversations,
+  dùng đúng attention hook/action space của learned gate. Teacher lưu continuous
+  best-gate target và confidence theo NLL decision margin; B4 tối ưu weighted
+  soft-MSE thay vì hard BCE 0/1.
 - B6 relevance target chỉ dùng distance và speaker identity, không dùng emotion,
   correctness, impact hoặc target label.
 - Validation NLL chọn epoch; test chỉ được đọc sau khi state tốt nhất đã khóa.

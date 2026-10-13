@@ -571,6 +571,8 @@ Chạy toàn bộ workflow, bao gồm Bayesian mixed-effects logistic regression
 bash run_structural_harm_experiment.sh
 ```
 
+Mixed-effects backend được hiện thực trực tiếp bằng PyTorch với mean-field variational Bayes; không cần `statsmodels` hoặc `pandas`. Fixed effects, random intercept theo conversation/target và standard deviation của hai random-effect distributions đều được học đồng thời. Posterior interval là xấp xỉ variational, vì vậy phải báo cáo cùng conversation-bootstrap CI từ phần descriptive thay vì xem nó như exact frequentist confidence interval.
+
 Hoặc fit riêng adjusted model:
 
 ```bash
@@ -597,6 +599,17 @@ random intercept: target nested by conversation
 ```
 
 Model được fit riêng cho zero/train-mean và từng epsilon. File robustness chỉ đánh dấu một coefficient là robust khi giữ cùng hướng và interval loại 0 qua tất cả các fit. `--max-rows` chỉ dành cho smoke/debug; không sử dụng subsampling khi báo cáo kết quả paper.
+
+Các tham số runtime có thể điều chỉnh nếu GPU/RAM hạn chế:
+
+```bash
+python fit_structural_harm_mixed_effects.py \
+  --run-dir "$RUN_DIR" \
+  --device cuda \
+  --epochs 60 \
+  --batch-size 8192 \
+  --learning-rate 0.02
+```
 
 ### Experiment 3 — Contextual profile và diagnostic oracle
 

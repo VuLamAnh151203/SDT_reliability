@@ -65,7 +65,10 @@ def _load_wrapper(experiment, artifact_path: Path):
         capacity_hidden=int(config["capacity_hidden"]),
         renormalize_attention=bool(config["renormalize_attention"]),
     ).to(experiment.device)
-    wrapper.freeze_backbone(True)
+    freeze_classifier = bool(config.get("freeze_classifier", False))
+    wrapper.freeze_backbone(train_classifier=not freeze_classifier)
+    if bool(config.get("unfreeze_backbone", False)):
+        wrapper.unfreeze_backbone()
     wrapper.load_trainable_state_dict(artifact["trainable_state_dict"])
     wrapper.eval()
     return wrapper, artifact

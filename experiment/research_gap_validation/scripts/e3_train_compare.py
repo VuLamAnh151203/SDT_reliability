@@ -48,6 +48,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--gate-lr", type=float,
+        help="Optional learning rate for gate/control parameters; defaults to --lr",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--gate-hidden", type=int, default=64)
@@ -79,6 +83,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-session-disjoint", action="store_true")
     parser.add_argument("--unfreeze-backbone", action="store_true",
                         help="Secondary protocol; applies identically to every selected model")
+    parser.add_argument(
+        "--freeze-classifier", action="store_true",
+        help="Strict diagnostic: freeze the SDT classifier and train only added gates/controls",
+    )
     parser.add_argument("--allow-smoke-checkpoint", action="store_true")
     return parser.parse_args(argv)
 
@@ -312,11 +320,34 @@ def _new_model(experiment, model_id, args):
         initial_gate=args.initial_gate, capacity_hidden=capacity_hidden,
         renormalize_attention=args.renormalize_attention,
     ).to(experiment.device)
-    wrapper.freeze_backbone(train_classifier=True)
+    wrapper.freeze_backbone(train_classifier=not args.freeze_classifier)
     if args.unfreeze_backbone:
         wrapper.unfreeze_backbone()
     wrapper.effective_capacity_hidden = capacity_hidden
     return wrapper
+
+
+def _make_optimizer(model, args):
+    classifier_parameters = [
+        parameter for parameter in model.base.all_output_layer.parameters()
+        if parameter.requires_grad
+    ]
+    classifier_ids = {id(parameter) for parameter in classifier_parameters}
+    gate_parameters = [
+        parameter for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in classifier_ids
+    ]
+    groups = []
+    if classifier_parameters:
+        groups.append({"params": classifier_parameters, "lr": args.lr})
+    if gate_parameters:
+        groups.append({
+            "params": gate_parameters,
+            "lr": args.lr if args.gate_lr is None else args.gate_lr,
+        })
+    if not groups:
+        return None
+    return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
 
 def _transition_summaries(rows, metadata):
@@ -447,9 +478,7 @@ def train(args: argparse.Namespace) -> None:
         for model_id in args.models:
             seed_everything(run_seed)
             model = _new_model(experiment, model_id, args)
-            parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-            optimizer = torch.optim.AdamW(parameters, lr=args.lr,
-                                          weight_decay=args.weight_decay)
+            optimizer = _make_optimizer(model, args)
             initial_selection_metrics, _ = run_epoch(
                 model, model_id, loaders[args.selection_split], experiment, args, teacher,
             )
@@ -462,7 +491,8 @@ def train(args: argparse.Namespace) -> None:
             train_seconds = 0.0
             if experiment.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(experiment.device)
-            for epoch in range(1, args.epochs + 1):
+            epoch_iterator = range(1, args.epochs + 1) if optimizer is not None else ()
+            for epoch in epoch_iterator:
                 train_metrics, _ = run_epoch(
                     model, model_id, loaders["train"], experiment, args, teacher,
                     optimizer=optimizer,
@@ -552,6 +582,9 @@ def train(args: argparse.Namespace) -> None:
                 ])),
                 "renormalize_attention": int(args.renormalize_attention),
                 "backbone_frozen": int(not args.unfreeze_backbone),
+                "classifier_frozen": int(args.freeze_classifier),
+                "classifier_lr": 0.0 if args.freeze_classifier else args.lr,
+                "gate_lr": args.lr if args.gate_lr is None else args.gate_lr,
             })
             checkpoint_path = output / "checkpoints" / f"{fold}_{model_id}_seed{run_seed}.pt"
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -600,6 +633,8 @@ def train(args: argparse.Namespace) -> None:
         "models": args.models, "seeds": args.seeds,
         "training_protocol": (
             "joint end-to-end fine-tuning" if args.unfreeze_backbone
+            else "strict frozen SDT; train added gates/controls only"
+            if args.freeze_classifier
             else "frozen contextual backbone; trainable gate/control and classifier"
         ),
         "selection": (
@@ -622,8 +657,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if min(args.epochs, args.batch_size, args.gate_hidden) < 1 or args.capacity_hidden < 0:
         raise ValueError("Positive training dimensions and nonnegative capacity width required")
-    if args.lr <= 0 or args.impact_eps < 0 or not 0.5 < args.initial_gate < 1:
+    if (args.lr <= 0 or (args.gate_lr is not None and args.gate_lr <= 0)
+            or args.impact_eps < 0 or not 0.5 < args.initial_gate < 1):
         raise ValueError("Invalid learning rate, epsilon, or initial gate")
+    if args.freeze_classifier and args.unfreeze_backbone:
+        raise ValueError("--freeze-classifier and --unfreeze-backbone are incompatible")
     train(args)
 
 

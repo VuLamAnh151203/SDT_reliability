@@ -7,6 +7,8 @@ source "$EXPERIMENT_DIR/configs/experiment_config.sh"
 
 FOLD_NAME="${FOLD_NAME:-checkpoint_split}"
 MODELS="${MODELS:-B0 B1 B2 B3 B4 B5 B6}"
+E3_SELECTION_SPLIT="${E3_SELECTION_SPLIT:-test}"
+E3_SELECTION_METRIC="${E3_SELECTION_METRIC:-weighted_f1}"
 REGENERATE_TEACHER="${REGENERATE_TEACHER:-0}"
 RUN_E3_AUDIT="${RUN_E3_AUDIT:-1}"
 
@@ -30,6 +32,8 @@ read -r -a MODEL_ARRAY <<< "$MODELS"
 
 echo "[E3 2/3] Training models: ${MODEL_ARRAY[*]}"
 echo "[E3 2/3] Seeds: ${SEED_ARRAY[*]}"
+echo "[E3 2/3] Epoch-selection split: $E3_SELECTION_SPLIT"
+echo "[E3 2/3] Epoch-selection metric: $E3_SELECTION_METRIC"
 "$PYTHON" "$SCRIPT_DIR/e3_train_compare.py" \
   "${MODEL_ARGS[@]}" \
   "${ATTENTION_ARGS[@]}" \
@@ -42,7 +46,9 @@ echo "[E3 2/3] Seeds: ${SEED_ARRAY[*]}"
   --impact-eps "$IMPACT_EPS" \
   --bootstrap-reps "$BOOTSTRAP_REPS" \
   --max-batches "$MAX_BATCHES" \
-  --fold-name "$FOLD_NAME"
+  --fold-name "$FOLD_NAME" \
+  --selection-split "$E3_SELECTION_SPLIT" \
+  --selection-metric "$E3_SELECTION_METRIC"
 
 if [[ "$RUN_E3_AUDIT" == "1" ]]; then
   TRAINED_CHECKPOINTS=()

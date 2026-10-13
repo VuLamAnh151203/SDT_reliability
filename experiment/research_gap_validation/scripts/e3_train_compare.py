@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import math
 import sys
 import time
 from collections import defaultdict
@@ -66,6 +65,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bootstrap-reps", type=int, default=2000)
     parser.add_argument("--renormalize-attention", action="store_true")
     parser.add_argument("--fold-name", default="checkpoint_split")
+    parser.add_argument(
+        "--selection-split", choices=("valid", "test"), default="valid",
+        help=("Split used for early stopping and best-epoch selection. Using test "
+              "is exploratory and makes the reported test metrics optimistically biased."),
+    )
+    parser.add_argument(
+        "--selection-metric", choices=("nll", "weighted_f1", "accuracy"),
+        default="nll",
+        help=("Primary checkpoint-selection metric. Weighted F1 uses accuracy and NLL "
+              "as deterministic tie-breakers; accuracy uses weighted F1 and NLL."),
+    )
     parser.add_argument("--require-session-disjoint", action="store_true")
     parser.add_argument("--unfreeze-backbone", action="store_true",
                         help="Secondary protocol; applies identically to every selected model")
@@ -384,8 +394,19 @@ def train(args: argparse.Namespace) -> None:
         args.allow_smoke_checkpoint,
     )
     split_ids = {name: list(values) for name, values in experiment.split_ids.items()}
-    if not split_ids.get("valid"):
-        raise ValueError("E3 requires a non-empty validation split for model selection")
+    if args.selection_split == "valid" and not split_ids.get("valid"):
+        raise ValueError(
+            "E3 requires a non-empty validation split for validation-based model "
+            "selection; pass --selection-split test only for exploratory test-selected runs"
+        )
+    if args.selection_split == "test":
+        if not split_ids.get("test"):
+            raise ValueError("E3 test-based model selection requires a non-empty test split")
+        print(
+            "WARNING: selecting E3 epochs on the test split; resulting test metrics are "
+            "not held-out estimates.",
+            flush=True,
+        )
     sets = {name: set(values) for name, values in split_ids.items()}
     if sets["train"] & sets["valid"] or sets["train"] & sets["test"] or sets["valid"] & sets["test"]:
         raise ValueError("Conversation leakage across checkpoint splits")
@@ -417,7 +438,8 @@ def train(args: argparse.Namespace) -> None:
             parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
             optimizer = torch.optim.AdamW(parameters, lr=args.lr,
                                           weight_decay=args.weight_decay)
-            best_state, best_nll, best_epoch, stale = None, math.inf, 0, 0
+            best_state, best_score, best_epoch, stale = None, None, 0, 0
+            best_selection_metrics = None
             train_seconds = 0.0
             if experiment.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(experiment.device)
@@ -426,13 +448,32 @@ def train(args: argparse.Namespace) -> None:
                     model, model_id, loaders["train"], experiment, args, teacher,
                     optimizer=optimizer,
                 )
-                validation_metrics, _ = run_epoch(
-                    model, model_id, loaders["valid"], experiment, args, teacher,
+                selection_metrics, _ = run_epoch(
+                    model, model_id, loaders[args.selection_split], experiment, args, teacher,
                 )
                 train_seconds += train_metrics["seconds"]
-                if validation_metrics["nll"] < best_nll - 1e-8:
-                    best_nll = validation_metrics["nll"]
+                if args.selection_metric == "weighted_f1":
+                    selection_score = (
+                        float(selection_metrics["weighted_f1"]),
+                        float(selection_metrics["accuracy"]),
+                        -float(selection_metrics["nll"]),
+                    )
+                elif args.selection_metric == "accuracy":
+                    selection_score = (
+                        float(selection_metrics["accuracy"]),
+                        float(selection_metrics["weighted_f1"]),
+                        -float(selection_metrics["nll"]),
+                    )
+                else:
+                    selection_score = (
+                        -float(selection_metrics["nll"]),
+                        float(selection_metrics["weighted_f1"]),
+                        float(selection_metrics["accuracy"]),
+                    )
+                if best_score is None or selection_score > best_score:
+                    best_score = selection_score
                     best_epoch = epoch
+                    best_selection_metrics = dict(selection_metrics)
                     best_state = copy.deepcopy(model.trainable_state_dict())
                     stale = 0
                 else:
@@ -440,7 +481,9 @@ def train(args: argparse.Namespace) -> None:
                 if stale >= args.patience:
                     break
             if best_state is None:
-                raise RuntimeError("No finite E3 validation checkpoint")
+                raise RuntimeError(
+                    f"No finite E3 checkpoint selected on {args.selection_split}"
+                )
             model.load_trainable_state_dict(best_state)
             test_metrics, predictions = run_epoch(
                 model, model_id, loaders["test"], experiment, args, teacher,
@@ -482,6 +525,11 @@ def train(args: argparse.Namespace) -> None:
             mean_length = int(round(np.mean(list(lengths_by_conversation.values()))))
             model_rows.append({
                 **metadata, "best_epoch": best_epoch,
+                "selection_split": args.selection_split,
+                "selection_metric": args.selection_metric,
+                "best_selection_accuracy": best_selection_metrics["accuracy"],
+                "best_selection_weighted_f1": best_selection_metrics["weighted_f1"],
+                "best_selection_nll": best_selection_metrics["nll"],
                 "accuracy": test_metrics["accuracy"],
                 "weighted_f1": test_metrics["weighted_f1"],
                 "macro_f1": test_metrics["macro_f1"], "nll": test_metrics["nll"],
@@ -547,9 +595,16 @@ def train(args: argparse.Namespace) -> None:
             "joint end-to-end fine-tuning" if args.unfreeze_backbone
             else "frozen contextual backbone; trainable gate/control and classifier"
         ),
-        "selection": "minimum validation NLL",
+        "selection": (
+            f"best {args.selection_split} {args.selection_metric}; deterministic "
+            "tie-break by the other reported selection metrics"
+        ),
+        "selection_split": args.selection_split,
+        "selection_metric": args.selection_metric,
         "impact_teacher": str(args.impact_teacher.resolve()) if args.impact_teacher else None,
-        "test_labels_or_impacts_used_for_training_or_selection": False,
+        "test_labels_or_impacts_used_for_training_or_selection": (
+            args.selection_split == "test"
+        ),
         "checkpoints": run_manifest,
         "smoke_limited": bool(args.max_batches),
     })

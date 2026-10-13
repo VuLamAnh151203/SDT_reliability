@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 source "$EXPERIMENT_DIR/configs/experiment_config.sh"
 
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+
 FOLD_NAME="${FOLD_NAME:-checkpoint_split}"
 MODELS="${MODELS:-B0 B1 B2 B3 B4 B5 B6}"
 E3_SELECTION_SPLIT="${E3_SELECTION_SPLIT:-test}"

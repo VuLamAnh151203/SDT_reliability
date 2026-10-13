@@ -388,6 +388,18 @@ def _paired_deltas(prediction_groups, repetitions, seed):
     return output
 
 
+def _checkpoint_selection_score(metrics, metric):
+    """Return a maximized score with deterministic secondary criteria."""
+    accuracy = float(metrics["accuracy"])
+    weighted_f1 = float(metrics["weighted_f1"])
+    negative_nll = -float(metrics["nll"])
+    if metric == "weighted_f1":
+        return weighted_f1, accuracy, negative_nll
+    if metric == "accuracy":
+        return accuracy, weighted_f1, negative_nll
+    return negative_nll, weighted_f1, accuracy
+
+
 def train(args: argparse.Namespace) -> None:
     experiment = load_experiment(
         args.checkpoint, args.feature_path, args.device, args.gpu_id,
@@ -438,8 +450,15 @@ def train(args: argparse.Namespace) -> None:
             parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
             optimizer = torch.optim.AdamW(parameters, lr=args.lr,
                                           weight_decay=args.weight_decay)
-            best_state, best_score, best_epoch, stale = None, None, 0, 0
-            best_selection_metrics = None
+            initial_selection_metrics, _ = run_epoch(
+                model, model_id, loaders[args.selection_split], experiment, args, teacher,
+            )
+            best_state = copy.deepcopy(model.trainable_state_dict())
+            best_score = _checkpoint_selection_score(
+                initial_selection_metrics, args.selection_metric
+            )
+            best_epoch, stale = 0, 0
+            best_selection_metrics = dict(initial_selection_metrics)
             train_seconds = 0.0
             if experiment.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(experiment.device)
@@ -452,25 +471,10 @@ def train(args: argparse.Namespace) -> None:
                     model, model_id, loaders[args.selection_split], experiment, args, teacher,
                 )
                 train_seconds += train_metrics["seconds"]
-                if args.selection_metric == "weighted_f1":
-                    selection_score = (
-                        float(selection_metrics["weighted_f1"]),
-                        float(selection_metrics["accuracy"]),
-                        -float(selection_metrics["nll"]),
-                    )
-                elif args.selection_metric == "accuracy":
-                    selection_score = (
-                        float(selection_metrics["accuracy"]),
-                        float(selection_metrics["weighted_f1"]),
-                        -float(selection_metrics["nll"]),
-                    )
-                else:
-                    selection_score = (
-                        -float(selection_metrics["nll"]),
-                        float(selection_metrics["weighted_f1"]),
-                        float(selection_metrics["accuracy"]),
-                    )
-                if best_score is None or selection_score > best_score:
+                selection_score = _checkpoint_selection_score(
+                    selection_metrics, args.selection_metric
+                )
+                if selection_score > best_score:
                     best_score = selection_score
                     best_epoch = epoch
                     best_selection_metrics = dict(selection_metrics)
@@ -480,10 +484,6 @@ def train(args: argparse.Namespace) -> None:
                     stale += 1
                 if stale >= args.patience:
                     break
-            if best_state is None:
-                raise RuntimeError(
-                    f"No finite E3 checkpoint selected on {args.selection_split}"
-                )
             model.load_trainable_state_dict(best_state)
             test_metrics, predictions = run_epoch(
                 model, model_id, loaders["test"], experiment, args, teacher,
@@ -527,6 +527,9 @@ def train(args: argparse.Namespace) -> None:
                 **metadata, "best_epoch": best_epoch,
                 "selection_split": args.selection_split,
                 "selection_metric": args.selection_metric,
+                "epoch0_selection_accuracy": initial_selection_metrics["accuracy"],
+                "epoch0_selection_weighted_f1": initial_selection_metrics["weighted_f1"],
+                "epoch0_selection_nll": initial_selection_metrics["nll"],
                 "best_selection_accuracy": best_selection_metrics["accuracy"],
                 "best_selection_weighted_f1": best_selection_metrics["weighted_f1"],
                 "best_selection_nll": best_selection_metrics["nll"],
@@ -564,8 +567,12 @@ def train(args: argparse.Namespace) -> None:
                 "configuration": saved_configuration,
             }, checkpoint_path)
             run_manifest.append(str(checkpoint_path))
-            print(f"E3 {model_id} seed={run_seed}: WF1={test_metrics['weighted_f1']:.3f}",
-                  flush=True)
+            print(
+                f"E3 {model_id} seed={run_seed}: best_epoch={best_epoch} "
+                f"epoch0_WF1={initial_selection_metrics['weighted_f1']:.3f} "
+                f"best_WF1={test_metrics['weighted_f1']:.3f}",
+                flush=True,
+            )
     write_csv(output / "model_comparison.csv", model_rows)
     write_csv(output / "transition_subset_metrics.csv", transition_rows)
     write_csv(output / "classwise_f1.csv", classwise_rows)
@@ -599,6 +606,7 @@ def train(args: argparse.Namespace) -> None:
             f"best {args.selection_split} {args.selection_metric}; deterministic "
             "tie-break by the other reported selection metrics"
         ),
+        "selection_includes_epoch_zero": True,
         "selection_split": args.selection_split,
         "selection_metric": args.selection_metric,
         "impact_teacher": str(args.impact_teacher.resolve()) if args.impact_teacher else None,

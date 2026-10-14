@@ -60,3 +60,23 @@ input modality.
   seed/fold hoặc nếu late oracle ngang early oracle.
 - Không kết luận impact supervision hữu ích nếu B4 không hơn cả B3 và B6.
 
+## 6. D1 harmful-edge learnability contract
+
+- Label D1 được tạo bằng frozen SDT và đúng direct propagation-edge action:
+  một `source→target→modality` gate bằng 0, mọi edge còn lại bằng 1.
+- Nếu checkpoint không có validation split, một session hoàn chỉnh trong train
+  được giữ riêng cho predictor validation. Conversation không xuất hiện ở nhiều
+  predictor split.
+- `eps_strong`, epoch và supervision variant chỉ được chọn trên validation.
+  Test impact chỉ dùng để tính metric sau khi model đã khóa.
+- Binary loại neutral và học harmful so với beneficial. Three-class giữ
+  beneficial/neutral/harmful. Magnitude-aware hồi quy signed impact và tăng
+  trọng số cho effect lớn.
+- Input chỉ gồm baseline uncertainty/probability summaries, projected-feature
+  similarity, attention mass, modality, speaker, direction, distance và position.
+  True emotion, correctness, signed impact và suppressed outputs bị cấm tại
+  inference.
+- Báo cáo đồng thời `scope=all` và `scope=strong`. AUROC gần 0.5 trên strong
+  pairs là negative finding về predictability dưới representation/predictor đã
+  thử, không phải bằng chứng rằng harm về nguyên tắc không thể học được.
+

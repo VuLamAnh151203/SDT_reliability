@@ -51,6 +51,9 @@ Các entry point nằm trong `scripts/` đúng theo guideline:
 - `e4_robustness.py`
 - `build_report.py`
 - `run_all.sh`
+- `d1_prepare_edge_dataset.py`
+- `d1_harm_learnability.py`
+- `run_d1.sh`
 
 ## Protocol và điều kiện dừng
 
@@ -89,6 +92,57 @@ export RUN_FULL_E3=1
 bash scripts/run_all.sh
 ```
 
+### D1 — Harmful influence có học được không?
+
+D1 tách bài toán harmful-edge prediction khỏi reliability gate. Frozen SDT tạo
+direct propagation-edge impact bằng đúng action `gate=0`; sau đó ba predictor có
+cùng capacity so sánh binary, three-class và magnitude-aware supervision.
+Threshold `eps_strong` chỉ được chọn trên validation conversations. Nếu checkpoint
+không có validation split, script giữ riêng một session từ checkpoint-train làm
+predictor-validation. Test impact không được dùng để train, early stopping hoặc
+chọn threshold.
+
+```bash
+cd /home/ubuntu/26anh.vl/SDT_reliability/experiment/research_gap_validation
+bash scripts/run_d1.sh
+```
+
+Chạy nhanh một seed, text-only:
+
+```bash
+D1_SEEDS="2024" \
+D1_MODALITIES="text" \
+D1_STRONG_EPS="0.0001 0.001 0.01" \
+bash scripts/run_d1.sh
+```
+
+GPU phase sinh impact được cache theo conversation. Các lần đổi supervision,
+threshold hoặc predictor sẽ reuse `D1/edge_impact_pairs.csv`. Đặt
+`D1_REGENERATE_DATA=1` khi đổi checkpoint, modality, intervention hoặc split.
+
+Outputs:
+
+```text
+outputs/full_run/D1/
+  edge_impact_pairs.csv
+  dataset_manifest.json
+  threshold_selection.csv
+  model_metrics.csv
+  precision_at_k.csv
+  summary.md
+  test_predictions/
+  checkpoints/
+  experiment_manifest.json
+```
+
+`model_metrics.csv` báo cáo AUROC, AUPRC và Spearman cho tất cả pairs
+(`scope=all`) và strong-impact pairs sau khi loại neutral (`scope=strong`).
+`precision_at_k.csv` đánh giá khả năng xếp harmful source trong từng
+conversation–target–modality, kèm prevalence/random baseline và precision lift.
+AUPRC phải được so với `harmful_prevalence`, không so mặc định với 0.5. True
+emotion và signed impact chỉ dùng để tạo supervision/scoring, không nằm trong
+predictor features.
+
 Kết quả chính thức nên dùng `SEEDS="2024 2025 2026 2027 2028"` và
 `BOOTSTRAP_REPS=2000`. Smoke test có thể giảm seeds, epochs, conversations và
 bootstrap repetitions; manifest luôn ghi rõ các giới hạn này.
@@ -122,6 +176,28 @@ Teacher edge khởi tạo có thể mất nhiều thời gian như E2 vì phải
 source-target edge. Các lần sau script tự reuse
 `outputs/full_run/manifests/train_edge_impact_teacher.csv`. Đặt
 `B4_REGENERATE_TEACHER=1` nếu cần sinh lại.
+
+## Experiment 04 — B4 chọn checkpoint bằng test
+
+Experiment này dùng B4, seed 2026, `initial_gate=0.90`,
+`lambda_impact=0.10`, `gate_lr=0.0003`, gate trên cả text/audio/visual và
+chọn checkpoint bằng test weighted-F1. Không dùng top-K. Vì test được
+dùng để chọn epoch, kết quả này chỉ mang tính exploratory và bị optimistic
+bias; không nên trình bày như final-test estimate chưa từng được chạm tới.
+
+```bash
+cd /home/ubuntu/26anh.vl/SDT_new/experiment/research_gap_validation
+bash scripts/run_experiment_04.sh
+```
+
+Chạy nhiều seed với cùng setting:
+
+```bash
+E04_SEEDS="2024 2025 2026 2027 2028" bash scripts/run_experiment_04.sh
+```
+
+Kết quả chính:
+`outputs/full_run/Experiment_04_test_selection/E3/model_comparison.csv`.
 
 ## Outputs
 

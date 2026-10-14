@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE / "scripts"
@@ -14,6 +15,8 @@ for path in (HERE, SCRIPTS):
         sys.path.insert(0, str(path))
 
 from common import classification_metrics, distance_bin, margin_bin
+from d1_harm_learnability import precision_at_k, spearman
+from d1_prepare_edge_dataset import predictor_splits
 from e1_mixed_contribution import aggregate_pairs
 from e3_train_compare import ImpactTeacher
 from generate_train_edge_teacher import select_teacher_action
@@ -87,6 +90,32 @@ class ResearchGapValidationTests(unittest.TestCase):
             self.assertAlmostEqual(target, 0.5)
             self.assertAlmostEqual(weight, 0.4)
 
+    def test_edge_teacher_min_margin_filters_weak_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "teacher.csv"
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=(
+                    "conversation_id", "target_idx", "source_idx", "modality",
+                    "teacher_gate", "teacher_weight", "teacher_decision_margin",
+                ))
+                writer.writeheader()
+                writer.writerows((
+                    {"conversation_id": "c", "target_idx": 1, "source_idx": 0,
+                     "modality": "text", "teacher_gate": 0.5,
+                     "teacher_weight": 0.1, "teacher_decision_margin": 0.001},
+                    {"conversation_id": "c", "target_idx": 0, "source_idx": 1,
+                     "modality": "text", "teacher_gate": 0.75,
+                     "teacher_weight": 1.0, "teacher_decision_margin": 0.02},
+                ))
+            teacher = ImpactTeacher(
+                path, {"c"}, 1e-4, 0.75, 0.01, min_margin=0.01
+            )
+            self.assertNotIn(("c", 1, 0, 0), teacher.values)
+            self.assertIn(("c", 0, 1, 0), teacher.values)
+            summary = teacher.summary()
+            self.assertEqual(summary["teacher_raw_pair_count"], 2)
+            self.assertEqual(summary["teacher_filtered_weak_count"], 1)
+
     def test_edge_teacher_selects_aligned_suppression_action(self):
         gate, weight, decision, margin = select_teacher_action(
             {0.0: 0.75, 0.5: 0.70, 0.75: 0.72, 1.0: 0.80},
@@ -106,6 +135,36 @@ class ResearchGapValidationTests(unittest.TestCase):
         self.assertEqual(decision, "keep")
         self.assertEqual(margin, 0.0)
         self.assertEqual(weight, 0.0)
+
+    def test_d1_holds_out_a_complete_session_without_impact_labels(self):
+        splits, metadata = predictor_splits({
+            "train": ["Ses01A", "Ses02A", "Ses02B"],
+            "valid": [],
+            "test": ["Ses03A"],
+        }, validation_sessions=("Ses02",))
+        self.assertEqual(splits["train"], ["Ses01A"])
+        self.assertEqual(splits["valid"], ["Ses02A", "Ses02B"])
+        self.assertEqual(splits["test"], ["Ses03A"])
+        self.assertEqual(metadata["validation_source"], "held_out_train_session")
+
+    def test_d1_spearman_and_precision_at_k_follow_harm_ranking(self):
+        impact = np.asarray([-0.4, 0.2, -0.1, 0.3], dtype=np.float64)
+        predicted_signed = np.asarray([-0.3, 0.1, -0.05, 0.4], dtype=np.float64)
+        self.assertAlmostEqual(spearman(predicted_signed, impact), 1.0)
+        rows = precision_at_k(
+            impact=impact,
+            harm_score=-predicted_signed,
+            conversations=np.asarray(["c", "c", "c", "c"]),
+            targets=np.asarray([0, 0, 1, 1]),
+            modalities=np.asarray(["text", "text", "text", "text"]),
+            epsilon=1e-4,
+            k_values=(1,),
+            scope="all",
+        )
+        self.assertEqual(rows[0]["target_groups"], 2)
+        self.assertAlmostEqual(rows[0]["macro_random_precision"], 0.5)
+        self.assertAlmostEqual(rows[0]["macro_precision_at_k"], 1.0)
+        self.assertAlmostEqual(rows[0]["macro_precision_lift"], 2.0)
 
 
 if __name__ == "__main__":

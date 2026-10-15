@@ -23,6 +23,11 @@ ORDER = ("B0", "P-0", "TRUE-P", "RAND-P", "TRUE-C", "RAND-C",
 def identify(args):
     if not args.get("use_emotion_wheel", False):
         return "B0"
+    # The mechanism matrix is Poincare-only. The reference geometry directory
+    # also contains Euclidean and spherical P/C/PC runs; including them would
+    # incorrectly create duplicate TRUE-P/TRUE-C/TRUE-PC identifiers.
+    if args.get("wheel_geometry", "poincare") != "poincare":
+        return None
     proto = float(args.get("lambda_wheel_proto", 0)) > 0
     cpcc = float(args.get("lambda_wheel_cpcc", 0)) > 0
     if not proto and not cpcc:
@@ -73,7 +78,7 @@ def load_runs(roots):
                 continue
             args, test = config["args"], summary["test"]
             run_id = identify(args)
-            if run_id not in ORDER:
+            if run_id is None or run_id not in ORDER:
                 continue
             row = {
                 "id": run_id, "dataset": args["dataset"],

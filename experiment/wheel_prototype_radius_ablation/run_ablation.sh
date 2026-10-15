@@ -26,7 +26,10 @@ case "$DATASET" in
     BATCH_SIZE="${BATCH_SIZE:-16}"
     LR="${LR:-0.0001}"
     SDT_TEMPERATURE="${SDT_TEMPERATURE:-1}"
-    WARMUP_EPOCHS="${WARMUP_EPOCHS:-10}"
+    # This experiment uses tical-mode=observe: anchor queries never affect
+    # logits or either Wheel loss. Keep them disabled to avoid an unnecessary
+    # O(utterances x anchor_size) search after epoch 10.
+    WARMUP_EPOCHS="${WARMUP_EPOCHS:-$EPOCHS}"
     ANCHOR_SIZE="${ANCHOR_SIZE:-2048}"
     ;;
   MELD)
@@ -34,7 +37,7 @@ case "$DATASET" in
     BATCH_SIZE="${BATCH_SIZE:-8}"
     LR="${LR:-0.000005}"
     SDT_TEMPERATURE="${SDT_TEMPERATURE:-8}"
-    WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
+    WARMUP_EPOCHS="${WARMUP_EPOCHS:-$EPOCHS}"
     ANCHOR_SIZE="${ANCHOR_SIZE:-4096}"
     ;;
   *)

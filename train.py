@@ -454,8 +454,12 @@ def _tical_epoch_metrics(storage, model, utterance_count):
 
 def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
               grad_clip=0.0, collect_predictions=False,
-              reliability_table=None, epoch=0):
+              reliability_table=None, epoch=0, compute_loss=True):
     training = optimizer is not None
+    if training and not compute_loss:
+        raise ValueError("training requires compute_loss=True")
+    if collect_predictions and not compute_loss:
+        raise ValueError("prediction export requires compute_loss=True")
     model.train(training)
     model.set_tical_epoch(epoch)
     totals, true, predicted, rows = {}, [], [], []
@@ -485,26 +489,38 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
             output = model(text, visual, audio, mask, speakers.transpose(0, 1), lengths)
-            loss, parts, errors = criterion(
-                output, labels, valid, reliability_targets,
-                sample_keep, modality_keep)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("nonfinite loss in batch {}".format(batch_index))
-            if training:
-                loss.backward()
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                # Query happened in forward against OLD banks. Insert the
-                # current detached batch only after the parameter update.
-                tical_storage["anchors_added"] += model.update_tical_anchors(
-                    output, labels, valid)
+            if compute_loss:
+                loss, parts, errors = criterion(
+                    output, labels, valid, reliability_targets,
+                    sample_keep, modality_keep)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        "nonfinite loss in batch {}".format(batch_index))
+                if training:
+                    loss.backward()
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), grad_clip)
+                    optimizer.step()
+                    # Query happened in forward against OLD banks. Insert the
+                    # current detached batch only after the parameter update.
+                    tical_storage["anchors_added"] += (
+                        model.update_tical_anchors(
+                            output, labels, valid))
+            else:
+                # Epoch selection needs predictions/F1 only. In particular,
+                # avoid rebuilding the O(N^2) Wheel-CPCC graph on the held-out
+                # split because it cannot affect parameters or checkpoint
+                # selection.
+                parts, errors = {}, {}
             n_valid = int(valid.sum().item())
             count += n_valid
             for name, value in parts.items():
                 totals[name] = totals.get(name, 0.0) + value.detach().item() * n_valid
             prediction = output["logits"].argmax(dim=-1)
-            _collect_tical_batch(tical_storage, output, labels, prediction, valid)
+            if compute_loss:
+                _collect_tical_batch(
+                    tical_storage, output, labels, prediction, valid)
             true.extend(labels[valid].cpu().tolist())
             predicted.extend(prediction[valid].cpu().tolist())
             if collect_predictions:
@@ -516,7 +532,8 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                     "weighted_f1": 100.0 * f1_score(true, predicted, average="weighted", zero_division=0),
                     "macro_f1": 100.0 * f1_score(true, predicted, average="macro", zero_division=0),
                     "utterances": count})
-    metrics.update(_tical_epoch_metrics(tical_storage, model, count))
+    if compute_loss:
+        metrics.update(_tical_epoch_metrics(tical_storage, model, count))
     return metrics, rows, true, predicted
 
 
@@ -902,7 +919,8 @@ def main(argv=None):
                                            args.max_batches, args.grad_clip,
                                            reliability_table=reliability_table, epoch=epoch)
         selected_metrics, _, _, _ = run_epoch(model, criterion, loaders[selection_split], device,
-                                              max_batches=args.max_batches, epoch=epoch)
+                                              max_batches=args.max_batches, epoch=epoch,
+                                              compute_loss=False)
         row = {"epoch": epoch, "seconds": time.time() - started}
         row.update({"train_" + k: v for k, v in train_metrics.items()})
         row.update({selection_split + "_" + k: v for k, v in selected_metrics.items()})

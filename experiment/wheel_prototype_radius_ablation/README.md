@@ -18,6 +18,12 @@ Radius học được dùng tham số hóa sigmoid trong `[0.20, 0.90]` và kh�
 L_{radius}=\frac{1}{C}\sum_c(r_c-0.75)^2.
 \]
 
+Runner đặt TiCAL warmup bằng tổng số epoch vì `tical-mode observe` không dùng
+anchor query trong logits hoặc hai Wheel loss. Việc này chỉ bỏ phép tìm anchor
+không cần thiết; mục tiêu huấn luyện và checkpoint F1 không đổi. Trong mỗi
+epoch, lượt chọn checkpoint cũng chỉ tính prediction/F1 và không tính lại
+Wheel CPCC trên test/validation.
+
 Chạy cả bốn mode trên IEMOCAP, một seed và chọn checkpoint bằng test:
 
 ```bash

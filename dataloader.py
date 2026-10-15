@@ -152,5 +152,6 @@ def make_loaders(dataset, split_ids, batch_size, seed, num_workers=0, pin_memory
             Subset(dataset, [lookup[key] for key in keys]), batch_size=batch_size,
             shuffle=split == "train", collate_fn=collate_dialogues,
             generator=torch.Generator().manual_seed(seed), num_workers=num_workers,
-            pin_memory=pin_memory)
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0)
     return loaders

@@ -21,6 +21,11 @@ RADIUS_MIN="${RADIUS_MIN:-0.20}"
 RADIUS_INIT="${RADIUS_INIT:-0.75}"
 RADIUS_MAX="${RADIUS_MAX:-0.90}"
 LAMBDA_RADIUS="${LAMBDA_RADIUS:-0.01}"
+# pad_sequence handles several large dialogue tensors per batch. On servers
+# exposing many CPU cores, PyTorch's default intra-op thread count makes these
+# memory-copy operations much slower because thread-launch overhead dominates.
+NUM_THREADS="${NUM_THREADS:-1}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
 
 case "$DATASET" in
   IEMOCAP)
@@ -86,6 +91,7 @@ run_one() {
   echo "Checkpoint selection  : $SELECTION_PROTOCOL"
   echo "Radius min/init/max   : $RADIUS_MIN / $RADIUS_INIT / $RADIUS_MAX"
   echo "Radius regularization : $lambda_radius"
+  echo "CPU threads/workers    : $NUM_THREADS / $NUM_WORKERS"
   echo "Output                 : $OUTPUT_DIR"
   echo "================================================================="
 
@@ -116,6 +122,7 @@ run_one() {
     --lambda-co 0 --lambda-reg 0 --lambda-reliability 0 --lambda-hyp 0 \
     --selection-protocol "$SELECTION_PROTOCOL" --valid-ratio "$VALID_RATIO" \
     --seed "$SEED" --device cuda --gpu-id "$GPU_ID" \
+    --num-threads "$NUM_THREADS" --num-workers "$NUM_WORKERS" \
     --output-dir "$OUTPUT_DIR" "$@"
 }
 

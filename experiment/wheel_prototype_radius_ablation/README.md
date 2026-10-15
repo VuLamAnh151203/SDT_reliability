@@ -32,6 +32,9 @@ bash experiment/wheel_prototype_radius_ablation/run_ablation.sh all \
   --gpu-id 2
 ```
 
+Runner mặc định dùng GPU 2. Có thể chọn GPU khác bằng `GPU_ID`, ví dụ
+`GPU_ID=3 bash ...`. Luôn kiểm tra dòng `Device: cuda:N` ở đầu log.
+
 Chạy riêng một mode:
 
 ```bash
@@ -58,3 +61,17 @@ bash experiment/wheel_prototype_radius_ablation/run_ablation.sh all \
 Sau khi hoàn tất, script tự sinh `radius_ablation_runs.csv` và
 `radius_ablation_aggregate.csv`. Cột `learned_radii` chứa bán kính theo thứ tự
 class ID của dataset.
+
+Nếu một epoch chậm bất thường, chạy một epoch profiling riêng:
+
+```bash
+OUTPUT_DIR=experiment/wheel_prototype_radius_ablation/results/profile \
+EPOCHS=1 GPU_ID=2 \
+bash experiment/wheel_prototype_radius_ablation/run_ablation.sh \
+  fixed-shared --profile-first-epoch
+```
+
+Dòng `PROFILE` tách thời gian thành data loader, copy CPU-to-GPU, forward,
+loss, backward/optimizer, bookkeeping và evaluation trên split chọn checkpoint.
+Profiler đồng bộ CUDA ở từng pha nên chỉ dùng để chẩn đoán, không dùng epoch
+profiling làm benchmark tốc độ.

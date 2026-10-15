@@ -11,7 +11,9 @@ fi
 
 DATASET="${DATASET:-IEMOCAP}"
 SEED="${SEED:-2024}"
-GPU_ID="${GPU_ID:-0}"
+# The reproduction runs in this repository used cuda:2/cuda:3. GPU 0 on the
+# research server is commonly shared and was observed to be >10x slower.
+GPU_ID="${GPU_ID:-2}"
 SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
 VALID_RATIO="${VALID_RATIO:-0.1}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/results/${DATASET,,}_${SELECTION_PROTOCOL}_seed${SEED}}"

@@ -148,6 +148,8 @@ def build_parser():
     parser.add_argument("--num-threads", type=int, default=0, help="0 keeps the PyTorch default")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="0 disables clipping, as in SDT")
     parser.add_argument("--max-batches", type=int, default=0, help="smoke check: cap each split per epoch; 0=all")
+    parser.add_argument("--profile-first-epoch", action="store_true",
+                        help="synchronize and report phase timings for training epoch 1")
     parser.add_argument("--output-dir", default=str(BASE_DIR / "results"))
     parser.add_argument("--eval-checkpoint", help="evaluate a saved checkpoint; architecture/loss settings come from it")
     return parser
@@ -454,7 +456,8 @@ def _tical_epoch_metrics(storage, model, utterance_count):
 
 def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
               grad_clip=0.0, collect_predictions=False,
-              reliability_table=None, epoch=0, compute_loss=True):
+              reliability_table=None, epoch=0, compute_loss=True,
+              profile_phases=False):
     training = optimizer is not None
     if training and not compute_loss:
         raise ValueError("training requires compute_loss=True")
@@ -474,12 +477,35 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     tical_storage.update({"kappa": [], "correct": [],
                           "categorical_discrepancy": [],
                           "wheel_discrepancy": [], "anchors_added": 0})
+    phase_totals = {
+        "loader": 0.0, "host_to_device": 0.0, "forward": 0.0,
+        "loss": 0.0, "backward_step": 0.0, "bookkeeping": 0.0,
+    }
+    profiled_batches = 0
+    if profile_phases and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    loader_started = time.perf_counter()
+
+    def profile_mark(started, phase):
+        if not profile_phases:
+            return time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        now = time.perf_counter()
+        phase_totals[phase] += now - started
+        return now
+
     count = 0
     with torch.set_grad_enabled(training):
         for batch_index, batch in enumerate(loader):
             if max_batches and batch_index >= max_batches:
                 break
+            if profile_phases:
+                phase_totals["loader"] += (
+                    time.perf_counter() - loader_started)
+            phase_started = time.perf_counter()
             text, visual, audio, speakers, mask, labels = [item.to(device) for item in batch[:6]]
+            phase_started = profile_mark(phase_started, "host_to_device")
             valid = mask.bool()
             lengths = valid.sum(dim=1).tolist()
             reliability_targets = sample_keep = modality_keep = None
@@ -489,10 +515,12 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
             output = model(text, visual, audio, mask, speakers.transpose(0, 1), lengths)
+            phase_started = profile_mark(phase_started, "forward")
             if compute_loss:
                 loss, parts, errors = criterion(
                     output, labels, valid, reliability_targets,
                     sample_keep, modality_keep)
+                phase_started = profile_mark(phase_started, "loss")
                 if not torch.isfinite(loss):
                     raise FloatingPointError(
                         "nonfinite loss in batch {}".format(batch_index))
@@ -507,6 +535,8 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                     tical_storage["anchors_added"] += (
                         model.update_tical_anchors(
                             output, labels, valid))
+                phase_started = profile_mark(
+                    phase_started, "backward_step")
             else:
                 # Epoch selection needs predictions/F1 only. In particular,
                 # avoid rebuilding the O(N^2) Wheel-CPCC graph on the held-out
@@ -525,6 +555,11 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
             predicted.extend(prediction[valid].cpu().tolist())
             if collect_predictions:
                 rows.extend(prediction_rows(batch[6], lengths, labels, prediction, output, errors))
+            if profile_phases:
+                phase_totals["bookkeeping"] += (
+                    time.perf_counter() - phase_started)
+                profiled_batches += 1
+            loader_started = time.perf_counter()
     if not count:
         raise ValueError("no valid utterances in the data loader")
     metrics = {name: value / count for name, value in totals.items()}
@@ -534,6 +569,18 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                     "utterances": count})
     if compute_loss:
         metrics.update(_tical_epoch_metrics(tical_storage, model, count))
+    if profile_phases:
+        print(
+            "PROFILE epoch={} batches={} loader={:.3f}s h2d={:.3f}s "
+            "forward={:.3f}s loss={:.3f}s backward+step={:.3f}s "
+            "bookkeeping={:.3f}s peak_cuda={:.1f}MB".format(
+                epoch, profiled_batches, phase_totals["loader"],
+                phase_totals["host_to_device"], phase_totals["forward"],
+                phase_totals["loss"], phase_totals["backward_step"],
+                phase_totals["bookkeeping"],
+                (torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                 if device.type == "cuda" else 0.0)),
+            flush=True)
     return metrics, rows, true, predicted
 
 
@@ -915,12 +962,25 @@ def main(argv=None):
     selection_split = "test" if args.selection_protocol == "test" else "valid"
     for epoch in range(1, args.epochs + 1):
         started = time.time()
+        train_started = time.perf_counter()
         train_metrics, _, _, _ = run_epoch(model, criterion, loaders["train"], device, optimizer,
                                            args.max_batches, args.grad_clip,
-                                           reliability_table=reliability_table, epoch=epoch)
+                                           reliability_table=reliability_table,
+                                           epoch=epoch,
+                                           profile_phases=(
+                                               args.profile_first_epoch
+                                               and epoch == 1))
+        train_seconds = time.perf_counter() - train_started
+        selection_started = time.perf_counter()
         selected_metrics, _, _, _ = run_epoch(model, criterion, loaders[selection_split], device,
                                               max_batches=args.max_batches, epoch=epoch,
                                               compute_loss=False)
+        selection_seconds = time.perf_counter() - selection_started
+        if args.profile_first_epoch and epoch == 1:
+            print(
+                "PROFILE epoch=1 train_total={:.3f}s selection_{}={:.3f}s".format(
+                    train_seconds, selection_split, selection_seconds),
+                flush=True)
         row = {"epoch": epoch, "seconds": time.time() - started}
         row.update({"train_" + k: v for k, v in train_metrics.items()})
         row.update({selection_split + "_" + k: v for k, v in selected_metrics.items()})

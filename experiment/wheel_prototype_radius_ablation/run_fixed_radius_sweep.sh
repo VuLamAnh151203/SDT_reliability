@@ -9,24 +9,37 @@ GPU_ID="${GPU_ID:-0}"
 SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/results/fixed_radius_sweep_${DATASET,,}_${SELECTION_PROTOCOL}}"
 
+# Match the TRUE-PC reference run that produced 75.306 weighted F1.  These
+# values intentionally override the speed-oriented defaults in
+# run_ablation.sh.  DataLoader workers can advance PyTorch's loader generator
+# differently and thereby change mini-batch order even when --seed is fixed.
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-10}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
+NUM_THREADS="${NUM_THREADS:-0}"
+
 # A Poincare-ball point must satisfy ||p|| < 1.  The requested 1.0 control is
 # therefore represented by a point very close to the boundary.
 RADIUS_ONE_EFFECTIVE="${RADIUS_ONE_EFFECTIVE:-0.9999}"
 RADIUS_MIN="${RADIUS_MIN:-0.05}"
 RADIUS_MAX="${RADIUS_MAX:-0.99998}"
-
-REQUESTED_RADII=(0.25 0.50 0.75 1.00)
-EFFECTIVE_RADII=(0.25 0.50 0.75 "$RADIUS_ONE_EFFECTIVE")
-RADIUS_LABELS=(0p25 0p50 0p75 1p00)
+RADII="${RADII:-0.25 0.50 0.75 1.00}"
 
 mkdir -p "$OUTPUT_DIR"
 
 read -r -a seed_values <<< "$SEEDS"
+read -r -a radius_values <<< "$RADII"
 for seed in "${seed_values[@]}"; do
-  for index in "${!REQUESTED_RADII[@]}"; do
-    requested="${REQUESTED_RADII[$index]}"
-    effective="${EFFECTIVE_RADII[$index]}"
-    label="${RADIUS_LABELS[$index]}"
+  for requested in "${radius_values[@]}"; do
+    case "$requested" in
+      0.25|.25) requested="0.25"; effective="0.25"; label="0p25" ;;
+      0.50|0.5|.5) requested="0.50"; effective="0.50"; label="0p50" ;;
+      0.75|.75) requested="0.75"; effective="0.75"; label="0p75" ;;
+      1.00|1.0|1) requested="1.00"; effective="$RADIUS_ONE_EFFECTIVE"; label="1p00" ;;
+      *)
+        echo "Unknown radius '$requested'. Use: 0.25 0.50 0.75 1.00" >&2
+        exit 2
+        ;;
+    esac
     run_output="$OUTPUT_DIR/radius_${label}/seed_${seed}"
 
     echo "================================================================="
@@ -42,6 +55,9 @@ for seed in "${seed_values[@]}"; do
     GPU_ID="$GPU_ID" \
     SELECTION_PROTOCOL="$SELECTION_PROTOCOL" \
     OUTPUT_DIR="$run_output" \
+    WARMUP_EPOCHS="$WARMUP_EPOCHS" \
+    NUM_WORKERS="$NUM_WORKERS" \
+    NUM_THREADS="$NUM_THREADS" \
     RADIUS_MIN="$RADIUS_MIN" \
     RADIUS_INIT="$effective" \
     RADIUS_MAX="$RADIUS_MAX" \

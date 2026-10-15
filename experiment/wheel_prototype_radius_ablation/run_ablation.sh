@@ -11,8 +11,8 @@ fi
 
 DATASET="${DATASET:-IEMOCAP}"
 SEED="${SEED:-2024}"
-# The reproduction runs in this repository used cuda:2/cuda:3. GPU 0 on the
-# research server is commonly shared and was observed to be >10x slower.
+# Keep the reproduction default on cuda:2; profiling showed that the earlier
+# slowdown was in data loading rather than a particular GPU.
 GPU_ID="${GPU_ID:-2}"
 SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
 VALID_RATIO="${VALID_RATIO:-0.1}"

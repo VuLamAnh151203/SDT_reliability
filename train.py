@@ -146,6 +146,9 @@ def build_parser():
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--num-threads", type=int, default=0, help="0 keeps the PyTorch default")
+    parser.add_argument(
+        "--pin-memory", action="store_true",
+        help="pin DataLoader batches; disabled by default because these large padded dialogue batches can be slower to pin")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="0 disables clipping, as in SDT")
     parser.add_argument("--max-batches", type=int, default=0, help="smoke check: cap each split per epoch; 0=all")
     parser.add_argument("--profile-first-epoch", action="store_true",
@@ -892,7 +895,9 @@ def main(argv=None):
         raise ValueError("checkpoint dialogue split differs from the supplied feature pickle")
     model = Transformer_Based_Model(**model_config).to(device)
     criterion = make_criterion(args, device)
-    loaders = make_loaders(dataset, split_ids, args.batch_size, args.seed, args.num_workers, device.type == "cuda")
+    loaders = make_loaders(
+        dataset, split_ids, args.batch_size, args.seed, args.num_workers,
+        pin_memory=(device.type == "cuda" and args.pin_memory))
     if model_config["fusion_variant"] in ("guided", "replace"):
         init_tag = model_config.get("distribution_init", "random").replace("-", "_")
     else:

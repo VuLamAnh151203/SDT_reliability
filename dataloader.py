@@ -63,21 +63,57 @@ class DialogueDataset(Dataset):
             if len(self.videoSpeakers[key]) != len(labels):
                 raise ValueError("speaker/label length mismatch in {}".format(key))
 
+        # The feature pickle is already resident in memory. Converting every
+        # conversation from NumPy/list data to fresh tensors in every epoch
+        # dominated runtime on the research server. Cache these immutable CPU
+        # tensors once; pad_sequence will still create an independent batch.
+        self._text_tensors = {
+            key: torch.as_tensor(
+                np.asarray(self.videoText[key]), dtype=torch.float32)
+            for key in self.keys
+        }
+        self._visual_tensors = {
+            key: torch.as_tensor(
+                np.asarray(self.videoVisual[key]), dtype=torch.float32)
+            for key in self.keys
+        }
+        self._audio_tensors = {
+            key: torch.as_tensor(
+                np.asarray(self.videoAudio[key]), dtype=torch.float32)
+            for key in self.keys
+        }
+        self._label_tensors = {
+            key: torch.as_tensor(
+                np.asarray(self.videoLabels[key]), dtype=torch.long)
+            for key in self.keys
+        }
+        self._speaker_tensors = {}
+        for key in self.keys:
+            speakers = self.videoSpeakers[key]
+            if self.dataset == "IEMOCAP":
+                speakers = [
+                    [1, 0] if speaker == "M" else [0, 1]
+                    for speaker in speakers
+                ]
+            self._speaker_tensors[key] = torch.as_tensor(
+                np.asarray(speakers), dtype=torch.float32)
+        self._mask_tensors = {
+            key: torch.ones(len(self.videoLabels[key]), dtype=torch.float32)
+            for key in self.keys
+        }
+
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, index):
         key = self.keys[index]
-        speakers = self.videoSpeakers[key]
-        if self.dataset == "IEMOCAP":
-            speakers = [[1, 0] if speaker == "M" else [0, 1] for speaker in speakers]
         return (
-            torch.tensor(np.asarray(self.videoText[key]), dtype=torch.float32),
-            torch.tensor(np.asarray(self.videoVisual[key]), dtype=torch.float32),
-            torch.tensor(np.asarray(self.videoAudio[key]), dtype=torch.float32),
-            torch.tensor(np.asarray(speakers), dtype=torch.float32),
-            torch.ones(len(self.videoLabels[key])),
-            torch.tensor(self.videoLabels[key], dtype=torch.long),
+            self._text_tensors[key],
+            self._visual_tensors[key],
+            self._audio_tensors[key],
+            self._speaker_tensors[key],
+            self._mask_tensors[key],
+            self._label_tensors[key],
             key,
         )
 

@@ -123,7 +123,10 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_uncertainty_gate_strength=0.5,
                  wheel_uncertainty_warmup_epochs=10,
                  wheel_uncertainty_ramp_epochs=5,
-                 fusion_feature_source="enhanced"):
+                 fusion_feature_source="enhanced",
+                 wheel_semantic_control="correct",
+                 wheel_permutation_seed=1729,
+                 wheel_detach_features=False):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -183,6 +186,9 @@ class Transformer_Based_Model(SDTBackbone):
         self.wheel_radius_mode = wheel_radius_mode
         self.wheel_fixed_radius = wheel_fixed_radius
         self.wheel_zero_residual = bool(wheel_zero_residual)
+        self.wheel_semantic_control = wheel_semantic_control
+        self.wheel_permutation_seed = int(wheel_permutation_seed)
+        self.wheel_detach_features = bool(wheel_detach_features)
         self.wheel_uncertainty_mode = wheel_uncertainty_mode
         self.wheel_uncertainty_temperature = float(
             wheel_uncertainty_temperature)
@@ -202,7 +208,8 @@ class Transformer_Based_Model(SDTBackbone):
                 wheel_temperature, wheel_anchor_mix, anchor_balance,
                 anchor_min_per_class, anchor_admission, wheel_geometry,
                 wheel_radius_mode, wheel_fixed_radius,
-                wheel_zero_residual)
+                wheel_zero_residual, wheel_semantic_control,
+                wheel_permutation_seed, wheel_detach_features)
         if wheel_uncertainty_mode != "none":
             self.wheel_uncertainty_heads = nn.ModuleDict({
                 name: WheelUncertaintyHead(

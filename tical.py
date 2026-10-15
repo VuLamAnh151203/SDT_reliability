@@ -18,6 +18,7 @@ from geometry_analysis.geometry import (GEOMETRIES, GeometryProjector,
 
 
 MODALITIES = ("t", "a", "v")
+WHEEL_SEMANTIC_CONTROLS = ("correct", "random")
 EMOTION_WHEEL_ORDERS = {
     "IEMOCAP": (0, 4, 3, 5, 1, 2),
     "MELD": (4, 1, 2, 6, 5, 3, 0),
@@ -36,6 +37,33 @@ def emotion_wheel_angles(dataset, n_classes, device=None, dtype=torch.float32):
     angles = torch.empty(n_classes, device=device, dtype=dtype)
     angles[torch.tensor(order, device=device, dtype=torch.long)] = ordered
     return angles
+
+
+def controlled_emotion_wheel_angles(dataset, n_classes, control="correct",
+                                    permutation_seed=1729, device=None,
+                                    dtype=torch.float32):
+    """Return class angles and the applied label-to-angle permutation.
+
+    The random control uses an isolated CPU generator, so it does not consume
+    the global training RNG. Dihedral permutations (rotations/reflections)
+    are rejected because they preserve every pairwise Wheel distance.
+    """
+    if control not in WHEEL_SEMANTIC_CONTROLS:
+        raise ValueError("unknown Wheel semantic control: {}".format(control))
+    base = emotion_wheel_angles(dataset, n_classes, dtype=dtype)
+    identity = torch.arange(n_classes, dtype=torch.long)
+    if control == "correct":
+        return base.to(device=device), identity.to(device=device)
+    generator = torch.Generator(device="cpu").manual_seed(int(permutation_seed))
+    base_distances = circular_class_distance_matrix(base)
+    for _ in range(256):
+        permutation = torch.randperm(n_classes, generator=generator)
+        candidate = base[permutation]
+        if not torch.allclose(
+                circular_class_distance_matrix(candidate), base_distances,
+                atol=1e-7, rtol=0.0):
+            return candidate.to(device=device), permutation.to(device=device)
+    raise RuntimeError("could not sample a non-isometric Wheel permutation")
 
 
 def circular_class_distance_matrix(class_angles):
@@ -251,7 +279,10 @@ class TiCALModule(nn.Module):
                  wheel_anchor_mix=0.5, anchor_balance="none",
                  anchor_min_per_class=0, anchor_admission="teacher",
                  wheel_geometry="poincare", wheel_radius_mode="free",
-                 wheel_fixed_radius=0.75, wheel_zero_residual=False):
+                 wheel_fixed_radius=0.75, wheel_zero_residual=False,
+                 wheel_semantic_control="correct",
+                 wheel_permutation_seed=1729,
+                 wheel_detach_features=False):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -286,6 +317,12 @@ class TiCALModule(nn.Module):
         self.wheel_radius_mode = wheel_radius_mode
         self.wheel_fixed_radius = float(wheel_fixed_radius)
         self.wheel_zero_residual = bool(wheel_zero_residual)
+        if wheel_semantic_control not in WHEEL_SEMANTIC_CONTROLS:
+            raise ValueError("unknown Wheel semantic control: {}".format(
+                wheel_semantic_control))
+        self.wheel_semantic_control = wheel_semantic_control
+        self.wheel_permutation_seed = int(wheel_permutation_seed)
+        self.wheel_detach_features = bool(wheel_detach_features)
         self.wheel_temperature = float(wheel_temperature)
         self.wheel_anchor_mix = float(wheel_anchor_mix)
         if self.use_emotion_wheel:
@@ -294,8 +331,15 @@ class TiCALModule(nn.Module):
             if (not math.isfinite(self.wheel_anchor_mix)
                     or not 0.0 <= self.wheel_anchor_mix <= 1.0):
                 raise ValueError("wheel anchor mix must be in [0, 1]")
-            wheel_angles = emotion_wheel_angles(dataset, n_classes)
+            wheel_angles, wheel_permutation = controlled_emotion_wheel_angles(
+                dataset, n_classes, wheel_semantic_control,
+                wheel_permutation_seed)
             self.register_buffer("wheel_angles", wheel_angles)
+            # Recreated deterministically from config; keeping this
+            # non-persistent preserves compatibility with older checkpoints.
+            self.register_buffer(
+                "wheel_label_permutation", wheel_permutation,
+                persistent=False)
             self.register_buffer(
                 "wheel_prototypes",
                 wheel_prototypes(
@@ -328,9 +372,12 @@ class TiCALModule(nn.Module):
         )
 
     def forward(self, pure_features, valid_mask, query_enabled=True):
+        projector_inputs = tuple(
+            feature.detach() if self.wheel_detach_features else feature
+            for feature in pure_features)
         projected = {
             name: self.projectors[name](feature)
-            for name, feature in zip(MODALITIES, pure_features)
+            for name, feature in zip(MODALITIES, projector_inputs)
         }
         result = {"ready": False, "projected": projected, "distance": None,
                   "pseudo_labels": None, "anchor_tau": None, "tau": None,
@@ -342,6 +389,11 @@ class TiCALModule(nn.Module):
                   "wheel_radius_mode": self.wheel_radius_mode,
                   "wheel_fixed_radius": self.wheel_fixed_radius,
                   "wheel_zero_residual": self.wheel_zero_residual,
+                  "wheel_semantic_control": self.wheel_semantic_control,
+                  "wheel_label_permutation": (
+                      self.wheel_label_permutation
+                      if self.use_emotion_wheel else None),
+                  "wheel_detach_features": self.wheel_detach_features,
                   "wheel_distances": None, "wheel_logits": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
                   "wheel_class_distances": (

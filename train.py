@@ -19,6 +19,7 @@ from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
+from tical import WHEEL_SEMANTIC_CONTROLS
 
 
 def build_parser():
@@ -75,6 +76,13 @@ def build_parser():
                         help="0=anchor typicality, 1=prototype typicality")
     parser.add_argument("--lambda-wheel-proto", type=float, default=0.0)
     parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
+    parser.add_argument("--wheel-semantic-control",
+                        choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
+                        help="correct semantic Wheel or a non-isometric random label permutation")
+    parser.add_argument("--wheel-permutation-seed", type=int, default=1729,
+                        help="isolated seed for the random semantic control")
+    parser.add_argument("--wheel-detach-features", action="store_true",
+                        help="block Wheel gradients from reaching the SDT backbone")
     parser.add_argument("--wheel-uncertainty-mode",
                         choices=WHEEL_UNCERTAINTY_MODES, default="none",
                         help="none/gate/supervise/full uncertainty-aware fusion ablation")
@@ -185,6 +193,9 @@ def make_model_config(args, dataset):
             "wheel_prototype_radius": args.wheel_prototype_radius,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix,
+            "wheel_semantic_control": args.wheel_semantic_control,
+            "wheel_permutation_seed": args.wheel_permutation_seed,
+            "wheel_detach_features": args.wheel_detach_features,
             "wheel_uncertainty_mode": args.wheel_uncertainty_mode,
             "wheel_uncertainty_hidden_dim": args.wheel_uncertainty_hidden_dim,
             "wheel_uncertainty_temperature": args.wheel_uncertainty_temperature,
@@ -655,7 +666,9 @@ def main(argv=None):
     if not args.use_emotion_wheel and (
             args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0
             or args.wheel_uncertainty_mode != "none"
-            or args.lambda_wheel_uncertainty > 0):
+            or args.lambda_wheel_uncertainty > 0
+            or args.wheel_semantic_control != "correct"
+            or args.wheel_detach_features):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
     if args.wheel_uncertainty_mode != "none":
         if args.wheel_geometry != "poincare":
@@ -716,6 +729,8 @@ def main(argv=None):
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
+                      "wheel_semantic_control", "wheel_permutation_seed",
+                      "wheel_detach_features",
                      "wheel_uncertainty_mode",
                      "wheel_uncertainty_hidden_dim",
                      "wheel_uncertainty_temperature",
@@ -733,6 +748,8 @@ def main(argv=None):
                      "wheel_prototype_radius", "wheel_temperature",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
+                      "wheel_semantic_control", "wheel_permutation_seed",
+                      "wheel_detach_features",
                      "wheel_anchor_mix", "lambda_wheel_proto",
                      "lambda_wheel_cpcc", "wheel_uncertainty_mode",
                      "lambda_wheel_uncertainty",
@@ -790,6 +807,11 @@ def main(argv=None):
                 str(model_config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))
         if model_config.get("wheel_zero_residual", False):
             method_tag += "_zerores"
+        if model_config.get("wheel_semantic_control", "correct") == "random":
+            method_tag += "_randomwheel{}".format(
+                model_config.get("wheel_permutation_seed", 1729))
+        if model_config.get("wheel_detach_features", False):
+            method_tag += "_detachwheel"
         method_tag += "_d{}".format(model_config["hyperbolic_dim"])
         if model_config.get("wheel_uncertainty_mode", "none") != "none":
             method_tag += "_unc_{}".format(

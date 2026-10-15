@@ -13,6 +13,7 @@ from losses import (SDTCOLDLoss, masked_kl_per_utterance,
 from model import MODALITIES, Transformer_Based_Model
 from tical import (AnchorBank, HyperbolicProjector, TiCALModule, compute_consistency,
                    blend_typicality, circular_class_distance_matrix,
+                   controlled_emotion_wheel_angles,
                    emotion_wheel_angles, emotion_wheel_prototypes,
                    hyp_cpcc_loss, hyperbolic_prototype_outputs,
                    poincare_distance, wheel_label_discrepancy)
@@ -39,6 +40,41 @@ class TiCALTests(unittest.TestCase):
         distance = poincare_distance(projected[:, :1], projected[:, 1:])
         self.assertTrue(torch.isfinite(distance).all())
         self.assertTrue((distance > 0).all())
+
+    def test_random_wheel_control_is_deterministic_and_non_isometric(self):
+        correct, identity = controlled_emotion_wheel_angles(
+            "IEMOCAP", 6, "correct", 31)
+        first, permutation = controlled_emotion_wheel_angles(
+            "IEMOCAP", 6, "random", 31)
+        second, repeated = controlled_emotion_wheel_angles(
+            "IEMOCAP", 6, "random", 31)
+        torch.testing.assert_close(identity, torch.arange(6))
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(permutation, repeated)
+        self.assertFalse(torch.allclose(
+            circular_class_distance_matrix(correct),
+            circular_class_distance_matrix(first)))
+
+    def test_detached_wheel_blocks_backbone_but_trains_projector(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_detach_features=True)
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_hyp=0, lambda_wheel_proto=1.0,
+            lambda_wheel_cpcc=0.5)
+        loss, _, _ = criterion(output, labels, self.mask.bool())
+        loss.backward()
+        backbone_grad = model.textf_input.weight.grad
+        if backbone_grad is not None:
+            self.assertEqual(backbone_grad.abs().sum().item(), 0.0)
+        projector_grad = model.tical.projectors["t"].linear.weight.grad
+        self.assertIsNotNone(projector_grad)
+        self.assertGreater(projector_grad.abs().sum().item(), 0.0)
 
     def test_anchor_bank_is_fifo_and_checkpoint_loads_dynamic_buffers(self):
         bank = AnchorBank(2, n_classes=3, max_size=3)

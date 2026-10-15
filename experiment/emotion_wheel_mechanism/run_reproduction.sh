@@ -17,6 +17,16 @@ GEOMETRY_DIR="$RUN_ROOT/full_geometry_ablation"
 CONTROL_DIR="$RUN_ROOT/mechanism_controls"
 DEVICE="${DEVICE:-cuda}"
 GPU_ID="${GPU_ID:-0}"
+SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
+VALID_RATIO="${VALID_RATIO:-0.1}"
+
+case "$SELECTION_PROTOCOL" in
+  test|validation) ;;
+  *)
+    echo "SELECTION_PROTOCOL must be test or validation; got: $SELECTION_PROTOCOL" >&2
+    exit 2
+    ;;
+esac
 
 # Keep analysis on the same GPU when the caller supplies --gpu-id as a
 # training argument instead of exporting GPU_ID.
@@ -43,7 +53,10 @@ print_layout() {
   echo "Mechanism controls: $CONTROL_DIR"
   echo "Dataset           : $DATASET"
   echo "Seeds             : $SEEDS"
-  echo "Checkpoint choice : test weighted F1"
+  echo "Checkpoint choice : $SELECTION_PROTOCOL weighted F1"
+  if [[ "$SELECTION_PROTOCOL" == "validation" ]]; then
+    echo "Validation ratio  : $VALID_RATIO"
+  fi
 }
 
 run_reference_ablation() {
@@ -51,7 +64,7 @@ run_reference_ablation() {
   local id
   for id in B0 P-P P-C P-PC; do
     DATASET="$DATASET" SEEDS="$SEEDS" OUTPUT_DIR="$REFERENCE_DIR" \
-      SELECTION_PROTOCOL=test \
+      SELECTION_PROTOCOL="$SELECTION_PROTOCOL" VALID_RATIO="$VALID_RATIO" \
       bash "$ROOT_DIR/geometry_analysis/run_ablation.sh" "$id" \
       --fusion-feature-source enhanced \
       --tical-warmup-epochs 10 \
@@ -66,7 +79,7 @@ run_reference_ablation() {
 run_full_geometry_ablation() {
   mkdir -p "$GEOMETRY_DIR"
   DATASET="$DATASET" SEEDS="$SEEDS" OUTPUT_DIR="$GEOMETRY_DIR" \
-    SELECTION_PROTOCOL=test \
+    SELECTION_PROTOCOL="$SELECTION_PROTOCOL" VALID_RATIO="$VALID_RATIO" \
     bash "$ROOT_DIR/geometry_analysis/run_ablation.sh" all \
     --fusion-feature-source enhanced \
     --tical-warmup-epochs 10 \
@@ -80,6 +93,7 @@ run_full_geometry_ablation() {
 run_mechanism_controls() {
   mkdir -p "$CONTROL_DIR"
   DATASET="$DATASET" SEEDS="$SEEDS" OUTPUT_DIR="$CONTROL_DIR" \
+    SELECTION_PROTOCOL="$SELECTION_PROTOCOL" VALID_RATIO="$VALID_RATIO" \
     bash "$SCRIPT_DIR/run_controls.sh" all "$@"
 }
 

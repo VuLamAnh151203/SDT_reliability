@@ -11,6 +11,16 @@ DATASET="${DATASET:-IEMOCAP}"
 SEEDS="${SEEDS:-2024}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/results/${DATASET,,}}"
 PERMUTATION_SEED="${PERMUTATION_SEED:-1729}"
+SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-test}"
+VALID_RATIO="${VALID_RATIO:-0.1}"
+
+case "$SELECTION_PROTOCOL" in
+  test|validation) ;;
+  *)
+    echo "SELECTION_PROTOCOL must be test or validation; got: $SELECTION_PROTOCOL" >&2
+    exit 2
+    ;;
+esac
 
 case "$DATASET" in
   IEMOCAP)
@@ -25,6 +35,8 @@ case "$DATASET" in
 esac
 
 # These are the controls missing from the basic B0/P-P/P-C/P-PC ablation.
+# Test selection remains the default. run_reproduction_validation.sh sets
+# SELECTION_PROTOCOL=validation for a held-out training split.
 ALL_IDS=(P-0 RAND-P RAND-C RAND-PC DETACH-PC P-FIXED)
 if [[ "$EXPERIMENT" == "ALL" ]]; then
   IDS=("${ALL_IDS[@]}")
@@ -51,7 +63,7 @@ run_one() {
   echo "================================================================="
   echo "Wheel mechanism control=$id dataset=$DATASET seed=$seed"
   echo "proto=$proto cpcc=$cpcc semantic=$semantic radius=$radius_mode detach=$detach"
-  echo "Checkpoint selection is locked to TEST."
+  echo "Checkpoint selection=$SELECTION_PROTOCOL valid_ratio=$VALID_RATIO"
   echo "================================================================="
 
   "${PYTHON:-python}" -u "$ROOT_DIR/train.py" \
@@ -70,8 +82,8 @@ run_one() {
     --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" \
     --hidden-dim 1024 --n-head 8 --lr "$LR" --l2 0.00001 \
     --dropout 0.5 --temp "$TEMP" --gamma-1 1 --gamma-2 1 --gamma-3 1 \
-    --seed "$seed" --output-dir "$OUTPUT_DIR" \
-    "$@" "${detach_args[@]}" --selection-protocol test
+    --seed "$seed" --output-dir "$OUTPUT_DIR" --valid-ratio "$VALID_RATIO" \
+    "$@" "${detach_args[@]}" --selection-protocol "$SELECTION_PROTOCOL"
 }
 
 for id in "${IDS[@]}"; do

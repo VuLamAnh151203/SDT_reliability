@@ -135,7 +135,11 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, iter, inputs_a, inputs_b, mask):
-        if inputs_a.equal(inputs_b):
+        # Every caller selects self-attention by passing the same tensor
+        # object twice.  ``Tensor.equal`` launches a full GPU comparison and
+        # synchronizes the host for every one of the nine SDT branches.
+        # Identity preserves the branch decision without that synchronization.
+        if inputs_a is inputs_b:
             if (iter != 0):
                 inputs_b = self.layer_norm(inputs_b)
             else:
@@ -168,7 +172,9 @@ class TransformerEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_a, x_b, mask, speaker_emb):
-        if x_a.equal(x_b):
+        # Self-modal calls pass the identical tensor object; cross-modal calls
+        # pass distinct objects. Avoid a device-wide value comparison here.
+        if x_a is x_b:
             x_b = self.pos_emb(x_b, speaker_emb)
             x_b = self.dropout(x_b)
             for i in range(self.layers):

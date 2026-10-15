@@ -191,7 +191,12 @@ def geometry_cpcc_loss(features, labels, geometry="poincare", eps=1e-8,
     categorical = categorical - categorical.mean()
     denominator = (geometric.square().sum().sqrt()
                    * categorical.square().sum().sqrt())
-    if denominator.detach().item() <= eps:
-        return geometric.sum() * 0.0
+    # Keep the zero-variance case on device. ``denominator.item()`` forced a
+    # CPU/GPU synchronization three times per training batch (T/A/V).
     correlation = (geometric * categorical).sum() / denominator.clamp_min(eps)
-    return 1.0 - correlation.clamp(-1.0, 1.0)
+    correlated_loss = 1.0 - correlation.clamp(-1.0, 1.0)
+    return torch.where(
+        denominator > eps,
+        correlated_loss,
+        geometric.sum() * 0.0,
+    )

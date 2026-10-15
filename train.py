@@ -504,7 +504,10 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                 phase_totals["loader"] += (
                     time.perf_counter() - loader_started)
             phase_started = time.perf_counter()
-            text, visual, audio, speakers, mask, labels = [item.to(device) for item in batch[:6]]
+            text, visual, audio, speakers, mask, labels = [
+                item.to(device, non_blocking=device.type == "cuda")
+                for item in batch[:6]
+            ]
             phase_started = profile_mark(phase_started, "host_to_device")
             valid = mask.bool()
             lengths = valid.sum(dim=1).tolist()

@@ -448,7 +448,7 @@ def analyze_checkpoint(checkpoint_path, cli_args, device):
     precision, recall, final_f1, support = precision_recall_fscore_support(
         labels, predictions, labels=np.arange(n_classes), zero_division=0)
     class_distance = model.tical.wheel_class_distances.detach().cpu().numpy()
-    prototypes = model.tical.wheel_prototypes.detach().float().cpu()
+    prototypes = model.tical.current_wheel_prototypes().detach().float().cpu()
     hyp_eps = float(config.get("hyp_eps", 1e-5))
 
     selected = balanced_indices(

@@ -19,7 +19,8 @@ from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
-from tical import WHEEL_SEMANTIC_CONTROLS
+from tical import (WHEEL_PROTOTYPE_RADIUS_MODES,
+                   WHEEL_SEMANTIC_CONTROLS)
 
 
 def build_parser():
@@ -62,6 +63,14 @@ def build_parser():
     parser.add_argument("--use-emotion-wheel", action="store_true",
                         help="constrain TiCAL with fixed hyperbolic emotion-wheel prototypes")
     parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
+    parser.add_argument(
+        "--wheel-prototype-radius-mode",
+        choices=WHEEL_PROTOTYPE_RADIUS_MODES, default="fixed-shared",
+        help="fixed shared radius, or a bounded learned shared/per-class radius")
+    parser.add_argument("--wheel-prototype-radius-min", type=float,
+                        default=0.20)
+    parser.add_argument("--wheel-prototype-radius-max", type=float,
+                        default=0.90)
     parser.add_argument("--wheel-geometry", choices=GEOMETRIES, default="poincare",
                         help="controlled wheel geometry ablation")
     parser.add_argument("--wheel-radius-mode", choices=RADIUS_MODES,
@@ -76,6 +85,8 @@ def build_parser():
                         help="0=anchor typicality, 1=prototype typicality")
     parser.add_argument("--lambda-wheel-proto", type=float, default=0.0)
     parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
+    parser.add_argument("--lambda-wheel-radius", type=float, default=0.0,
+                        help="keep learned per-class prototype radii near their initial value")
     parser.add_argument("--wheel-semantic-control",
                         choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
                         help="correct semantic Wheel or a non-isometric random label permutation")
@@ -191,6 +202,10 @@ def make_model_config(args, dataset):
             "wheel_fixed_radius": args.wheel_fixed_radius,
             "wheel_zero_residual": args.wheel_zero_residual,
             "wheel_prototype_radius": args.wheel_prototype_radius,
+            "wheel_prototype_radius_mode": (
+                args.wheel_prototype_radius_mode),
+            "wheel_prototype_radius_min": args.wheel_prototype_radius_min,
+            "wheel_prototype_radius_max": args.wheel_prototype_radius_max,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix,
             "wheel_semantic_control": args.wheel_semantic_control,
@@ -219,7 +234,8 @@ def make_criterion(args, device):
                        args.lambda_hyp, args.lambda_wheel_proto,
                        args.lambda_wheel_cpcc,
                        args.wheel_uncertainty_mode,
-                       args.lambda_wheel_uncertainty).to(device)
+                       args.lambda_wheel_uncertainty,
+                       args.lambda_wheel_radius).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -642,6 +658,7 @@ def main(argv=None):
             or args.beta_gate < 0 or args.consistency_t < 0
             or args.consistency_k < 0 or args.lambda_wheel_proto < 0
             or args.lambda_wheel_cpcc < 0
+            or args.lambda_wheel_radius < 0
             or args.lambda_wheel_uncertainty < 0
             or args.wheel_uncertainty_hidden_dim < 1
             or args.wheel_uncertainty_warmup_epochs < 0
@@ -665,6 +682,8 @@ def main(argv=None):
         raise ValueError("--use-emotion-wheel requires --use-tical")
     if not args.use_emotion_wheel and (
             args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0
+            or args.lambda_wheel_radius > 0
+            or args.wheel_prototype_radius_mode != "fixed-shared"
             or args.wheel_uncertainty_mode != "none"
             or args.lambda_wheel_uncertainty > 0
             or args.wheel_semantic_control != "correct"
@@ -694,6 +713,25 @@ def main(argv=None):
             raise ValueError("emotion wheel requires --hyperbolic-dim >= 2")
         if not 0 < args.wheel_prototype_radius < 1 - args.hyp_eps:
             raise ValueError("--wheel-prototype-radius must be in (0, 1-hyp-eps)")
+        if not (0 < args.wheel_prototype_radius_min
+                < args.wheel_prototype_radius
+                < args.wheel_prototype_radius_max
+                < 1 - args.hyp_eps):
+            raise ValueError(
+                "prototype radii require 0 < min < initial < max < 1-hyp-eps")
+        if (args.wheel_prototype_radius_mode != "fixed-shared"
+                and args.wheel_geometry != "poincare"):
+            raise ValueError(
+                "learnable prototype radii require --wheel-geometry poincare")
+        if (args.wheel_prototype_radius_mode == "per-class-regularized"
+                and args.lambda_wheel_radius <= 0):
+            raise ValueError(
+                "per-class-regularized requires --lambda-wheel-radius > 0")
+        if (args.wheel_prototype_radius_mode
+                != "per-class-regularized"
+                and args.lambda_wheel_radius != 0):
+            raise ValueError(
+                "--lambda-wheel-radius is only used by per-class-regularized")
         if args.wheel_temperature <= 0:
             raise ValueError("--wheel-temperature must be positive")
         if not 0 <= args.wheel_anchor_mix <= 1:
@@ -726,6 +764,9 @@ def main(argv=None):
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
+                     "wheel_prototype_radius_mode",
+                     "wheel_prototype_radius_min",
+                     "wheel_prototype_radius_max",
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
@@ -746,12 +787,16 @@ def main(argv=None):
                      "oof_reliability_targets", "tical_mode", "lambda_hyp",
                      "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
                      "wheel_prototype_radius", "wheel_temperature",
+                     "wheel_prototype_radius_mode",
+                     "wheel_prototype_radius_min",
+                     "wheel_prototype_radius_max",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
                       "wheel_semantic_control", "wheel_permutation_seed",
                       "wheel_detach_features",
                      "wheel_anchor_mix", "lambda_wheel_proto",
-                     "lambda_wheel_cpcc", "wheel_uncertainty_mode",
+                     "lambda_wheel_cpcc", "lambda_wheel_radius",
+                     "wheel_uncertainty_mode",
                      "lambda_wheel_uncertainty",
                      "wheel_uncertainty_hidden_dim",
                      "wheel_uncertainty_temperature",
@@ -805,6 +850,11 @@ def main(argv=None):
         if model_config.get("wheel_radius_mode", "free") == "fixed":
             method_tag += "_fixedr{}".format(
                 str(model_config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))
+        prototype_radius_mode = model_config.get(
+            "wheel_prototype_radius_mode", "fixed-shared")
+        if prototype_radius_mode != "fixed-shared":
+            method_tag += "_proto_{}".format(
+                prototype_radius_mode.replace("-", "_"))
         if model_config.get("wheel_zero_residual", False):
             method_tag += "_zerores"
         if model_config.get("wheel_semantic_control", "correct") == "random":
@@ -867,7 +917,7 @@ def main(argv=None):
         if args.use_tical:
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
-                  "wheel(proto/cpcc)={:.4f}/{:.4f}; "
+                  "wheel(proto/cpcc/radius)={:.4f}/{:.4f}/{:.4f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
@@ -875,6 +925,7 @@ def main(argv=None):
                 train_metrics["ca_distillation"], train_metrics["weighted_hyp"],
                 train_metrics["weighted_wheel_proto"],
                 train_metrics["weighted_wheel_cpcc"],
+                train_metrics.get("weighted_wheel_radius", 0.0),
                 train_metrics.get("weighted_wheel_uncertainty", 0.0),
                 train_metrics.get("wheel_uncertainty_progress", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),
@@ -900,9 +951,21 @@ def main(argv=None):
                                               max_batches=args.max_batches, collect_predictions=True,
                                               epoch=checkpoint.get("epoch", best_epoch))
     save_test_outputs(run_dir, metrics, rows, true, predicted, dataset.n_classes)
-    write_json(run_dir / "summary.json", {"best_epoch": best_epoch, "selection_protocol": args.selection_protocol,
-                                         "selection_weighted_f1": best_score, "test": metrics,
-                                         "smoke_test": args.max_batches > 0})
+    learned_radii = None
+    if model_config.get("use_emotion_wheel"):
+        learned_radii = model.tical.current_wheel_prototype_radii()
+        learned_radii = [float(value) for value in
+                         learned_radii.detach().cpu().tolist()]
+    write_json(run_dir / "summary.json", {
+        "best_epoch": best_epoch,
+        "selection_protocol": args.selection_protocol,
+        "selection_weighted_f1": best_score,
+        "test": metrics,
+        "wheel_prototype_radius_mode": model_config.get(
+            "wheel_prototype_radius_mode", "fixed-shared"),
+        "learned_prototype_radii": learned_radii,
+        "smoke_test": args.max_batches > 0,
+    })
     print("Best epoch: {}; test accuracy={:.2f}, weighted F1={:.2f}".format(
         best_epoch, metrics["accuracy"], metrics["weighted_f1"]), flush=True)
     return run_dir

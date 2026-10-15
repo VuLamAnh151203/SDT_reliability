@@ -19,6 +19,12 @@ from geometry_analysis.geometry import (GEOMETRIES, GeometryProjector,
 
 MODALITIES = ("t", "a", "v")
 WHEEL_SEMANTIC_CONTROLS = ("correct", "random")
+WHEEL_PROTOTYPE_RADIUS_MODES = (
+    "fixed-shared",
+    "learnable-shared",
+    "learnable-per-class",
+    "per-class-regularized",
+)
 EMOTION_WHEEL_ORDERS = {
     "IEMOCAP": (0, 4, 3, 5, 1, 2),
     "MELD": (4, 1, 2, 6, 5, 3, 0),
@@ -282,7 +288,10 @@ class TiCALModule(nn.Module):
                  wheel_fixed_radius=0.75, wheel_zero_residual=False,
                  wheel_semantic_control="correct",
                  wheel_permutation_seed=1729,
-                 wheel_detach_features=False):
+                 wheel_detach_features=False,
+                 wheel_prototype_radius_mode="fixed-shared",
+                 wheel_prototype_radius_min=0.20,
+                 wheel_prototype_radius_max=0.90):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -325,12 +334,37 @@ class TiCALModule(nn.Module):
         self.wheel_detach_features = bool(wheel_detach_features)
         self.wheel_temperature = float(wheel_temperature)
         self.wheel_anchor_mix = float(wheel_anchor_mix)
+        if wheel_prototype_radius_mode not in WHEEL_PROTOTYPE_RADIUS_MODES:
+            raise ValueError("unknown Wheel prototype radius mode: {}".format(
+                wheel_prototype_radius_mode))
+        self.wheel_prototype_radius_mode = wheel_prototype_radius_mode
+        self.wheel_prototype_radius = float(wheel_prototype_radius)
+        self.wheel_prototype_radius_min = float(wheel_prototype_radius_min)
+        self.wheel_prototype_radius_max = float(wheel_prototype_radius_max)
+        self.register_parameter("wheel_prototype_radius_logits", None)
         if self.use_emotion_wheel:
             if not math.isfinite(self.wheel_temperature) or self.wheel_temperature <= 0:
                 raise ValueError("wheel temperature must be finite and positive")
             if (not math.isfinite(self.wheel_anchor_mix)
                     or not 0.0 <= self.wheel_anchor_mix <= 1.0):
                 raise ValueError("wheel anchor mix must be in [0, 1]")
+            radius_values = (
+                self.wheel_prototype_radius,
+                self.wheel_prototype_radius_min,
+                self.wheel_prototype_radius_max,
+            )
+            if any(not math.isfinite(value) for value in radius_values):
+                raise ValueError("Wheel prototype radii must be finite")
+            if not (0.0 < self.wheel_prototype_radius_min
+                    < self.wheel_prototype_radius
+                    < self.wheel_prototype_radius_max
+                    < 1.0 - self.hyp_eps):
+                raise ValueError(
+                    "prototype radii must satisfy 0 < min < initial < max < 1-eps")
+            if (self.wheel_prototype_radius_mode != "fixed-shared"
+                    and self.wheel_geometry != "poincare"):
+                raise ValueError(
+                    "learnable prototype radii require Poincare geometry")
             wheel_angles, wheel_permutation = controlled_emotion_wheel_angles(
                 dataset, n_classes, wheel_semantic_control,
                 wheel_permutation_seed)
@@ -345,6 +379,16 @@ class TiCALModule(nn.Module):
                 wheel_prototypes(
                     wheel_angles, hyperbolic_dim, wheel_geometry,
                     wheel_prototype_radius, hyp_eps))
+            if self.wheel_prototype_radius_mode != "fixed-shared":
+                fraction = ((self.wheel_prototype_radius
+                             - self.wheel_prototype_radius_min)
+                            / (self.wheel_prototype_radius_max
+                               - self.wheel_prototype_radius_min))
+                initial_logit = math.log(fraction / (1.0 - fraction))
+                parameter_count = (1 if self.wheel_prototype_radius_mode
+                                   == "learnable-shared" else n_classes)
+                self.wheel_prototype_radius_logits = nn.Parameter(
+                    torch.full((parameter_count,), initial_logit))
             self.register_buffer(
                 "wheel_class_distances",
                 circular_class_distance_matrix(wheel_angles))
@@ -361,6 +405,49 @@ class TiCALModule(nn.Module):
                 balance_mode=anchor_balance, geometry=wheel_geometry)
             for name in MODALITIES
         })
+
+    def current_wheel_prototype_radii(self):
+        """Return the bounded Euclidean ball radius of every class prototype."""
+        if not self.use_emotion_wheel:
+            return None
+        if self.wheel_prototype_radius_logits is None:
+            return self.wheel_angles.new_full(
+                (self.wheel_angles.numel(),), self.wheel_prototype_radius)
+        radii = self.wheel_prototype_radius_min + (
+            self.wheel_prototype_radius_max
+            - self.wheel_prototype_radius_min
+        ) * torch.sigmoid(self.wheel_prototype_radius_logits)
+        if radii.numel() == 1:
+            radii = radii.expand(self.wheel_angles.numel())
+        return radii
+
+    def current_wheel_prototypes(self):
+        """Build class prototypes while retaining gradients to learned radii."""
+        if not self.use_emotion_wheel:
+            return None
+        if self.wheel_prototype_radius_logits is None:
+            return self.wheel_prototypes
+        directions = torch.stack(
+            (torch.cos(self.wheel_angles), torch.sin(self.wheel_angles)),
+            dim=-1)
+        if self.wheel_prototypes.size(-1) > 2:
+            directions = torch.cat((
+                directions,
+                directions.new_zeros(
+                    directions.size(0), self.wheel_prototypes.size(-1) - 2),
+            ), dim=-1)
+        return directions * self.current_wheel_prototype_radii().unsqueeze(-1)
+
+    def wheel_radius_regularization(self):
+        """Penalize only the explicitly regularized per-class radius mode."""
+        if (not self.use_emotion_wheel
+                or self.wheel_prototype_radius_mode
+                != "per-class-regularized"):
+            if self.use_emotion_wheel:
+                return self.wheel_prototypes.sum() * 0.0
+            return torch.tensor(0.0)
+        radii = self.current_wheel_prototype_radii()
+        return ((radii - self.wheel_prototype_radius) ** 2).mean()
 
     def banks_ready(self):
         if self.anchor_min_per_class == 0:
@@ -387,6 +474,12 @@ class TiCALModule(nn.Module):
                   "wheel_enabled": self.use_emotion_wheel,
                   "wheel_geometry": self.wheel_geometry,
                   "wheel_radius_mode": self.wheel_radius_mode,
+                  "wheel_prototype_radius_mode": (
+                      self.wheel_prototype_radius_mode),
+                  "wheel_prototype_radii": (
+                      self.current_wheel_prototype_radii()),
+                  "wheel_radius_regularization": (
+                      self.wheel_radius_regularization()),
                   "wheel_fixed_radius": self.wheel_fixed_radius,
                   "wheel_zero_residual": self.wheel_zero_residual,
                   "wheel_semantic_control": self.wheel_semantic_control,
@@ -407,7 +500,8 @@ class TiCALModule(nn.Module):
                 (wheel_distances[name], wheel_logits[name],
                  wheel_pseudo[name], prototype_tau[name]) = (
                     geometry_prototype_outputs(
-                        projected[name][valid], self.wheel_prototypes,
+                        projected[name][valid],
+                        self.current_wheel_prototypes(),
                         self.wheel_geometry, self.wheel_temperature,
                         self.hyp_eps))
                 if self.detach_tau:

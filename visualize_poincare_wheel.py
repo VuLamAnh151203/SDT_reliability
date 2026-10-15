@@ -224,7 +224,7 @@ def main(argv=None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path = output_path.with_suffix(".csv")
     write_csv(csv_path, rows)
-    render(output_path, rows, model.tical.wheel_prototypes,
+    render(output_path, rows, model.tical.current_wheel_prototypes(),
            dataset_name, args.max_points_per_class, args.seed)
     print("Saved figure: {}".format(output_path))
     print("Saved coordinates: {}".format(csv_path))

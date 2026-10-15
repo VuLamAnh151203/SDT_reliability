@@ -190,6 +190,68 @@ class TiCALTests(unittest.TestCase):
             distances.diag(), torch.zeros(6), atol=1e-4, rtol=0)
         self.assertLess(distances[0, 4], distances[0, 5])
 
+    def test_learnable_wheel_prototype_radius_modes(self):
+        fixed = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=4, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_radius_mode="fixed-shared")
+        self.assertIsNone(fixed.wheel_prototype_radius_logits)
+        torch.testing.assert_close(
+            fixed.current_wheel_prototype_radii(),
+            torch.full((6,), 0.75))
+
+        shared = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=4, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_radius_mode="learnable-shared")
+        self.assertEqual(shared.wheel_prototype_radius_logits.numel(), 1)
+        shared_radii = shared.current_wheel_prototype_radii()
+        torch.testing.assert_close(shared_radii, torch.full((6,), 0.75))
+        shared.current_wheel_prototypes()[0].norm().backward()
+        self.assertIsNotNone(shared.wheel_prototype_radius_logits.grad)
+        self.assertGreater(
+            shared.wheel_prototype_radius_logits.grad.abs().item(), 0.0)
+
+        per_class = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=4, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_radius_mode="learnable-per-class")
+        self.assertEqual(per_class.wheel_prototype_radius_logits.numel(), 6)
+        with torch.no_grad():
+            per_class.wheel_prototype_radius_logits.add_(
+                torch.linspace(-1.0, 1.0, 6))
+        radii = per_class.current_wheel_prototype_radii()
+        self.assertTrue((radii > 0.20).all())
+        self.assertTrue((radii < 0.90).all())
+        self.assertGreater(radii.std().item(), 0.0)
+
+    def test_per_class_radius_regularization_enters_total_loss(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_radius_mode="per-class-regularized")
+        with torch.no_grad():
+            model.tical.wheel_prototype_radius_logits.add_(
+                torch.linspace(-0.5, 0.5, 6))
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_hyp=0, lambda_wheel_proto=0,
+            lambda_wheel_cpcc=0, lambda_wheel_radius=2.0)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertGreater(parts["wheel_radius"].item(), 0.0)
+        torch.testing.assert_close(
+            loss, 2.0 * parts["wheel_radius"])
+        loss.backward()
+        gradient = model.tical.wheel_prototype_radius_logits.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
     def test_prototype_prediction_blending_and_wheel_disagreement(self):
         angles = emotion_wheel_angles("IEMOCAP", 6)
         prototypes = emotion_wheel_prototypes(angles, 2, radius=0.7)

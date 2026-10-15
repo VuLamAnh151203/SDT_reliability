@@ -147,11 +147,13 @@ class SDTCOLDLoss(nn.Module):
                  tical_mode=None, lambda_hyp=0.1,
                  lambda_wheel_proto=0.0, lambda_wheel_cpcc=0.0,
                  wheel_uncertainty_mode="none",
-                 lambda_wheel_uncertainty=0.0):
+                 lambda_wheel_uncertainty=0.0,
+                 lambda_wheel_radius=0.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
-                   lambda_wheel_cpcc, lambda_wheel_uncertainty)
+                   lambda_wheel_cpcc, lambda_wheel_uncertainty,
+                   lambda_wheel_radius)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -163,6 +165,7 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_hyp = lambda_hyp
         self.lambda_wheel_proto = lambda_wheel_proto
         self.lambda_wheel_cpcc = lambda_wheel_cpcc
+        self.lambda_wheel_radius = lambda_wheel_radius
         if wheel_uncertainty_mode not in (
                 "none", "gate", "supervise", "full"):
             raise ValueError("unknown wheel uncertainty mode: {}".format(
@@ -270,6 +273,11 @@ class SDTCOLDLoss(nn.Module):
             ) / len(MODALITIES)
         weighted_wheel_proto = self.lambda_wheel_proto * wheel_proto
         weighted_wheel_cpcc = self.lambda_wheel_cpcc * wheel_cpcc
+        wheel_radius = zero
+        if wheel_ready:
+            wheel_radius = tical_output.get(
+                "wheel_radius_regularization", zero)
+        weighted_wheel_radius = self.lambda_wheel_radius * wheel_radius
         wheel_uncertainty = zero
         wheel_uncertainty_by_modality = {
             name: zero for name in MODALITIES}
@@ -311,6 +319,7 @@ class SDTCOLDLoss(nn.Module):
         total = (sdt + weighted_cold + weighted_reg
                  + weighted_reliability + weighted_hyp
                  + weighted_wheel_proto + weighted_wheel_cpcc
+                 + weighted_wheel_radius
                  + weighted_wheel_uncertainty)
         sample_keep_rate = (torch.ones((), device=total.device) if sample_keep_mask is None
                             else sample_keep_mask[valid].float().mean())
@@ -324,6 +333,8 @@ class SDTCOLDLoss(nn.Module):
                  "weighted_wheel_proto": weighted_wheel_proto,
                  "wheel_cpcc": wheel_cpcc,
                  "weighted_wheel_cpcc": weighted_wheel_cpcc,
+                 "wheel_radius": wheel_radius,
+                 "weighted_wheel_radius": weighted_wheel_radius,
                  "wheel_uncertainty": wheel_uncertainty,
                  "weighted_wheel_uncertainty": weighted_wheel_uncertainty,
                  "wheel_uncertainty_progress": zero + uncertainty_progress,

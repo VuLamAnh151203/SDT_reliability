@@ -347,10 +347,14 @@ def error_transitions(baseline, variant, reference_id, experiment_id, seed,
             "baseline_error_tier": tier,
             "n": int(selected.sum()), "baseline_wrong": int(old_wrong.sum()),
             "wrong_to_correct": int(np.sum(old_wrong & (new == labels))),
-            "correction_rate": (float(np.mean(new[old_wrong] == labels)) if old_wrong.any() else None),
+            "correction_rate": (
+                float(np.mean(new[old_wrong] == labels[old_wrong]))
+                if old_wrong.any() else None),
             "baseline_correct": int(old_correct.sum()),
             "correct_to_wrong": int(np.sum(old_correct & (new != labels))),
-            "harm_rate": (float(np.mean(new[old_correct] != labels)) if old_correct.any() else None),
+            "harm_rate": (
+                float(np.mean(new[old_correct] != labels[old_correct]))
+                if old_correct.any() else None),
         })
     return rows
 

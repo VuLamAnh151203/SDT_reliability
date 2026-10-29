@@ -394,7 +394,8 @@ def confidence_bin_rows(confidence, radius, correctness, modality,
 def infer_experiment_id(config, args):
     if not config.get("use_emotion_wheel", False):
         return "B0"
-    prefix = {"euclidean": "E", "spherical": "S", "poincare": "P"}[
+    prefix = {"euclidean": "E", "ball_euclidean": "BE",
+              "spherical": "S", "poincare": "P"}[
         config.get("wheel_geometry", "poincare")]
     has_proto = float(args.get("lambda_wheel_proto", 0.0)) > 0
     has_cpcc = float(args.get("lambda_wheel_cpcc", 0.0)) > 0

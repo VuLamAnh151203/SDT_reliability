@@ -253,7 +253,8 @@ class Transformer_Based_Model(SDTBackbone):
 
     def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len):
         """Label-free forward. qmask is [B,L,S]; inputs are [L,B,D_m]."""
-        if self.use_tical or self.fusion_feature_source == "pure":
+        if (self.use_tical or self.fusion_feature_source == "pure"
+                or getattr(self, "capture_pure", False)):
             enhanced, pure = self.encode_modalities(
                 textf, visuf, acouf, u_mask, qmask, dia_len, return_pure=True)
         else:
@@ -381,6 +382,12 @@ class Transformer_Based_Model(SDTBackbone):
             "teacher_kl_prob": F.softmax(logits / self.temp, dim=-1),
             "enhanced": features,
             "pure": pure_features,
+            # Keep the exact graph nodes consumed by both the SDT gates and
+            # the Wheel projector.  Mechanism diagnostics use these tensors
+            # to measure task/Wheel gradient alignment at H_TT/H_AA/H_VV.
+            "pure_modalities": (
+                {name: feature for name, feature in zip(MODALITIES, pure)}
+                if pure is not None else None),
             "fusion_feature_source": self.fusion_feature_source,
             "wheel_feature_source": self.wheel_feature_source,
             "fusion_features": latents,

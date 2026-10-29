@@ -21,7 +21,7 @@ class GeometryTest(unittest.TestCase):
                 torch.testing.assert_close(
                     projected.norm(dim=-1), torch.ones(7),
                     atol=1e-5, rtol=1e-5)
-            if geometry == "poincare":
+            if geometry in ("ball_euclidean", "poincare"):
                 self.assertTrue((projected.norm(dim=-1) < 1).all())
             projected.square().mean().backward()
             self.assertIsNotNone(projector.linear.weight.grad)
@@ -85,6 +85,21 @@ class GeometryTest(unittest.TestCase):
             projector.linear.weight.grad[2:],
             torch.zeros_like(projector.linear.weight.grad[2:]),
             atol=0, rtol=0)
+
+    def test_ball_euclidean_shares_poincare_map_but_not_metric(self):
+        torch.manual_seed(9)
+        ball = GeometryProjector(5, 4, "ball_euclidean")
+        poincare = GeometryProjector(5, 4, "poincare")
+        poincare.load_state_dict(ball.state_dict())
+        features = torch.randn(7, 5)
+        ball_points = ball(features)
+        poincare_points = poincare(features)
+        torch.testing.assert_close(ball_points, poincare_points)
+        euclidean = geometry_distance(
+            ball_points[:3, None], ball_points[None, 3:], "ball_euclidean")
+        hyperbolic = geometry_distance(
+            poincare_points[:3, None], poincare_points[None, 3:], "poincare")
+        self.assertTrue((hyperbolic > euclidean).all())
 
 
 if __name__ == "__main__":

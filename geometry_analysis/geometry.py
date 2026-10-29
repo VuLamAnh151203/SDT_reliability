@@ -1,4 +1,4 @@
-"""Shared Euclidean, spherical, and Poincare operations.
+"""Shared Euclidean, ball-Euclidean, spherical, and Poincare operations.
 
 Every geometry uses the same learned affine projection.  Only the final
 manifold map and distance change.  This is important for a controlled
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 
-GEOMETRIES = ("euclidean", "spherical", "poincare")
+GEOMETRIES = ("euclidean", "ball_euclidean", "spherical", "poincare")
 RADIUS_MODES = ("free", "fixed")
 
 
@@ -37,8 +37,8 @@ class GeometryProjector(nn.Module):
             raise ValueError("radius mode must be one of {}".format(RADIUS_MODES))
         if not math.isfinite(fixed_radius) or fixed_radius <= 0.0:
             raise ValueError("fixed radius must be finite and positive")
-        if geometry == "poincare" and fixed_radius >= 1.0 - eps:
-            raise ValueError("fixed Poincare radius must be in (0, 1-eps)")
+        if geometry in ("ball_euclidean", "poincare") and fixed_radius >= 1.0 - eps:
+            raise ValueError("fixed ball radius must be in (0, 1-eps)")
         if geometry == "spherical" and radius_mode == "fixed" and not math.isclose(
                 fixed_radius, 1.0, rel_tol=0.0, abs_tol=eps):
             raise ValueError("fixed spherical radius must equal 1")
@@ -71,6 +71,8 @@ class GeometryProjector(nn.Module):
             projected = tangent / norm
         else:
             # Exponential map at the origin of the unit-curvature Poincare ball.
+            # ``ball_euclidean`` deliberately shares this map with
+            # ``poincare`` and changes only the downstream distance.
             norm = tangent.norm(p=2, dim=-1, keepdim=True).clamp_min(self.eps)
             projected = torch.tanh(norm) * tangent / norm
             projected_norm = projected.norm(p=2, dim=-1, keepdim=True)
@@ -96,8 +98,8 @@ def wheel_prototypes(class_angles, feature_dim, geometry="poincare",
                      radius=0.75, eps=1e-5):
     """Embed a fixed semantic wheel in a two-dimensional subspace of R^D.
 
-    Spherical prototypes must have unit norm.  Euclidean and Poincare
-    prototypes use ``radius``; Poincare additionally requires radius < 1.
+    Spherical prototypes must have unit norm.  Euclidean, ball-Euclidean and
+    Poincare prototypes use ``radius``; ball geometries require radius < 1.
     The remaining dimensions are an orthogonal residual subspace available to
     projected samples, while the semantic prototype plane stays identical.
     """
@@ -108,8 +110,8 @@ def wheel_prototypes(class_angles, feature_dim, geometry="poincare",
         raise ValueError("emotion-wheel prototypes require at least 2 dimensions")
     if not math.isfinite(radius) or radius <= 0.0:
         raise ValueError("prototype radius must be finite and positive")
-    if geometry == "poincare" and radius >= 1.0 - eps:
-        raise ValueError("Poincare prototype radius must be in (0, 1-eps)")
+    if geometry in ("ball_euclidean", "poincare") and radius >= 1.0 - eps:
+        raise ValueError("ball prototype radius must be in (0, 1-eps)")
     effective_radius = 1.0 if geometry == "spherical" else float(radius)
     prototypes = class_angles.new_zeros(class_angles.numel(), feature_dim)
     prototypes[:, 0] = effective_radius * torch.cos(class_angles)
@@ -122,7 +124,7 @@ def geometry_distance(first, second, geometry="poincare", eps=1e-5):
     _validate_geometry(geometry)
     if first.size(-1) != second.size(-1):
         raise ValueError("geometry vectors must have the same final dimension")
-    if geometry == "euclidean":
+    if geometry in ("euclidean", "ball_euclidean"):
         distance = (first - second).norm(p=2, dim=-1)
     elif geometry == "spherical":
         first_unit = first / first.norm(

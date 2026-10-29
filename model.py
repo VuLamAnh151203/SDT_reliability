@@ -13,6 +13,7 @@ from tical import MODALITIES as TICAL_MODALITIES, TiCALModule
 MODALITIES = ("t", "a", "v")
 FUSION_VARIANTS = ("guided", "replace", "oof-guided", "sdt")
 FUSION_FEATURE_SOURCES = ("enhanced", "pure")
+WHEEL_FEATURE_SOURCES = ("pure", "enhanced")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 WHEEL_UNCERTAINTY_MODES = ("none", "gate", "supervise", "full")
 
@@ -124,6 +125,7 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_uncertainty_warmup_epochs=10,
                  wheel_uncertainty_ramp_epochs=5,
                  fusion_feature_source="enhanced",
+                 wheel_feature_source="pure",
                  wheel_semantic_control="correct",
                  wheel_permutation_seed=1729,
                  wheel_detach_features=False,
@@ -137,6 +139,12 @@ class Transformer_Based_Model(SDTBackbone):
                 fusion_feature_source))
         if fusion_feature_source == "pure" and fusion_variant != "sdt":
             raise ValueError("pure fusion requires --fusion-variant sdt")
+        if wheel_feature_source not in WHEEL_FEATURE_SOURCES:
+            raise ValueError("unknown Wheel feature source: {}".format(
+                wheel_feature_source))
+        if wheel_feature_source != "pure" and not use_emotion_wheel:
+            raise ValueError(
+                "enhanced Wheel features require emotion-wheel mode")
         if not math.isfinite(temp) or temp <= 0:
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(cold_eps) or cold_eps <= 0:
@@ -185,6 +193,7 @@ class Transformer_Based_Model(SDTBackbone):
         self.tical_warmup_epochs = tical_warmup_epochs
         self.beta_gate = beta_gate
         self.use_emotion_wheel = bool(use_emotion_wheel)
+        self.wheel_feature_source = wheel_feature_source
         self.wheel_geometry = wheel_geometry
         self.wheel_radius_mode = wheel_radius_mode
         self.wheel_fixed_radius = wheel_fixed_radius
@@ -269,9 +278,16 @@ class Transformer_Based_Model(SDTBackbone):
                 self.last_gate.fc(fusion_features), dim=-2)
             fusion_weights = sdt_weights
             if self.use_tical:
+                # TiCAL originally regularized the pure self-modal features
+                # H_TT/H_AA/H_VV.  The enhanced option attaches the same
+                # projector and objectives to H'_T/H'_A/H'_V while leaving
+                # the ordinary SDT fusion path unchanged.
+                tical_features = (pure if self.wheel_feature_source == "pure"
+                                  else enhanced)
                 tical_output = self.tical(
-                    pure, u_mask.bool(),
+                    tical_features, u_mask.bool(),
                     query_enabled=self.tical_epoch > self.tical_warmup_epochs)
+                tical_output["feature_source"] = self.wheel_feature_source
                 if self.wheel_uncertainty_mode != "none":
                     wheel_uncertainty = {
                         name: self.wheel_uncertainty_heads[name](
@@ -366,6 +382,7 @@ class Transformer_Based_Model(SDTBackbone):
             "enhanced": features,
             "pure": pure_features,
             "fusion_feature_source": self.fusion_feature_source,
+            "wheel_feature_source": self.wheel_feature_source,
             "fusion_features": latents,
             "distributions": distributions,
             "latents": latents,

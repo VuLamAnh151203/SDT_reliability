@@ -76,6 +76,26 @@ class TiCALTests(unittest.TestCase):
         self.assertIsNotNone(projector_grad)
         self.assertGreater(projector_grad.abs().sum().item(), 0.0)
 
+    def test_enhanced_wheel_source_projects_h_prime(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_feature_source="enhanced").eval()
+        output = model(*self.inputs)
+        self.assertEqual(output["wheel_feature_source"], "enhanced")
+        self.assertEqual(output["tical"]["feature_source"], "enhanced")
+        for index, name in enumerate(MODALITIES):
+            expected = model.tical.projectors[name](
+                output["enhanced"][:, :, index, :])
+            torch.testing.assert_close(
+                output["tical"]["projected"][name], expected)
+
+    def test_enhanced_wheel_source_requires_emotion_wheel(self):
+        with self.assertRaises(ValueError):
+            Transformer_Based_Model(
+                **self.config, use_tical=True,
+                wheel_feature_source="enhanced")
+
     def test_anchor_bank_is_fifo_and_checkpoint_loads_dynamic_buffers(self):
         bank = AnchorBank(2, n_classes=3, max_size=3)
         features = torch.tensor([[0.0, 0.0], [0.1, 0.0], [0.2, 0.0], [0.3, 0.0]])

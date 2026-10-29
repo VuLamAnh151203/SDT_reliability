@@ -15,7 +15,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from dataloader import BASE_DIR, DialogueDataset, make_loaders, split_dialogues
 from losses import SDTCOLDLoss, wheel_uncertainty_target
 from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
-                   FUSION_VARIANTS, MODALITIES, WHEEL_UNCERTAINTY_MODES,
+                   FUSION_VARIANTS, MODALITIES, WHEEL_FEATURE_SOURCES,
+                   WHEEL_UNCERTAINTY_MODES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
@@ -62,6 +63,10 @@ def build_parser():
     parser.add_argument("--lambda-hyp", type=float, default=0.1)
     parser.add_argument("--use-emotion-wheel", action="store_true",
                         help="constrain TiCAL with fixed hyperbolic emotion-wheel prototypes")
+    parser.add_argument(
+        "--wheel-feature-source", choices=WHEEL_FEATURE_SOURCES,
+        default="pure",
+        help="pure=H_TT/H_AA/H_VV; enhanced=H'_T/H'_A/H'_V")
     parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
     parser.add_argument(
         "--wheel-prototype-radius-mode",
@@ -202,6 +207,7 @@ def make_model_config(args, dataset):
             "detach_kappa": not args.no_detach_kappa,
             "beta_gate": args.beta_gate,
             "use_emotion_wheel": args.use_emotion_wheel,
+            "wheel_feature_source": args.wheel_feature_source,
             "wheel_geometry": args.wheel_geometry,
             "wheel_radius_mode": args.wheel_radius_mode,
             "wheel_fixed_radius": args.wheel_fixed_radius,
@@ -757,7 +763,8 @@ def main(argv=None):
             or args.wheel_uncertainty_mode != "none"
             or args.lambda_wheel_uncertainty > 0
             or args.wheel_semantic_control != "correct"
-            or args.wheel_detach_features):
+            or args.wheel_detach_features
+            or args.wheel_feature_source != "pure"):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
     if args.wheel_uncertainty_mode != "none":
         if args.wheel_geometry != "poincare":
@@ -834,6 +841,7 @@ def main(argv=None):
                      "hyperbolic_dim", "hyp_eps", "typicality_eps",
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
+                     "wheel_feature_source",
                      "wheel_prototype_radius_mode",
                      "wheel_prototype_radius_min",
                      "wheel_prototype_radius_max",
@@ -856,6 +864,7 @@ def main(argv=None):
                      "sample_prune_quantile", "disagreement_weight", "sample_prune_any",
                      "oof_reliability_targets", "tical_mode", "lambda_hyp",
                      "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
+                     "wheel_feature_source",
                      "wheel_prototype_radius", "wheel_temperature",
                      "wheel_prototype_radius_mode",
                      "wheel_prototype_radius_min",
@@ -919,6 +928,8 @@ def main(argv=None):
     if model_config.get("use_emotion_wheel"):
         method_tag += "_wheel_{}".format(
             model_config.get("wheel_geometry", "poincare"))
+        if model_config.get("wheel_feature_source", "pure") == "enhanced":
+            method_tag += "_enhanced"
         if model_config.get("wheel_radius_mode", "free") == "fixed":
             method_tag += "_fixedr{}".format(
                 str(model_config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))

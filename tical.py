@@ -100,6 +100,63 @@ def poincare_distance(first, second, eps=1e-5):
     return geometry_distance(first, second, "poincare", eps)
 
 
+def poincare_mobius_add(first, second, eps=1e-5):
+    """Stable Mobius addition for curvature -1 with broadcasting."""
+    first_sq = (first * first).sum(dim=-1, keepdim=True)
+    second_sq = (second * second).sum(dim=-1, keepdim=True)
+    inner = (first * second).sum(dim=-1, keepdim=True)
+    numerator = ((1.0 + 2.0 * inner + second_sq) * first
+                 + (1.0 - first_sq) * second)
+    denominator = (1.0 + 2.0 * inner
+                   + first_sq * second_sq).clamp_min(eps)
+    result = numerator / denominator
+    norm = result.norm(p=2, dim=-1, keepdim=True)
+    scale = ((1.0 - eps) / norm.clamp_min(eps)).clamp(max=1.0)
+    return result * scale
+
+
+def poincare_log_map(base, points, eps=1e-5):
+    """Logarithmic map at an arbitrary Poincare-ball base point."""
+    difference = poincare_mobius_add(-base, points, eps)
+    norm = difference.norm(p=2, dim=-1, keepdim=True)
+    direction = difference / norm.clamp_min(eps)
+    base_sq = (base * base).sum(dim=-1, keepdim=True)
+    conformal = 2.0 / (1.0 - base_sq).clamp_min(eps)
+    magnitude = (2.0 / conformal) * torch.atanh(
+        norm.clamp(max=1.0 - eps))
+    tangent = magnitude * direction
+    return torch.where(norm > eps, tangent, torch.zeros_like(tangent))
+
+
+def poincare_exp_map(base, tangent, eps=1e-5):
+    """Exponential map at an arbitrary Poincare-ball base point."""
+    norm = tangent.norm(p=2, dim=-1, keepdim=True)
+    direction = tangent / norm.clamp_min(eps)
+    base_sq = (base * base).sum(dim=-1, keepdim=True)
+    conformal = 2.0 / (1.0 - base_sq).clamp_min(eps)
+    displacement = torch.tanh(conformal * norm / 2.0) * direction
+    displacement = torch.where(
+        norm > eps, displacement, torch.zeros_like(displacement))
+    return poincare_mobius_add(base, displacement, eps)
+
+
+def poincare_frechet_mean(points, eps=1e-5, iterations=5):
+    """Differentiable equal-weight Karcher mean over the penultimate axis."""
+    if points.ndim < 3 or points.size(-2) < 1:
+        raise ValueError("Frechet mean expects [...,J,D] with J >= 1")
+    if points.size(-2) == 1:
+        return points.squeeze(-2)
+    tangent_zero = poincare_log_map(
+        torch.zeros_like(points), points, eps).mean(dim=-2)
+    mean = poincare_exp_map(
+        torch.zeros_like(tangent_zero), tangent_zero, eps)
+    for _ in range(iterations):
+        base = mean.unsqueeze(-2).expand_as(points)
+        update = poincare_log_map(base, points, eps).mean(dim=-2)
+        mean = poincare_exp_map(mean, update, eps)
+    return mean
+
+
 def hyperbolic_prototype_outputs(features, prototypes, temperature=1.0,
                                  eps=1e-5):
     """Return class distances, logits, pseudo-labels, and absolute typicality."""
@@ -294,7 +351,11 @@ class TiCALModule(nn.Module):
                  wheel_prototype_radius_mode="fixed-shared",
                  wheel_prototype_radius_min=0.20,
                  wheel_prototype_radius_max=0.90,
-                 wheel_free_prototype_max_radius=0.95):
+                 wheel_free_prototype_max_radius=0.95,
+                 wheel_prototypes_per_class=1,
+                 wheel_multi_prototype_temperature=0.2,
+                 wheel_multi_prototype_init_std=0.02,
+                 wheel_prototype_diversity_margin=0.5):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -350,6 +411,26 @@ class TiCALModule(nn.Module):
         self.wheel_prototype_radius_max = float(wheel_prototype_radius_max)
         self.wheel_free_prototype_max_radius = float(
             wheel_free_prototype_max_radius)
+        if wheel_prototypes_per_class < 1:
+            raise ValueError("prototypes per class must be positive")
+        if (wheel_prototypes_per_class > 1
+                and wheel_prototype_layout != "modality-specific"):
+            raise ValueError(
+                "multiple prototypes require modality-specific layout")
+        multi_values = (wheel_multi_prototype_temperature,
+                        wheel_multi_prototype_init_std,
+                        wheel_prototype_diversity_margin)
+        if any(not math.isfinite(value) or value < 0 for value in multi_values):
+            raise ValueError("multi-prototype settings must be finite and nonnegative")
+        if wheel_multi_prototype_temperature <= 0:
+            raise ValueError("multi-prototype temperature must be positive")
+        self.wheel_prototypes_per_class = int(wheel_prototypes_per_class)
+        self.wheel_multi_prototype_temperature = float(
+            wheel_multi_prototype_temperature)
+        self.wheel_multi_prototype_init_std = float(
+            wheel_multi_prototype_init_std)
+        self.wheel_prototype_diversity_margin = float(
+            wheel_prototype_diversity_margin)
         self.register_parameter("wheel_prototype_radius_logits", None)
         self.register_parameter("wheel_free_prototype_tangent", None)
         self.register_parameter("wheel_shared_center_tangent", None)
@@ -429,8 +510,18 @@ class TiCALModule(nn.Module):
                     initial_tangent.clone())
                 # p_c^T, p_c^A, p_c^V: independently learned prototypes used
                 # by the corresponding modality-distance classifiers.
+                if self.wheel_prototypes_per_class == 1:
+                    modality_initial = initial_tangent
+                else:
+                    modality_initial = initial_tangent.unsqueeze(1).expand(
+                        -1, self.wheel_prototypes_per_class, -1).clone()
+                    noise = torch.randn_like(modality_initial)
+                    noise = noise - noise.mean(dim=1, keepdim=True)
+                    modality_initial = (
+                        modality_initial
+                        + self.wheel_multi_prototype_init_std * noise)
                 self.wheel_modality_prototype_tangents = nn.ParameterDict({
-                    name: nn.Parameter(initial_tangent.clone())
+                    name: nn.Parameter(modality_initial.clone())
                     for name in MODALITIES
                 })
             elif self.wheel_prototype_radius_mode != "fixed-shared":
@@ -525,6 +616,38 @@ class TiCALModule(nn.Module):
             ), dim=-1)
         return directions * self.current_wheel_prototype_radii().unsqueeze(-1)
 
+    def current_wheel_prototype_barycenters(self, modality):
+        """Return one Poincare barycenter per class for a modality bank."""
+        prototypes = self.current_wheel_prototypes(modality)
+        if prototypes.ndim == 2:
+            return prototypes
+        return poincare_frechet_mean(prototypes, self.hyp_eps)
+
+    def wheel_prototype_outputs(self, features, prototypes):
+        """Classify by one prototype or a soft-min pool over J prototypes."""
+        if prototypes.ndim == 2:
+            distance, logits, pseudo, typicality = (
+                geometry_prototype_outputs(
+                    features, prototypes, self.wheel_geometry,
+                    self.wheel_temperature, self.hyp_eps))
+            return distance, logits, pseudo, typicality, None
+        if prototypes.ndim != 3:
+            raise ValueError("prototypes must have shape [C,D] or [C,J,D]")
+        subprototype_distance = geometry_distance(
+            features[:, None, None, :], prototypes[None, :, :, :],
+            self.wheel_geometry, self.hyp_eps)
+        pool_temperature = self.wheel_multi_prototype_temperature
+        class_distance = -pool_temperature * (
+            torch.logsumexp(
+                -subprototype_distance / pool_temperature, dim=-1)
+            - math.log(prototypes.size(1)))
+        logits = -class_distance / self.wheel_temperature
+        nearest, pseudo = class_distance.min(dim=-1)
+        typicality = torch.exp(
+            -nearest / self.wheel_temperature).clamp(0.0, 1.0)
+        return (class_distance, logits, pseudo, typicality,
+                subprototype_distance)
+
     def wheel_radius_regularization(self):
         """Penalize only the explicitly regularized per-class radius mode."""
         if (not self.use_emotion_wheel
@@ -562,7 +685,7 @@ class TiCALModule(nn.Module):
         return (learned - target).square().mean()
 
     def wheel_prototype_alignment_loss(self):
-        """Align p_c^T/p_c^A/p_c^V with shared semantic centers q_c."""
+        """Align each modality's class barycenter with semantic center q_c."""
         if (not self.use_emotion_wheel
                 or self.wheel_prototype_layout != "modality-specific"):
             if self.use_emotion_wheel:
@@ -571,10 +694,32 @@ class TiCALModule(nn.Module):
         centers = self.current_wheel_prototypes()
         return sum(
             geometry_distance(
-                self.current_wheel_prototypes(name), centers,
+                self.current_wheel_prototype_barycenters(name), centers,
                 "poincare", self.hyp_eps).square().mean()
             for name in MODALITIES
         ) / len(MODALITIES)
+
+    def wheel_prototype_diversity_loss(self):
+        """Keep same-class subprototypes from collapsing onto one point."""
+        if (not self.use_emotion_wheel
+                or self.wheel_prototype_layout != "modality-specific"
+                or self.wheel_prototypes_per_class == 1):
+            if self.use_emotion_wheel:
+                return self.wheel_prototypes.sum() * 0.0
+            return torch.tensor(0.0)
+        losses = []
+        for name in MODALITIES:
+            prototypes = self.current_wheel_prototypes(name)
+            row, column = torch.triu_indices(
+                prototypes.size(1), prototypes.size(1), offset=1,
+                device=prototypes.device)
+            pairwise = geometry_distance(
+                prototypes[:, row, :], prototypes[:, column, :],
+                "poincare", self.hyp_eps)
+            losses.append(torch.relu(
+                self.wheel_prototype_diversity_margin - pairwise
+            ).square().mean())
+        return sum(losses) / len(losses)
 
     def wheel_prototype_boundary_loss(self):
         """Softly keep free prototypes away from the unstable ball boundary."""
@@ -595,7 +740,7 @@ class TiCALModule(nn.Module):
                 self.wheel_modality_prototype_tangents[name]
                 for name in MODALITIES)
         tangent_radii = torch.cat([
-            tangent.norm(p=2, dim=-1) for tangent in tangents])
+            tangent.norm(p=2, dim=-1).reshape(-1) for tangent in tangents])
         maximum = tangent_radii.new_tensor(
             self.wheel_free_prototype_max_radius)
         maximum = torch.atanh(maximum)
@@ -637,8 +782,14 @@ class TiCALModule(nn.Module):
                       self.wheel_prototype_structure_loss()),
                   "wheel_prototype_alignment": (
                       self.wheel_prototype_alignment_loss()),
+                  "wheel_prototype_diversity": (
+                      self.wheel_prototype_diversity_loss()),
                   "wheel_prototype_boundary": (
                       self.wheel_prototype_boundary_loss()),
+                  "wheel_prototypes_per_class": (
+                      self.wheel_prototypes_per_class),
+                  "wheel_multi_prototype_temperature": (
+                      self.wheel_multi_prototype_temperature),
                   "wheel_free_prototype_max_radius": (
                       self.wheel_free_prototype_max_radius),
                   "wheel_fixed_radius": self.wheel_fixed_radius,
@@ -649,6 +800,7 @@ class TiCALModule(nn.Module):
                       if self.use_emotion_wheel else None),
                   "wheel_detach_features": self.wheel_detach_features,
                   "wheel_distances": None, "wheel_logits": None,
+                  "wheel_subprototype_distances": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
                   "wheel_class_distances": (
                       self.wheel_class_distances
@@ -657,19 +809,21 @@ class TiCALModule(nn.Module):
         if self.use_emotion_wheel and valid.any():
             wheel_distances, wheel_logits = {}, {}
             wheel_pseudo, prototype_tau = {}, {}
+            wheel_subprototype_distances = {}
             for name in MODALITIES:
                 (wheel_distances[name], wheel_logits[name],
-                 wheel_pseudo[name], prototype_tau[name]) = (
-                    geometry_prototype_outputs(
+                 wheel_pseudo[name], prototype_tau[name],
+                 wheel_subprototype_distances[name]) = (
+                    self.wheel_prototype_outputs(
                         projected[name][valid],
-                        self.current_wheel_prototypes(name),
-                        self.wheel_geometry, self.wheel_temperature,
-                        self.hyp_eps))
+                        self.current_wheel_prototypes(name)))
                 if self.detach_tau:
                     prototype_tau[name] = prototype_tau[name].detach()
             result.update({
                 "wheel_distances": wheel_distances,
                 "wheel_logits": wheel_logits,
+                "wheel_subprototype_distances": (
+                    wheel_subprototype_distances),
                 "wheel_pseudo_labels": wheel_pseudo,
                 "prototype_tau": prototype_tau,
             })

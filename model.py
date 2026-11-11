@@ -190,7 +190,13 @@ class Transformer_Based_Model(SDTBackbone):
                  prototype_evidence_ramp_epochs=5,
                  prototype_evidence_initial_alpha=0.05,
                  prototype_evidence_entropy_strength=1.0,
-                 prototype_evidence_gate_temperature=1.0):
+                 prototype_evidence_gate_temperature=1.0,
+                 wheel_prototypes_per_class=1,
+                 wheel_multi_prototype_temperature=0.2,
+                 wheel_multi_prototype_init_std=0.02,
+                 wheel_prototype_diversity_margin=0.5,
+                 prototype_loss_warmup_epochs=0,
+                 prototype_loss_ramp_epochs=0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -239,6 +245,8 @@ class Transformer_Based_Model(SDTBackbone):
                 or prototype_evidence_gate_temperature <= 0):
             raise ValueError(
                 "prototype evidence gate temperature must be finite and positive")
+        if prototype_loss_warmup_epochs < 0 or prototype_loss_ramp_epochs < 0:
+            raise ValueError("prototype loss schedule must be nonnegative")
         if prototype_evidence_fusion != "none":
             if not use_emotion_wheel:
                 raise ValueError(
@@ -313,6 +321,9 @@ class Transformer_Based_Model(SDTBackbone):
             prototype_evidence_entropy_strength)
         self.prototype_evidence_gate_temperature = float(
             prototype_evidence_gate_temperature)
+        self.prototype_loss_warmup_epochs = int(
+            prototype_loss_warmup_epochs)
+        self.prototype_loss_ramp_epochs = int(prototype_loss_ramp_epochs)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -329,7 +340,11 @@ class Transformer_Based_Model(SDTBackbone):
                 wheel_prototype_radius_mode,
                 wheel_prototype_radius_min,
                  wheel_prototype_radius_max,
-                 wheel_free_prototype_max_radius)
+                 wheel_free_prototype_max_radius,
+                 wheel_prototypes_per_class,
+                 wheel_multi_prototype_temperature,
+                 wheel_multi_prototype_init_std,
+                 wheel_prototype_diversity_margin)
         if wheel_uncertainty_mode != "none":
             self.wheel_uncertainty_heads = nn.ModuleDict({
                 name: WheelUncertaintyHead(
@@ -402,6 +417,7 @@ class Transformer_Based_Model(SDTBackbone):
         prototype_evidence_temperatures = None
         prototype_evidence_modality_entropy = None
         prototype_evidence_progress = self.prototype_evidence_progress()
+        prototype_loss_progress = self.prototype_loss_progress()
         if self.fusion_variant == "sdt":
             fusion_features = (pure_features
                                if self.fusion_feature_source == "pure"
@@ -421,6 +437,8 @@ class Transformer_Based_Model(SDTBackbone):
                     tical_features, u_mask.bool(),
                     query_enabled=self.tical_epoch > self.tical_warmup_epochs)
                 tical_output["feature_source"] = self.wheel_feature_source
+                tical_output["prototype_loss_progress"] = (
+                    prototype_loss_progress)
                 if self.wheel_uncertainty_mode != "none":
                     wheel_uncertainty = {
                         name: self.wheel_uncertainty_heads[name](
@@ -655,6 +673,7 @@ class Transformer_Based_Model(SDTBackbone):
             "prototype_evidence_effective_weight": (
                 self.prototype_evidence_weight
                 * prototype_evidence_progress),
+            "prototype_loss_progress": prototype_loss_progress,
         }
 
     def set_tical_epoch(self, epoch):
@@ -669,6 +688,21 @@ class Transformer_Based_Model(SDTBackbone):
         if self.wheel_uncertainty_ramp_epochs == 0:
             return 1.0
         return min(1.0, elapsed / self.wheel_uncertainty_ramp_epochs)
+
+    def prototype_loss_progress(self):
+        if not self.use_emotion_wheel:
+            return 0.0
+        # Preserve the pre-schedule behavior exactly for every existing
+        # configuration and unit test.
+        if (self.prototype_loss_warmup_epochs == 0
+                and self.prototype_loss_ramp_epochs == 0):
+            return 1.0
+        elapsed = self.tical_epoch - self.prototype_loss_warmup_epochs
+        if elapsed <= 0:
+            return 0.0
+        if self.prototype_loss_ramp_epochs == 0:
+            return 1.0
+        return min(1.0, elapsed / self.prototype_loss_ramp_epochs)
 
     def prototype_evidence_progress(self):
         if self.prototype_evidence_fusion == "none":

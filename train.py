@@ -106,6 +106,18 @@ def build_parser():
                         help="keep free prototypes away from the Poincare boundary")
     parser.add_argument("--lambda-wheel-alignment", type=float, default=0.0,
                         help="align modality-specific prototypes with shared semantic centers")
+    parser.add_argument("--wheel-prototypes-per-class", type=int, default=1,
+                        help="J prototypes per class and modality; J>1 requires modality-specific layout")
+    parser.add_argument("--wheel-multi-prototype-temperature", type=float,
+                        default=0.2, help="soft-min pooling and utilization temperature")
+    parser.add_argument("--wheel-multi-prototype-init-std", type=float,
+                        default=0.02, help="zero-mean tangent perturbation used to split J prototypes")
+    parser.add_argument("--wheel-prototype-diversity-margin", type=float,
+                        default=0.5, help="minimum within-class Poincare distance")
+    parser.add_argument("--lambda-wheel-diversity", type=float, default=0.0)
+    parser.add_argument("--lambda-wheel-utilization", type=float, default=0.0)
+    parser.add_argument("--prototype-loss-warmup-epochs", type=int, default=0)
+    parser.add_argument("--prototype-loss-ramp-epochs", type=int, default=0)
     parser.add_argument(
         "--prototype-evidence-fusion",
         choices=PROTOTYPE_EVIDENCE_FUSION_MODES, default="none",
@@ -127,6 +139,10 @@ def build_parser():
                         default=1.0,
                         help="downweight high-entropy modality evidence")
     parser.add_argument("--prototype-evidence-gate-temperature", type=float,
+                        default=1.0)
+    parser.add_argument("--lambda-prototype-selector", type=float, default=0.0,
+                        help="supervise alpha using detached SDT-vs-prototype CE advantage")
+    parser.add_argument("--prototype-selector-target-temperature", type=float,
                         default=1.0)
     parser.add_argument("--wheel-semantic-control",
                         choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
@@ -196,6 +212,10 @@ def build_parser():
                         help="synchronize and report phase timings for training epoch 1")
     parser.add_argument("--output-dir", default=str(BASE_DIR / "results"))
     parser.add_argument("--eval-checkpoint", help="evaluate a saved checkpoint; architecture/loss settings come from it")
+    parser.add_argument("--init-checkpoint",
+                        help="initialize a training run without restoring its optimizer/schedule")
+    parser.add_argument("--freeze-for-selector", action="store_true",
+                        help="freeze backbone/prototypes and train only prototype-evidence parameters")
     return parser
 
 
@@ -256,6 +276,16 @@ def make_model_config(args, dataset):
             "wheel_prototype_radius_max": args.wheel_prototype_radius_max,
             "wheel_free_prototype_max_radius": (
                 args.wheel_free_prototype_max_radius),
+            "wheel_prototypes_per_class": args.wheel_prototypes_per_class,
+            "wheel_multi_prototype_temperature": (
+                args.wheel_multi_prototype_temperature),
+            "wheel_multi_prototype_init_std": (
+                args.wheel_multi_prototype_init_std),
+            "wheel_prototype_diversity_margin": (
+                args.wheel_prototype_diversity_margin),
+            "prototype_loss_warmup_epochs": (
+                args.prototype_loss_warmup_epochs),
+            "prototype_loss_ramp_epochs": args.prototype_loss_ramp_epochs,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix,
             "wheel_semantic_control": args.wheel_semantic_control,
@@ -302,7 +332,11 @@ def make_criterion(args, device):
                        args.lambda_wheel_radius,
                        args.lambda_wheel_structure,
                        args.lambda_wheel_boundary,
-                       args.lambda_wheel_alignment).to(device)
+                       args.lambda_wheel_alignment,
+                       args.lambda_wheel_diversity,
+                       args.lambda_wheel_utilization,
+                       args.lambda_prototype_selector,
+                       args.prototype_selector_target_temperature).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -600,6 +634,12 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     if collect_predictions and not compute_loss:
         raise ValueError("prediction export requires compute_loss=True")
     model.train(training)
+    if training and getattr(model, "selector_only_training", False):
+        # Keep the frozen backbone deterministic while retaining dropout in
+        # the newly introduced selector/fusion heads.
+        model.eval()
+        if hasattr(model, "prototype_evidence_selector"):
+            model.prototype_evidence_selector.train()
     model.set_tical_epoch(epoch)
     totals, true, predicted, rows = {}, [], [], []
     sdt_only_predicted, prototype_only_predicted = [], []
@@ -672,9 +712,10 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                     optimizer.step()
                     # Query happened in forward against OLD banks. Insert the
                     # current detached batch only after the parameter update.
-                    tical_storage["anchors_added"] += (
-                        model.update_tical_anchors(
-                            output, labels, valid))
+                    if not getattr(model, "selector_only_training", False):
+                        tical_storage["anchors_added"] += (
+                            model.update_tical_anchors(
+                                output, labels, valid))
                 phase_started = profile_mark(
                     phase_started, "backward_step")
             else:
@@ -700,6 +741,17 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                 prototype_only_predicted.extend(
                     output["prototype_evidence_logits"][valid]
                     .argmax(dim=-1).cpu().tolist())
+            elif (output.get("tical") is not None
+                  and output["tical"].get("wheel_logits") is not None):
+                # A read-only diagnostic for no-fusion stages: it measures
+                # whether the prototype branch is strong enough to justify
+                # training the selector in the next stage.
+                uniform_prototype_logits = torch.stack([
+                    output["tical"]["wheel_logits"][name]
+                    for name in MODALITIES
+                ], dim=-1).mean(dim=-1)
+                prototype_only_predicted.extend(
+                    uniform_prototype_logits.argmax(dim=-1).cpu().tolist())
             if collect_predictions:
                 rows.extend(prediction_rows(batch[6], lengths, labels, prediction, output, errors))
             if profile_phases:
@@ -921,6 +973,11 @@ def main(argv=None):
             or args.lambda_wheel_structure < 0
             or args.lambda_wheel_boundary < 0
             or args.lambda_wheel_alignment < 0
+            or args.lambda_wheel_diversity < 0
+            or args.lambda_wheel_utilization < 0
+            or args.lambda_prototype_selector < 0
+            or args.prototype_loss_warmup_epochs < 0
+            or args.prototype_loss_ramp_epochs < 0
             or args.lambda_wheel_uncertainty < 0
             or args.wheel_uncertainty_hidden_dim < 1
             or args.wheel_uncertainty_warmup_epochs < 0
@@ -931,6 +988,18 @@ def main(argv=None):
             or args.prototype_evidence_ramp_epochs < 0
             or args.prototype_evidence_entropy_strength < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
+    if args.eval_checkpoint and args.init_checkpoint:
+        raise ValueError("--eval-checkpoint and --init-checkpoint are mutually exclusive")
+    if args.wheel_prototypes_per_class < 1:
+        raise ValueError("--wheel-prototypes-per-class must be positive")
+    if args.wheel_multi_prototype_temperature <= 0:
+        raise ValueError("--wheel-multi-prototype-temperature must be positive")
+    if (args.wheel_multi_prototype_init_std < 0
+            or args.wheel_prototype_diversity_margin < 0):
+        raise ValueError("multi-prototype initialization/margin must be nonnegative")
+    if args.prototype_selector_target_temperature <= 0:
+        raise ValueError(
+            "--prototype-selector-target-temperature must be positive")
     if not 0 <= args.anchor_conf_threshold <= 1:
         raise ValueError("--anchor-conf-threshold must be in [0,1]")
     for name in ("modality_prune_quantile", "sample_prune_quantile"):
@@ -953,12 +1022,18 @@ def main(argv=None):
             or args.lambda_wheel_structure > 0
             or args.lambda_wheel_boundary > 0
             or args.lambda_wheel_alignment > 0
+            or args.lambda_wheel_diversity > 0
+            or args.lambda_wheel_utilization > 0
+            or args.wheel_prototypes_per_class != 1
+            or args.prototype_loss_warmup_epochs != 0
+            or args.prototype_loss_ramp_epochs != 0
             or args.wheel_prototype_layout != "fixed-wheel"
             or args.wheel_prototype_radius_mode != "fixed-shared"
             or args.wheel_uncertainty_mode != "none"
             or args.lambda_wheel_uncertainty > 0
             or args.prototype_evidence_fusion != "none"
             or args.prototype_evidence_weight > 0
+            or args.lambda_prototype_selector > 0
             or args.wheel_semantic_control != "correct"
             or args.wheel_detach_features
             or args.wheel_feature_source != "pure"):
@@ -970,6 +1045,19 @@ def main(argv=None):
     elif args.prototype_evidence_weight <= 0:
         raise ValueError(
             "prototype evidence fusion requires --prototype-evidence-weight > 0")
+    if (args.lambda_prototype_selector > 0
+            and args.prototype_evidence_fusion != "calibrated"):
+        raise ValueError(
+            "supervised prototype selector requires calibrated fusion")
+    if args.freeze_for_selector:
+        if not args.init_checkpoint:
+            raise ValueError("--freeze-for-selector requires --init-checkpoint")
+        if args.prototype_evidence_fusion != "calibrated":
+            raise ValueError(
+                "--freeze-for-selector requires calibrated fusion")
+        if args.lambda_prototype_selector <= 0:
+            raise ValueError(
+                "--freeze-for-selector requires supervised selector loss")
     if not 0 < args.prototype_evidence_initial_alpha < 1:
         raise ValueError(
             "--prototype-evidence-initial-alpha must be in (0,1)")
@@ -1026,6 +1114,15 @@ def main(argv=None):
                 and args.lambda_wheel_alignment != 0):
             raise ValueError(
                 "--lambda-wheel-alignment requires modality-specific prototypes")
+        if (args.wheel_prototypes_per_class > 1
+                and args.wheel_prototype_layout != "modality-specific"):
+            raise ValueError(
+                "J>1 requires --wheel-prototype-layout modality-specific")
+        if (args.wheel_prototypes_per_class == 1
+                and (args.lambda_wheel_diversity != 0
+                     or args.lambda_wheel_utilization != 0)):
+            raise ValueError(
+                "diversity/utilization losses require J>1")
         if (args.wheel_prototype_radius_mode == "per-class-regularized"
                 and args.lambda_wheel_radius <= 0):
             raise ValueError(
@@ -1057,6 +1154,7 @@ def main(argv=None):
     seed_everything(args.seed)
     device = resolve_device(args)
     checkpoint = None
+    initial_checkpoint = None
     if args.eval_checkpoint:
         checkpoint = torch.load(args.eval_checkpoint, map_location="cpu", weights_only=True)
         args.dataset = checkpoint["model_config"]["dataset"]
@@ -1076,6 +1174,12 @@ def main(argv=None):
                      "wheel_prototype_radius_min",
                      "wheel_prototype_radius_max",
                       "wheel_free_prototype_max_radius",
+                     "wheel_prototypes_per_class",
+                     "wheel_multi_prototype_temperature",
+                     "wheel_multi_prototype_init_std",
+                     "wheel_prototype_diversity_margin",
+                     "prototype_loss_warmup_epochs",
+                     "prototype_loss_ramp_epochs",
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
@@ -1118,6 +1222,10 @@ def main(argv=None):
                      "lambda_wheel_cpcc", "lambda_wheel_radius",
                       "lambda_wheel_structure", "lambda_wheel_boundary",
                       "lambda_wheel_alignment",
+                     "lambda_wheel_diversity",
+                     "lambda_wheel_utilization",
+                     "lambda_prototype_selector",
+                     "prototype_selector_target_temperature",
                      "wheel_uncertainty_mode",
                      "lambda_wheel_uncertainty",
                      "wheel_uncertainty_hidden_dim",
@@ -1131,6 +1239,9 @@ def main(argv=None):
             saved_path = checkpoint["feature_path"]
             if Path(saved_path).is_file():
                 args.feature_path = saved_path
+    elif args.init_checkpoint:
+        initial_checkpoint = torch.load(
+            args.init_checkpoint, map_location="cpu", weights_only=True)
     dataset = DialogueDataset(args.dataset, args.feature_path)
     split_ids = split_dialogues(dataset, args.selection_protocol, args.valid_ratio)
     reliability_table = None
@@ -1146,6 +1257,41 @@ def main(argv=None):
     if checkpoint and split_ids != checkpoint["split_ids"]:
         raise ValueError("checkpoint dialogue split differs from the supplied feature pickle")
     model = Transformer_Based_Model(**model_config).to(device)
+    if initial_checkpoint is not None:
+        initial_config = initial_checkpoint.get("model_config", {})
+        for key, value in dataset.feature_dims.items():
+            if initial_config.get(key, value) != value:
+                raise ValueError(
+                    "initial checkpoint feature dimensions do not match dataset")
+        if ("split_ids" in initial_checkpoint
+                and initial_checkpoint["split_ids"] != split_ids):
+            raise ValueError(
+                "initial checkpoint dialogue split differs from current split")
+        incompatible = model.load_state_dict(
+            initial_checkpoint["model_state_dict"], strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        invalid_missing = [
+            name for name in incompatible.missing_keys
+            if not name.startswith("prototype_evidence_")]
+        if unexpected or invalid_missing:
+            raise ValueError(
+                "incompatible initial checkpoint; missing={}, unexpected={}".format(
+                    invalid_missing, unexpected))
+        print("Initialized from {} (new parameters: {})".format(
+            args.init_checkpoint, list(incompatible.missing_keys)), flush=True)
+    model.selector_only_training = bool(args.freeze_for_selector)
+    if args.freeze_for_selector:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        selected_parameters = []
+        for name, parameter in model.named_parameters():
+            if name.startswith("prototype_evidence_"):
+                parameter.requires_grad_(True)
+                selected_parameters.append(name)
+        if not selected_parameters:
+            raise RuntimeError("no prototype-evidence parameters to train")
+        print("Selector-only parameters: {}".format(
+            ", ".join(selected_parameters)), flush=True)
     criterion = make_criterion(args, device)
     loaders = make_loaders(
         dataset, split_ids, args.batch_size, args.seed, args.num_workers,
@@ -1203,6 +1349,14 @@ def main(argv=None):
         if prototype_fusion != "none":
             method_tag += "_protofusion_{}".format(
                 prototype_fusion.replace("-", "_"))
+        prototypes_per_class = model_config.get(
+            "wheel_prototypes_per_class", 1)
+        if prototypes_per_class > 1:
+            method_tag += "_j{}".format(prototypes_per_class)
+        if model_config.get("prototype_loss_ramp_epochs", 0) > 0:
+            method_tag += "_protoramp"
+        if args.freeze_for_selector:
+            method_tag += "_supervised_selector"
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
@@ -1229,8 +1383,12 @@ def main(argv=None):
         print(json.dumps(metrics, indent=2))
         return run_dir
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
+    optimizer = torch.optim.Adam(
+        [parameter for parameter in model.parameters()
+         if parameter.requires_grad],
+        lr=args.lr, weight_decay=args.l2)
     best_score, best_epoch = -1.0, 0
+    best_prototype_score, best_prototype_epoch = -1.0, 0
     history = []
     selection_split = "test" if args.selection_protocol == "test" else "valid"
     for epoch in range(1, args.epochs + 1):
@@ -1265,11 +1423,28 @@ def main(argv=None):
                         "args": vars(args), "epoch": epoch, "selection_metrics": selected_metrics,
                         "split_ids": split_ids, "feature_path": str(dataset.feature_path)},
                        run_dir / "best_checkpoint.pt")
+        prototype_score = selected_metrics.get(
+            "prototype_only_weighted_f1")
+        if (prototype_score is not None
+                and prototype_score > best_prototype_score):
+            best_prototype_score = prototype_score
+            best_prototype_epoch = epoch
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "model_config": model_config,
+                "args": vars(args),
+                "epoch": epoch,
+                "selection_metrics": selected_metrics,
+                "prototype_selection_metric": (
+                    "prototype_only_weighted_f1"),
+                "split_ids": split_ids,
+                "feature_path": str(dataset.feature_path),
+            }, run_dir / "best_prototype_checkpoint.pt")
         if args.use_tical:
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
-                  "wheel(proto/cpcc/radius/structure/align/boundary)="
-                  "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}; "
+                  "wheel(proto/cpcc/radius/structure/align/boundary/div/use/progress)="
+                  "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.2f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "protofusion(progress/max/alpha/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
@@ -1282,6 +1457,9 @@ def main(argv=None):
                 train_metrics.get("weighted_wheel_structure", 0.0),
                 train_metrics.get("weighted_wheel_alignment", 0.0),
                 train_metrics.get("weighted_wheel_boundary", 0.0),
+                train_metrics.get("weighted_wheel_diversity", 0.0),
+                train_metrics.get("weighted_wheel_utilization", 0.0),
+                train_metrics.get("prototype_loss_progress", 0.0),
                 train_metrics.get("weighted_wheel_uncertainty", 0.0),
                 train_metrics.get("wheel_uncertainty_progress", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),
@@ -1313,6 +1491,24 @@ def main(argv=None):
                                               max_batches=args.max_batches, collect_predictions=True,
                                               epoch=checkpoint.get("epoch", best_epoch))
     save_test_outputs(run_dir, metrics, rows, true, predicted, dataset.n_classes)
+    prototype_checkpoint_test = None
+    prototype_checkpoint_path = run_dir / "best_prototype_checkpoint.pt"
+    if prototype_checkpoint_path.is_file():
+        prototype_checkpoint = torch.load(
+            prototype_checkpoint_path, map_location=device,
+            weights_only=True)
+        model.load_state_dict(prototype_checkpoint["model_state_dict"])
+        model.set_tical_epoch(prototype_checkpoint.get(
+            "epoch", best_prototype_epoch))
+        prototype_checkpoint_test, _, _, _ = run_epoch(
+            model, criterion, loaders["test"], device,
+            max_batches=args.max_batches,
+            epoch=prototype_checkpoint.get(
+                "epoch", best_prototype_epoch), compute_loss=False)
+        # Summary geometry below describes the ordinary selection checkpoint,
+        # while stage 6 explicitly consumes best_prototype_checkpoint.pt.
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.set_tical_epoch(checkpoint.get("epoch", best_epoch))
     learned_radii = None
     learned_prototypes = None
     learned_modality_radii = None
@@ -1338,11 +1534,16 @@ def main(argv=None):
         "best_epoch": best_epoch,
         "selection_protocol": args.selection_protocol,
         "selection_weighted_f1": best_score,
+        "best_prototype_epoch": best_prototype_epoch,
+        "prototype_selection_weighted_f1": best_prototype_score,
+        "prototype_checkpoint_test": prototype_checkpoint_test,
         "test": metrics,
         "wheel_prototype_radius_mode": model_config.get(
             "wheel_prototype_radius_mode", "fixed-shared"),
         "wheel_prototype_layout": model_config.get(
             "wheel_prototype_layout", "fixed-wheel"),
+        "wheel_prototypes_per_class": model_config.get(
+            "wheel_prototypes_per_class", 1),
         "prototype_evidence_fusion": model_config.get(
             "prototype_evidence_fusion", "none"),
         "prototype_evidence_weight": model_config.get(

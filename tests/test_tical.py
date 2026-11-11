@@ -822,6 +822,84 @@ class TiCALTests(unittest.TestCase):
             Transformer_Based_Model(**{**self.config, "fusion_variant": "guided"},
                                     use_tical=True)
 
+    def test_j2_prototypes_softmin_barycenter_and_regularizers(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=32, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            wheel_prototypes_per_class=2)
+        model.set_tical_epoch(1)
+        output = model(*self.inputs)
+        for name in MODALITIES:
+            self.assertEqual(
+                model.tical.current_wheel_prototypes(name).shape,
+                (6, 2, 32))
+            self.assertEqual(
+                model.tical.current_wheel_prototype_barycenters(name).shape,
+                (6, 32))
+            self.assertEqual(
+                output["tical"]["wheel_subprototype_distances"][name].shape,
+                (5, 6, 2))
+            self.assertEqual(
+                output["tical"]["wheel_distances"][name].shape, (5, 6))
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=1.0, lambda_wheel_alignment=0.1,
+            lambda_wheel_diversity=0.1,
+            lambda_wheel_utilization=0.1)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(parts["wheel_utilization"].item(), 0.0)
+        loss.backward()
+        for name in MODALITIES:
+            gradient = model.tical.wheel_modality_prototype_tangents[name].grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_prototype_loss_warmup_and_ramp(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            prototype_loss_warmup_epochs=2,
+            prototype_loss_ramp_epochs=4)
+        expected = {1: 0.0, 2: 0.0, 3: 0.25, 4: 0.5, 6: 1.0}
+        for epoch, progress in expected.items():
+            model.set_tical_epoch(epoch)
+            self.assertEqual(model.prototype_loss_progress(), progress)
+            output = model(*self.inputs)
+            self.assertEqual(output["prototype_loss_progress"], progress)
+            self.assertEqual(
+                output["tical"]["prototype_loss_progress"], progress)
+
+    def test_supervised_prototype_selector_has_direct_gradient(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=8, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            wheel_prototypes_per_class=2,
+            prototype_evidence_fusion="calibrated",
+            prototype_evidence_weight=0.2,
+            prototype_evidence_warmup_epochs=0,
+            prototype_evidence_ramp_epochs=0)
+        model.set_tical_epoch(1)
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_prototype_selector=1.0)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertGreater(parts["prototype_selector"].item(), 0.0)
+        loss.backward()
+        gradients = [
+            parameter.grad for parameter in
+            model.prototype_evidence_selector.parameters()]
+        self.assertTrue(any(
+            gradient is not None and gradient.abs().sum().item() > 0
+            for gradient in gradients))
+
 
 if __name__ == "__main__":
     unittest.main()

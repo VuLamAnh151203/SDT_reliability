@@ -151,13 +151,19 @@ class SDTCOLDLoss(nn.Module):
                  lambda_wheel_radius=0.0,
                  lambda_wheel_structure=0.0,
                  lambda_wheel_boundary=0.0,
-                 lambda_wheel_alignment=0.0):
+                 lambda_wheel_alignment=0.0,
+                 lambda_wheel_diversity=0.0,
+                 lambda_wheel_utilization=0.0,
+                 lambda_prototype_selector=0.0,
+                 prototype_selector_target_temperature=1.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
                    lambda_wheel_cpcc, lambda_wheel_uncertainty,
                    lambda_wheel_radius, lambda_wheel_structure,
-                   lambda_wheel_boundary, lambda_wheel_alignment)
+                   lambda_wheel_boundary, lambda_wheel_alignment,
+                   lambda_wheel_diversity, lambda_wheel_utilization,
+                   lambda_prototype_selector)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -173,6 +179,15 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_wheel_structure = lambda_wheel_structure
         self.lambda_wheel_boundary = lambda_wheel_boundary
         self.lambda_wheel_alignment = lambda_wheel_alignment
+        self.lambda_wheel_diversity = lambda_wheel_diversity
+        self.lambda_wheel_utilization = lambda_wheel_utilization
+        self.lambda_prototype_selector = lambda_prototype_selector
+        if (not math.isfinite(prototype_selector_target_temperature)
+                or prototype_selector_target_temperature <= 0):
+            raise ValueError(
+                "prototype selector target temperature must be positive")
+        self.prototype_selector_target_temperature = float(
+            prototype_selector_target_temperature)
         if wheel_uncertainty_mode not in (
                 "none", "gate", "supervise", "full"):
             raise ValueError("unknown wheel uncertainty mode: {}".format(
@@ -278,16 +293,22 @@ class SDTCOLDLoss(nn.Module):
                 )
                 for name in MODALITIES
             ) / len(MODALITIES)
-        weighted_wheel_proto = self.lambda_wheel_proto * wheel_proto
+        prototype_loss_progress = float(outputs.get(
+            "prototype_loss_progress", 1.0))
+        weighted_wheel_proto = (
+            self.lambda_wheel_proto * prototype_loss_progress * wheel_proto)
         weighted_wheel_cpcc = self.lambda_wheel_cpcc * wheel_cpcc
         wheel_radius = zero
         if wheel_ready:
             wheel_radius = tical_output.get(
                 "wheel_radius_regularization", zero)
-        weighted_wheel_radius = self.lambda_wheel_radius * wheel_radius
+        weighted_wheel_radius = (
+            self.lambda_wheel_radius * prototype_loss_progress * wheel_radius)
         wheel_structure = zero
         wheel_alignment = zero
         wheel_boundary = zero
+        wheel_diversity = zero
+        wheel_utilization = zero
         if wheel_ready:
             wheel_structure = tical_output.get(
                 "wheel_prototype_structure", zero)
@@ -295,12 +316,47 @@ class SDTCOLDLoss(nn.Module):
                 "wheel_prototype_alignment", zero)
             wheel_boundary = tical_output.get(
                 "wheel_prototype_boundary", zero)
+            wheel_diversity = tical_output.get(
+                "wheel_prototype_diversity", zero)
+            subprototype_distances = tical_output.get(
+                "wheel_subprototype_distances")
+            if subprototype_distances is not None:
+                utilization_parts = []
+                pool_temperature = float(tical_output.get(
+                    "wheel_multi_prototype_temperature", 1.0))
+                for name in MODALITIES:
+                    distances = subprototype_distances.get(name)
+                    if distances is None:
+                        continue
+                    for class_index in range(distances.size(1)):
+                        class_mask = valid_targets == class_index
+                        if not class_mask.any():
+                            continue
+                        assignment = torch.softmax(
+                            -distances[class_mask, class_index]
+                            / pool_temperature, dim=-1).mean(dim=0)
+                        utilization_parts.append((
+                            assignment
+                            * (assignment.clamp_min(1e-12).log()
+                               + math.log(assignment.numel()))).sum())
+                if utilization_parts:
+                    wheel_utilization = sum(utilization_parts) / len(
+                        utilization_parts)
         weighted_wheel_structure = (
-            self.lambda_wheel_structure * wheel_structure)
+            self.lambda_wheel_structure * prototype_loss_progress
+            * wheel_structure)
         weighted_wheel_boundary = (
-            self.lambda_wheel_boundary * wheel_boundary)
+            self.lambda_wheel_boundary * prototype_loss_progress
+            * wheel_boundary)
         weighted_wheel_alignment = (
-            self.lambda_wheel_alignment * wheel_alignment)
+            self.lambda_wheel_alignment * prototype_loss_progress
+            * wheel_alignment)
+        weighted_wheel_diversity = (
+            self.lambda_wheel_diversity * prototype_loss_progress
+            * wheel_diversity)
+        weighted_wheel_utilization = (
+            self.lambda_wheel_utilization * prototype_loss_progress
+            * wheel_utilization)
         wheel_uncertainty = zero
         wheel_uncertainty_by_modality = {
             name: zero for name in MODALITIES}
@@ -339,13 +395,35 @@ class SDTCOLDLoss(nn.Module):
         weighted_wheel_uncertainty = (
             self.lambda_wheel_uncertainty * uncertainty_progress
             * wheel_uncertainty)
+        prototype_selector = zero
+        selector_alpha = outputs.get("prototype_evidence_alpha")
+        selector_logits = outputs.get("prototype_evidence_logits")
+        if (self.lambda_prototype_selector > 0
+                and selector_alpha is not None
+                and selector_logits is not None):
+            valid_sdt_ce = F.cross_entropy(
+                outputs["sdt_logits"][valid].detach(), valid_targets,
+                reduction="none")
+            valid_prototype_ce = F.cross_entropy(
+                selector_logits[valid].detach(), valid_targets,
+                reduction="none")
+            selector_target = torch.sigmoid(
+                (valid_sdt_ce - valid_prototype_ce)
+                / self.prototype_selector_target_temperature)
+            prototype_selector = F.binary_cross_entropy(
+                selector_alpha[valid], selector_target)
+        weighted_prototype_selector = (
+            self.lambda_prototype_selector * prototype_selector)
         total = (sdt + weighted_cold + weighted_reg
                  + weighted_reliability + weighted_hyp
                  + weighted_wheel_proto + weighted_wheel_cpcc
                  + weighted_wheel_radius
                  + weighted_wheel_structure + weighted_wheel_alignment
                  + weighted_wheel_boundary
-                 + weighted_wheel_uncertainty)
+                 + weighted_wheel_diversity
+                 + weighted_wheel_utilization
+                 + weighted_wheel_uncertainty
+                 + weighted_prototype_selector)
         sample_keep_rate = (torch.ones((), device=total.device) if sample_keep_mask is None
                             else sample_keep_mask[valid].float().mean())
         modality_keep_rate = (torch.ones((), device=total.device) if modality_keep_mask is None
@@ -366,6 +444,14 @@ class SDTCOLDLoss(nn.Module):
                   "weighted_wheel_alignment": weighted_wheel_alignment,
                   "wheel_boundary": wheel_boundary,
                   "weighted_wheel_boundary": weighted_wheel_boundary,
+                  "wheel_diversity": wheel_diversity,
+                  "weighted_wheel_diversity": weighted_wheel_diversity,
+                  "wheel_utilization": wheel_utilization,
+                  "weighted_wheel_utilization": weighted_wheel_utilization,
+                 "prototype_loss_progress": zero + prototype_loss_progress,
+                 "prototype_selector": prototype_selector,
+                 "weighted_prototype_selector": (
+                     weighted_prototype_selector),
                  "wheel_uncertainty": wheel_uncertainty,
                  "weighted_wheel_uncertainty": weighted_wheel_uncertainty,
                  "wheel_uncertainty_progress": zero + uncertainty_progress,

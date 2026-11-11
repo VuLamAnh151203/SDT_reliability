@@ -29,6 +29,8 @@ WHEEL_PROTOTYPE_LAYOUTS = (
     "fixed-wheel", "free", "modality-specific", "shared-private")
 WHEEL_PROTOTYPE_STRUCTURE_MODES = ("pairwise-mse", "ordinal")
 WHEEL_FREE_PROTOTYPE_INITS = ("wheel", "random")
+DATA_PROTOTYPE_LAYOUTS = ("shared", "modality-specific")
+DATA_PROTOTYPE_INITS = ("centroid", "random")
 EMOTION_WHEEL_ORDERS = {
     "IEMOCAP": (0, 4, 3, 5, 1, 2),
     "MELD": (4, 1, 2, 6, 5, 3, 0),
@@ -364,6 +366,10 @@ class TiCALModule(nn.Module):
                  wheel_free_prototype_init="wheel",
                  wheel_private_residual_init_std=0.02,
                  use_data_prototypes=False,
+                 data_prototype_layout="shared",
+                 data_prototype_init="centroid",
+                 data_prototype_initial_radius=0.3,
+                 replace_fixed_wheel_prototypes=False,
                  data_prototype_warmup_epochs=5,
                  data_prototype_ramp_epochs=10,
                  data_prototype_temperature=1.0):
@@ -450,6 +456,29 @@ class TiCALModule(nn.Module):
         self.use_data_prototypes = bool(use_data_prototypes)
         if self.use_data_prototypes and not self.use_emotion_wheel:
             raise ValueError("data prototypes require emotion-wheel mode")
+        if data_prototype_layout not in DATA_PROTOTYPE_LAYOUTS:
+            raise ValueError("unknown data prototype layout: {}".format(
+                data_prototype_layout))
+        self.data_prototype_layout = data_prototype_layout
+        if data_prototype_init not in DATA_PROTOTYPE_INITS:
+            raise ValueError("unknown data prototype initialization: {}".format(
+                data_prototype_init))
+        if (not math.isfinite(data_prototype_initial_radius)
+                or not 0 < data_prototype_initial_radius < 1 - self.hyp_eps):
+            raise ValueError(
+                "data prototype initial radius must be in (0,1-eps)")
+        self.data_prototype_init = data_prototype_init
+        self.data_prototype_initial_radius = float(
+            data_prototype_initial_radius)
+        self.replace_fixed_wheel_prototypes = bool(
+            replace_fixed_wheel_prototypes)
+        if self.replace_fixed_wheel_prototypes:
+            if not self.use_data_prototypes:
+                raise ValueError(
+                    "replacing fixed Wheel prototypes requires data prototypes")
+            if self.data_prototype_init != "random":
+                raise ValueError(
+                    "train-from-start replacement requires random initialization")
         self.data_prototype_warmup_epochs = int(
             data_prototype_warmup_epochs)
         self.data_prototype_ramp_epochs = int(data_prototype_ramp_epochs)
@@ -481,13 +510,21 @@ class TiCALModule(nn.Module):
         self.wheel_modality_prototype_tangents = nn.ParameterDict()
         self.wheel_modality_private_tangents = nn.ParameterDict()
         self.register_parameter("data_prototype_tangent", None)
+        data_bank_count = (len(MODALITIES)
+                           if self.data_prototype_layout == "modality-specific"
+                           else None)
+        centroid_shape = ((data_bank_count, n_classes, hyperbolic_dim)
+                          if data_bank_count is not None
+                          else (n_classes, hyperbolic_dim))
+        count_shape = ((data_bank_count, n_classes)
+                       if data_bank_count is not None else (n_classes,))
         self.register_buffer(
             "data_prototype_centroid_sum",
-            torch.zeros(n_classes, hyperbolic_dim),
+            torch.zeros(*centroid_shape),
             persistent=self.use_data_prototypes)
         self.register_buffer(
             "data_prototype_centroid_count",
-            torch.zeros(n_classes), persistent=self.use_data_prototypes)
+            torch.zeros(*count_shape), persistent=self.use_data_prototypes)
         self.register_buffer(
             "data_prototype_initialized",
             torch.tensor(False), persistent=self.use_data_prototypes)
@@ -553,7 +590,17 @@ class TiCALModule(nn.Module):
                 # This parameter is present before optimizer construction but
                 # receives no gradient until centroid initialization finishes.
                 self.data_prototype_tangent = nn.Parameter(
-                    torch.zeros(n_classes, hyperbolic_dim))
+                    torch.zeros(*centroid_shape))
+                if self.data_prototype_init == "random":
+                    random_direction = torch.randn(*centroid_shape)
+                    random_direction = random_direction / random_direction.norm(
+                        p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
+                    tangent_radius = math.atanh(
+                        self.data_prototype_initial_radius)
+                    with torch.no_grad():
+                        self.data_prototype_tangent.copy_(
+                            tangent_radius * random_direction)
+                        self.data_prototype_initialized.fill_(True)
             initial_norm = self.wheel_prototypes.norm(
                 p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
             wheel_initial_tangent = (
@@ -683,22 +730,33 @@ class TiCALModule(nn.Module):
         self.data_prototype_initialized.fill_(True)
         return True
 
-    def current_data_prototypes(self):
+    def current_data_prototypes(self, modality=None):
         if (not self.use_data_prototypes
                 or not bool(self.data_prototype_initialized)):
             return None
-        return self._exp_map_free_prototypes(self.data_prototype_tangent)
+        tangent = self.data_prototype_tangent
+        if self.data_prototype_layout == "modality-specific":
+            if modality not in MODALITIES:
+                raise ValueError(
+                    "modality-specific data prototypes require t/a/v")
+            tangent = tangent[MODALITIES.index(modality)]
+        return self._exp_map_free_prototypes(tangent)
 
     def data_prototype_cpcc_loss(self):
         """Correlate learned prototype distances with semantic Wheel order."""
-        prototypes = self.current_data_prototypes()
-        if prototypes is None:
+        if not bool(self.data_prototype_initialized):
             return self.wheel_prototypes.sum() * 0.0
-        labels = torch.arange(
-            prototypes.size(0), device=prototypes.device)
-        return geometry_cpcc_loss(
-            prototypes, labels, "poincare", self.typicality_eps,
-            self.hyp_eps, self.wheel_class_distances)
+        modalities = (MODALITIES if self.data_prototype_layout
+                      == "modality-specific" else (None,))
+        losses = []
+        for name in modalities:
+            prototypes = self.current_data_prototypes(name)
+            labels = torch.arange(
+                prototypes.size(0), device=prototypes.device)
+            losses.append(geometry_cpcc_loss(
+                prototypes, labels, "poincare", self.typicality_eps,
+                self.hyp_eps, self.wheel_class_distances))
+        return sum(losses) / len(losses)
 
     def _exp_map_free_prototypes(self, tangent):
         """Map arbitrary tangent parameters safely into the Poincare ball."""
@@ -1020,6 +1078,10 @@ class TiCALModule(nn.Module):
                   "wheel_subprototype_distances": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
                   "data_prototype_enabled": self.use_data_prototypes,
+                  "data_prototype_layout": self.data_prototype_layout,
+                  "data_prototype_init": self.data_prototype_init,
+                  "replace_fixed_wheel_prototypes": (
+                      self.replace_fixed_wheel_prototypes),
                   "data_prototype_ready": bool(
                       self.data_prototype_initialized),
                   "data_prototype_progress": (
@@ -1042,12 +1104,16 @@ class TiCALModule(nn.Module):
             wheel_pseudo, prototype_tau = {}, {}
             wheel_subprototype_distances = {}
             for name in MODALITIES:
+                primary_prototypes = (
+                    self.current_data_prototypes(name)
+                    if self.replace_fixed_wheel_prototypes
+                    else self.current_wheel_prototypes(name))
                 (wheel_distances[name], wheel_logits[name],
                  wheel_pseudo[name], prototype_tau[name],
                  wheel_subprototype_distances[name]) = (
                     self.wheel_prototype_outputs(
                         projected[name][valid],
-                        self.current_wheel_prototypes(name)))
+                        primary_prototypes))
                 if self.detach_tau:
                     prototype_tau[name] = prototype_tau[name].detach()
             result.update({
@@ -1058,10 +1124,13 @@ class TiCALModule(nn.Module):
                 "wheel_pseudo_labels": wheel_pseudo,
                 "prototype_tau": prototype_tau,
             })
-            data_prototypes = self.current_data_prototypes()
-            if data_prototypes is not None:
+            if self.replace_fixed_wheel_prototypes:
+                result["data_prototype_distances"] = wheel_distances
+                result["data_prototype_logits"] = wheel_logits
+            elif bool(self.data_prototype_initialized):
                 data_distances, data_logits = {}, {}
                 for name in MODALITIES:
+                    data_prototypes = self.current_data_prototypes(name)
                     (data_distances[name], data_logits[name], _, _, _) = (
                         self.wheel_prototype_outputs(
                             projected[name][valid], data_prototypes))
@@ -1124,17 +1193,24 @@ class TiCALModule(nn.Module):
         if (self.use_data_prototypes
                 and not bool(self.data_prototype_initialized)):
             valid_labels = labels[valid_mask.bool()]
-            for name in MODALITIES:
+            for modality_index, name in enumerate(MODALITIES):
                 valid_projected = projected[name][valid_mask.bool()].detach()
                 tangent = poincare_log_map(
                     torch.zeros_like(valid_projected), valid_projected,
                     self.hyp_eps)
-                self.data_prototype_centroid_sum.index_add_(
-                    0, valid_labels, tangent)
-                self.data_prototype_centroid_count.index_add_(
+                if self.data_prototype_layout == "modality-specific":
+                    centroid_sum = self.data_prototype_centroid_sum[
+                        modality_index]
+                    centroid_count = self.data_prototype_centroid_count[
+                        modality_index]
+                else:
+                    centroid_sum = self.data_prototype_centroid_sum
+                    centroid_count = self.data_prototype_centroid_count
+                centroid_sum.index_add_(0, valid_labels, tangent)
+                centroid_count.index_add_(
                     0, valid_labels,
-                    torch.ones_like(valid_labels, dtype=(
-                        self.data_prototype_centroid_count.dtype)))
+                    torch.ones_like(
+                        valid_labels, dtype=centroid_count.dtype))
             if self.data_prototype_epoch > self.data_prototype_warmup_epochs:
                 self._initialize_data_prototypes()
         confidence, prediction = probability.max(dim=-1)

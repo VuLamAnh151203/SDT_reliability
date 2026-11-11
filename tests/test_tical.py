@@ -411,6 +411,99 @@ class TiCALTests(unittest.TestCase):
         module.set_epoch(15)
         self.assertEqual(module.data_prototype_progress(), 1.0)
 
+    def test_modality_data_banks_use_independent_centroids_and_gradients(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="fixed-wheel",
+            use_data_prototypes=True,
+            data_prototype_layout="modality-specific",
+            data_prototype_warmup_epochs=0,
+            data_prototype_ramp_epochs=0)
+        model.train()
+        model.set_tical_epoch(1)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 2]])
+        full_mask = torch.ones_like(self.mask)
+        full_inputs = (*self.inputs[:3], full_mask, self.inputs[4], [3, 3])
+        first = model(*full_inputs)
+        model.update_tical_anchors(first, labels, full_mask.bool())
+
+        banks = {
+            name: model.tical.current_data_prototypes(name)
+            for name in MODALITIES
+        }
+        self.assertTrue(all(bank.shape == (6, 16)
+                            for bank in banks.values()))
+        self.assertFalse(torch.allclose(banks["t"], banks["a"]))
+        self.assertFalse(torch.allclose(banks["t"], banks["v"]))
+        output = model(*full_inputs)
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_data_prototype=0.02,
+            lambda_data_prototype_cpcc=0.01)
+        loss, _, _ = criterion(output, labels, full_mask.bool())
+        loss.backward()
+        gradient = model.tical.data_prototype_tangent.grad
+        self.assertEqual(gradient.shape, (3, 6, 16))
+        for modality_index in range(len(MODALITIES)):
+            self.assertGreater(
+                gradient[modality_index].abs().sum().item(), 0.0)
+
+    def test_learned_wheel_prototypes_train_from_start_in_full_dimension(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="fixed-wheel",
+            use_data_prototypes=True,
+            data_prototype_layout="modality-specific",
+            data_prototype_init="random",
+            data_prototype_initial_radius=0.3,
+            replace_fixed_wheel_prototypes=True,
+            data_prototype_warmup_epochs=0,
+            data_prototype_ramp_epochs=0)
+        model.train()
+        model.set_tical_epoch(1)
+        self.assertTrue(bool(model.tical.data_prototype_initialized))
+        self.assertEqual(model.tical.data_prototype_progress(), 1.0)
+        self.assertEqual(
+            model.tical.data_prototype_centroid_count.sum().item(), 0.0)
+        for name in MODALITIES:
+            prototypes = model.tical.current_data_prototypes(name)
+            torch.testing.assert_close(
+                prototypes.norm(dim=-1), torch.full((6,), 0.3),
+                atol=1e-6, rtol=1e-6)
+            self.assertGreater(prototypes[:, 2:].abs().sum().item(), 0.0)
+
+        output = model(*self.inputs)
+        valid = self.mask.bool()
+        for name in MODALITIES:
+            expected = poincare_distance(
+                output["tical"]["projected"][name][valid].unsqueeze(1),
+                model.tical.current_data_prototypes(name).unsqueeze(0))
+            torch.testing.assert_close(
+                output["tical"]["wheel_distances"][name], expected)
+            self.assertIs(
+                output["tical"]["data_prototype_logits"][name],
+                output["tical"]["wheel_logits"][name])
+
+        labels = torch.tensor([[0, 4, 3], [5, 1, 2]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=0.1, lambda_wheel_cpcc=0.05,
+            lambda_data_prototype=0,
+            lambda_data_prototype_cpcc=0.01)
+        loss, parts, _ = criterion(output, labels, valid)
+        self.assertGreater(parts["weighted_wheel_proto"].item(), 0.0)
+        self.assertGreater(parts["weighted_data_prototype_cpcc"].item(), 0.0)
+        loss.backward()
+        gradient = model.tical.data_prototype_tangent.grad
+        self.assertIsNotNone(gradient)
+        for modality_index in range(len(MODALITIES)):
+            self.assertGreater(
+                gradient[modality_index].abs().sum().item(), 0.0)
+
     def test_free_prototype_losses_enter_total_objective(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

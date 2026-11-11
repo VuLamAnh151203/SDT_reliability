@@ -202,6 +202,10 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_free_prototype_init="wheel",
                  wheel_private_residual_init_std=0.02,
                  use_data_prototypes=False,
+                 data_prototype_layout="shared",
+                 data_prototype_init="centroid",
+                 data_prototype_initial_radius=0.3,
+                 replace_fixed_wheel_prototypes=False,
                  data_prototype_warmup_epochs=5,
                  data_prototype_ramp_epochs=10,
                  data_prototype_temperature=1.0):
@@ -359,6 +363,10 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_free_prototype_init,
                  wheel_private_residual_init_std,
                  use_data_prototypes,
+                 data_prototype_layout,
+                 data_prototype_init,
+                 data_prototype_initial_radius,
+                 replace_fixed_wheel_prototypes,
                  data_prototype_warmup_epochs,
                  data_prototype_ramp_epochs,
                  data_prototype_temperature)

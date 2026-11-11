@@ -21,7 +21,9 @@ from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
-from tical import (WHEEL_FREE_PROTOTYPE_INITS, WHEEL_PROTOTYPE_LAYOUTS,
+from tical import (DATA_PROTOTYPE_INITS, DATA_PROTOTYPE_LAYOUTS,
+                   WHEEL_FREE_PROTOTYPE_INITS,
+                   WHEEL_PROTOTYPE_LAYOUTS,
                    WHEEL_PROTOTYPE_RADIUS_MODES,
                    WHEEL_PROTOTYPE_STRUCTURE_MODES,
                    WHEEL_SEMANTIC_CONTROLS)
@@ -140,6 +142,18 @@ def build_parser():
     parser.add_argument(
         "--use-data-prototypes", action="store_true",
         help="add a learned full-D class-prototype bank beside fixed Wheel anchors")
+    parser.add_argument(
+        "--data-prototype-layout", choices=DATA_PROTOTYPE_LAYOUTS,
+        default="shared",
+        help="one shared data bank or one independently learned bank per modality")
+    parser.add_argument(
+        "--data-prototype-init", choices=DATA_PROTOTYPE_INITS,
+        default="centroid")
+    parser.add_argument("--data-prototype-initial-radius", type=float,
+                        default=0.3)
+    parser.add_argument(
+        "--replace-fixed-wheel-prototypes", action="store_true",
+        help="use learned data banks as the primary Wheel Prototype CE anchors")
     parser.add_argument("--lambda-data-prototype", type=float, default=0.0,
                         help="CE weight for the learned data prototype bank")
     parser.add_argument("--lambda-data-prototype-cpcc", type=float, default=0.0,
@@ -323,6 +337,12 @@ def make_model_config(args, dataset):
                 args.prototype_loss_warmup_epochs),
             "prototype_loss_ramp_epochs": args.prototype_loss_ramp_epochs,
             "use_data_prototypes": args.use_data_prototypes,
+            "data_prototype_layout": args.data_prototype_layout,
+            "data_prototype_init": args.data_prototype_init,
+            "data_prototype_initial_radius": (
+                args.data_prototype_initial_radius),
+            "replace_fixed_wheel_prototypes": (
+                args.replace_fixed_wheel_prototypes),
             "data_prototype_warmup_epochs": (
                 args.data_prototype_warmup_epochs),
             "data_prototype_ramp_epochs": args.data_prototype_ramp_epochs,
@@ -1054,6 +1074,9 @@ def main(argv=None):
         raise ValueError("ordinal margin/private residual init must be nonnegative")
     if args.data_prototype_temperature <= 0:
         raise ValueError("--data-prototype-temperature must be positive")
+    if not 0 < args.data_prototype_initial_radius < 1 - args.hyp_eps:
+        raise ValueError(
+            "--data-prototype-initial-radius must be in (0,1-hyp-eps)")
     if args.eval_checkpoint and args.init_checkpoint:
         raise ValueError("--eval-checkpoint and --init-checkpoint are mutually exclusive")
     if args.wheel_prototypes_per_class < 1:
@@ -1122,6 +1145,13 @@ def main(argv=None):
           or args.lambda_data_prototype_cpcc != 0):
         raise ValueError(
             "data prototype loss weights require --use-data-prototypes")
+    if args.replace_fixed_wheel_prototypes:
+        if not args.use_data_prototypes:
+            raise ValueError(
+                "--replace-fixed-wheel-prototypes requires data prototypes")
+        if args.data_prototype_init != "random":
+            raise ValueError(
+                "train-from-start replacement requires random initialization")
     if args.prototype_evidence_fusion == "none":
         if args.prototype_evidence_weight != 0:
             raise ValueError(
@@ -1275,6 +1305,10 @@ def main(argv=None):
                      "prototype_loss_warmup_epochs",
                      "prototype_loss_ramp_epochs",
                      "use_data_prototypes",
+                     "data_prototype_layout",
+                     "data_prototype_init",
+                     "data_prototype_initial_radius",
+                     "replace_fixed_wheel_prototypes",
                      "data_prototype_warmup_epochs",
                      "data_prototype_ramp_epochs",
                      "data_prototype_temperature",
@@ -1451,7 +1485,13 @@ def main(argv=None):
         if model_config.get("wheel_detach_features", False):
             method_tag += "_detachwheel"
         if model_config.get("use_data_prototypes", False):
-            method_tag += "_dualdata"
+            method_tag += ("_learnedwheel"
+                           if model_config.get(
+                               "replace_fixed_wheel_prototypes", False)
+                           else "_dualdata")
+            if (model_config.get("data_prototype_layout", "shared")
+                    == "modality-specific"):
+                method_tag += "_modality"
         method_tag += "_d{}".format(model_config["hyperbolic_dim"])
         if model_config.get("wheel_uncertainty_mode", "none") != "none":
             method_tag += "_unc_{}".format(
@@ -1658,13 +1698,27 @@ def main(argv=None):
                 for name in MODALITIES
             }
         if model_config.get("use_data_prototypes", False):
-            data_prototypes = model.tical.current_data_prototypes()
-            if data_prototypes is not None:
-                learned_data_prototypes = (
-                    data_prototypes.detach().cpu().tolist())
-            data_prototype_counts = (
-                model.tical.data_prototype_centroid_count.detach()
-                .cpu().tolist())
+            if (model_config.get("data_prototype_layout", "shared")
+                    == "modality-specific"):
+                if bool(model.tical.data_prototype_initialized):
+                    learned_data_prototypes = {
+                        name: model.tical.current_data_prototypes(
+                            name).detach().cpu().tolist()
+                        for name in MODALITIES
+                    }
+                data_prototype_counts = {
+                    name: model.tical.data_prototype_centroid_count[index]
+                    .detach().cpu().tolist()
+                    for index, name in enumerate(MODALITIES)
+                }
+            else:
+                data_prototypes = model.tical.current_data_prototypes()
+                if data_prototypes is not None:
+                    learned_data_prototypes = (
+                        data_prototypes.detach().cpu().tolist())
+                data_prototype_counts = (
+                    model.tical.data_prototype_centroid_count.detach()
+                    .cpu().tolist())
     write_json(run_dir / "summary.json", {
         "best_epoch": best_epoch,
         "selection_protocol": args.selection_protocol,
@@ -1696,6 +1750,12 @@ def main(argv=None):
         "learned_private_tangent_residuals": learned_private_residuals,
         "use_data_prototypes": model_config.get(
             "use_data_prototypes", False),
+        "data_prototype_layout": model_config.get(
+            "data_prototype_layout", "shared"),
+        "data_prototype_init": model_config.get(
+            "data_prototype_init", "centroid"),
+        "replace_fixed_wheel_prototypes": model_config.get(
+            "replace_fixed_wheel_prototypes", False),
         "learned_data_prototypes": learned_data_prototypes,
         "data_prototype_centroid_counts": data_prototype_counts,
         "smoke_test": args.max_batches > 0,

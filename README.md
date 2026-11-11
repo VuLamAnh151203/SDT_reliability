@@ -108,11 +108,16 @@ final_logits[c] = sdt_logits[c]
                 + beta(t) * sum_m gate[u,c,m] * prototype_logits[u,c,m]
 ```
 
-`gate[u,c,m]` được softmax theo modality, phụ thuộc cả utterance và class.
-Lớp cuối của gate được khởi tạo bằng zero nên ban đầu gate chính xác là
-`1/3, 1/3, 1/3`. `beta(t)` bằng zero trong warm-up rồi tăng tuyến tính để giữ
-SDT baseline ổn định ở đầu training. Runner đầy đủ mặc định dùng D=32,
-`beta_max=0.20`, warm-up 5 epoch và ramp 5 epoch:
+Runner mặc định dùng mode `calibrated`: raw prototype logits được temperature
+calibration riêng cho T/A/V, rồi gate sử dụng class log-probability, modality
+entropy và một class/modality bias nhỏ. Selective selector `alpha[u]` đọc
+entropy/confidence của ba prototype branches và SDT. Nó khởi tạo ở `0.05` và
+có thể học về zero nếu prototype evidence gây hại, khi đó prediction trở lại
+SDT. `beta(t)` vẫn bằng zero trong warm-up rồi tăng tuyến tính.
+
+Runner đầy đủ mặc định dùng D=32, `beta_max=0.20`, `initial_alpha=0.05`,
+warm-up 5 epoch và ramp 5 epoch. Vì vậy residual thực tế lúc mới bật chỉ có
+maximum scale `0.20 * 0.05 = 0.01`:
 
 ```bash
 bash SDT_new/exec_iemocap_wheel_modality_prototype_fusion.sh \
@@ -126,18 +131,25 @@ GPU_SLOT=0 \
 bash SDT_new/run_iemocap_modality_proto_fusion_interactive_1gpu.sh
 ```
 
-Để chạy ablation chỉ trung bình ba prototype-logit banks mà không học gate:
+Để tái hiện MLP class-wise gate cũ hoặc chạy uniform ablation:
 
 ```bash
+PROTOTYPE_EVIDENCE_FUSION=class-wise \
+bash SDT_new/run_iemocap_modality_proto_fusion_interactive_1gpu.sh
+
 PROTOTYPE_EVIDENCE_FUSION=uniform \
 bash SDT_new/run_iemocap_modality_proto_fusion_interactive_1gpu.sh
 ```
 
 Các biến override gồm `PROTOTYPE_EVIDENCE_WEIGHT`,
 `PROTOTYPE_EVIDENCE_HIDDEN_DIM`, `PROTOTYPE_EVIDENCE_WARMUP_EPOCHS` và
-`PROTOTYPE_EVIDENCE_RAMP_EPOCHS`. `epoch_metrics.csv` ghi progress, effective
-weight, gate entropy và mean gate weight T/A/V; `test_predictions.csv` ghi gate
-weight của class được dự đoán cho từng utterance.
+`PROTOTYPE_EVIDENCE_RAMP_EPOCHS`. Calibrated mode còn hỗ trợ
+`PROTOTYPE_EVIDENCE_INITIAL_ALPHA`, `PROTOTYPE_EVIDENCE_ENTROPY_STRENGTH` và
+`PROTOTYPE_EVIDENCE_GATE_TEMPERATURE`. `epoch_metrics.csv` ghi alpha,
+temperature, entropy và mean gate weight T/A/V; `test_predictions.csv` ghi
+alpha cùng gate weight của class được dự đoán cho từng utterance.
+Mỗi epoch cũng báo cáo `sdt_only_*` và `prototype_only_*`, cho phép phân biệt
+backbone bị ảnh hưởng với trường hợp chỉ riêng residual fusion làm giảm điểm.
 
 Nếu allocation hiện tại có hai GPU, chọn GPU thứ hai bằng
 `GPU_SLOT=1`. Script chọn theo vị trí trong `CUDA_VISIBLE_DEVICES` do Slurm

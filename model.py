@@ -16,7 +16,8 @@ FUSION_FEATURE_SOURCES = ("enhanced", "pure")
 WHEEL_FEATURE_SOURCES = ("pure", "enhanced")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 WHEEL_UNCERTAINTY_MODES = ("none", "gate", "supervise", "full")
-PROTOTYPE_EVIDENCE_FUSION_MODES = ("none", "uniform", "class-wise")
+PROTOTYPE_EVIDENCE_FUSION_MODES = (
+    "none", "uniform", "class-wise", "calibrated")
 
 
 def poincare_log_map_zero(points, eps=1e-5):
@@ -70,6 +71,31 @@ class PrototypeEvidenceGate(nn.Module):
 
     def forward(self, projected_features):
         return self.network(projected_features)
+
+
+class PrototypeEvidenceSelector(nn.Module):
+    """Predict whether prototype evidence should modify one SDT prediction."""
+
+    def __init__(self, input_dim, hidden_dim, dropout, initial_alpha):
+        super().__init__()
+        if min(input_dim, hidden_dim) < 1:
+            raise ValueError("prototype evidence selector dimensions must be positive")
+        if not 0.0 < initial_alpha < 1.0:
+            raise ValueError("initial prototype evidence alpha must be in (0, 1)")
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.constant_(
+            self.network[-1].bias,
+            math.log(initial_alpha / (1.0 - initial_alpha)))
+
+    def forward(self, reliability_features):
+        return torch.sigmoid(
+            self.network(reliability_features).squeeze(-1))
 
 
 class DistributionHead(nn.Module):
@@ -161,7 +187,10 @@ class Transformer_Based_Model(SDTBackbone):
                  prototype_evidence_weight=0.0,
                  prototype_evidence_hidden_dim=32,
                  prototype_evidence_warmup_epochs=5,
-                 prototype_evidence_ramp_epochs=5):
+                 prototype_evidence_ramp_epochs=5,
+                 prototype_evidence_initial_alpha=0.05,
+                 prototype_evidence_entropy_strength=1.0,
+                 prototype_evidence_gate_temperature=1.0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -200,6 +229,16 @@ class Transformer_Based_Model(SDTBackbone):
                 or prototype_evidence_warmup_epochs < 0
                 or prototype_evidence_ramp_epochs < 0):
             raise ValueError("invalid prototype evidence fusion schedule")
+        if not 0.0 < prototype_evidence_initial_alpha < 1.0:
+            raise ValueError("prototype evidence initial alpha must be in (0,1)")
+        if (not math.isfinite(prototype_evidence_entropy_strength)
+                or prototype_evidence_entropy_strength < 0):
+            raise ValueError(
+                "prototype evidence entropy strength must be finite and nonnegative")
+        if (not math.isfinite(prototype_evidence_gate_temperature)
+                or prototype_evidence_gate_temperature <= 0):
+            raise ValueError(
+                "prototype evidence gate temperature must be finite and positive")
         if prototype_evidence_fusion != "none":
             if not use_emotion_wheel:
                 raise ValueError(
@@ -268,6 +307,12 @@ class Transformer_Based_Model(SDTBackbone):
             prototype_evidence_warmup_epochs)
         self.prototype_evidence_ramp_epochs = int(
             prototype_evidence_ramp_epochs)
+        self.prototype_evidence_initial_alpha = float(
+            prototype_evidence_initial_alpha)
+        self.prototype_evidence_entropy_strength = float(
+            prototype_evidence_entropy_strength)
+        self.prototype_evidence_gate_temperature = float(
+            prototype_evidence_gate_temperature)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -298,6 +343,20 @@ class Transformer_Based_Model(SDTBackbone):
                     n_classes, dropout)
                 for name in MODALITIES
             })
+        elif prototype_evidence_fusion == "calibrated":
+            # Positive modality temperatures calibrate the three hyperbolic
+            # distance classifiers before their evidence is compared.
+            self.prototype_evidence_log_temperatures = nn.Parameter(
+                torch.zeros(len(MODALITIES)))
+            # Only C x M parameters encode stable class/modality preferences.
+            self.prototype_evidence_class_bias = nn.Parameter(
+                torch.zeros(n_classes, len(MODALITIES)))
+            # Features: entropy and maximum probability for every modality,
+            # followed by the same two confidence statistics from SDT.
+            self.prototype_evidence_selector = PrototypeEvidenceSelector(
+                2 * len(MODALITIES) + 2,
+                prototype_evidence_hidden_dim, dropout,
+                prototype_evidence_initial_alpha)
         if fusion_variant in ("guided", "replace"):
             self.distribution_heads = nn.ModuleDict({
                 name: DistributionHead(
@@ -339,6 +398,9 @@ class Transformer_Based_Model(SDTBackbone):
         prototype_evidence_modality_logits = None
         prototype_evidence_weights = None
         prototype_evidence_logits = None
+        prototype_evidence_alpha = None
+        prototype_evidence_temperatures = None
+        prototype_evidence_modality_entropy = None
         prototype_evidence_progress = self.prototype_evidence_progress()
         if self.fusion_variant == "sdt":
             fusion_features = (pure_features
@@ -447,18 +509,80 @@ class Transformer_Based_Model(SDTBackbone):
                 and tical_output is not None
                 and tical_output.get("wheel_logits") is not None):
             valid = u_mask.bool()
-            valid_modality_logits = torch.stack([
+            raw_valid_modality_logits = torch.stack([
                 tical_output["wheel_logits"][name]
                 for name in MODALITIES
             ], dim=-1)
             prototype_evidence_modality_logits = sdt_logits.new_zeros(
                 *sdt_logits.shape, len(MODALITIES))
+            if self.prototype_evidence_fusion == "calibrated":
+                prototype_evidence_temperatures = (
+                    self.prototype_evidence_log_temperatures.exp()
+                    .clamp(0.05, 20.0))
+                calibrated_valid_logits = (
+                    raw_valid_modality_logits
+                    / prototype_evidence_temperatures.view(1, 1, -1))
+                valid_modality_logits = F.log_softmax(
+                    calibrated_valid_logits, dim=1)
+                valid_probabilities = valid_modality_logits.exp()
+                valid_entropy = -(
+                    valid_probabilities * valid_modality_logits
+                ).sum(dim=1) / math.log(self.n_classes)
+                prototype_evidence_modality_entropy = (
+                    sdt_logits.new_zeros(
+                        *sdt_logits.shape[:-1], len(MODALITIES)))
+                prototype_evidence_modality_entropy[valid] = valid_entropy
+
+                # Confidence statistics are detached so the selector cannot
+                # make a modality artificially overconfident merely to raise
+                # its own residual strength.
+                detached_entropy = valid_entropy.detach()
+                detached_maximum = valid_probabilities.max(
+                    dim=1).values.detach()
+                valid_sdt_probabilities = F.softmax(
+                    sdt_logits[valid], dim=-1)
+                valid_sdt_log_probabilities = valid_sdt_probabilities.clamp_min(
+                    1e-12).log()
+                valid_sdt_entropy = -(
+                    valid_sdt_probabilities * valid_sdt_log_probabilities
+                ).sum(dim=-1, keepdim=True) / math.log(self.n_classes)
+                valid_sdt_maximum = valid_sdt_probabilities.max(
+                    dim=-1, keepdim=True).values
+                selector_features = torch.cat((
+                    detached_entropy,
+                    detached_maximum,
+                    valid_sdt_entropy.detach(),
+                    valid_sdt_maximum.detach(),
+                ), dim=-1)
+                valid_alpha = self.prototype_evidence_selector(
+                    selector_features)
+                prototype_evidence_alpha = sdt_logits.new_zeros(
+                    *sdt_logits.shape[:-1])
+                prototype_evidence_alpha[valid] = valid_alpha
+
+                gate_scores = (
+                    valid_modality_logits
+                    - self.prototype_evidence_entropy_strength
+                    * detached_entropy.unsqueeze(1)
+                    + self.prototype_evidence_class_bias.unsqueeze(0))
+                valid_weights = torch.softmax(
+                    gate_scores
+                    / self.prototype_evidence_gate_temperature,
+                    dim=-1)
+                prototype_evidence_weights = sdt_logits.new_full(
+                    (*sdt_logits.shape, len(MODALITIES)),
+                    1.0 / len(MODALITIES))
+                prototype_evidence_weights[valid] = valid_weights
+            else:
+                valid_modality_logits = raw_valid_modality_logits
+                prototype_evidence_alpha = sdt_logits.new_ones(
+                    *sdt_logits.shape[:-1])
             prototype_evidence_modality_logits[valid] = valid_modality_logits
             if self.prototype_evidence_fusion == "uniform":
                 prototype_evidence_weights = sdt_logits.new_full(
                     (*sdt_logits.shape, len(MODALITIES)),
                     1.0 / len(MODALITIES))
-            else:
+            elif self.prototype_evidence_fusion == "class-wise":
                 gate_scores = torch.stack([
                     self.prototype_evidence_gates[name](
                         tical_output["projected"][name])
@@ -478,6 +602,7 @@ class Transformer_Based_Model(SDTBackbone):
                 sdt_logits
                 + self.prototype_evidence_weight
                 * prototype_evidence_progress
+                * prototype_evidence_alpha.unsqueeze(-1)
                 * prototype_evidence_logits)
         return {
             "logits": logits,
@@ -521,6 +646,11 @@ class Transformer_Based_Model(SDTBackbone):
                 prototype_evidence_modality_logits),
             "prototype_evidence_weights": prototype_evidence_weights,
             "prototype_evidence_logits": prototype_evidence_logits,
+            "prototype_evidence_alpha": prototype_evidence_alpha,
+            "prototype_evidence_temperatures": (
+                prototype_evidence_temperatures),
+            "prototype_evidence_modality_entropy": (
+                prototype_evidence_modality_entropy),
             "prototype_evidence_progress": prototype_evidence_progress,
             "prototype_evidence_effective_weight": (
                 self.prototype_evidence_weight

@@ -120,6 +120,14 @@ def build_parser():
                         default=5)
     parser.add_argument("--prototype-evidence-ramp-epochs", type=int,
                         default=5)
+    parser.add_argument("--prototype-evidence-initial-alpha", type=float,
+                        default=0.05,
+                        help="initial selective residual strength in calibrated mode")
+    parser.add_argument("--prototype-evidence-entropy-strength", type=float,
+                        default=1.0,
+                        help="downweight high-entropy modality evidence")
+    parser.add_argument("--prototype-evidence-gate-temperature", type=float,
+                        default=1.0)
     parser.add_argument("--wheel-semantic-control",
                         choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
                         help="correct semantic Wheel or a non-isometric random label permutation")
@@ -269,7 +277,13 @@ def make_model_config(args, dataset):
             "prototype_evidence_warmup_epochs": (
                 args.prototype_evidence_warmup_epochs),
             "prototype_evidence_ramp_epochs": (
-                args.prototype_evidence_ramp_epochs)}
+                args.prototype_evidence_ramp_epochs),
+            "prototype_evidence_initial_alpha": (
+                args.prototype_evidence_initial_alpha),
+            "prototype_evidence_entropy_strength": (
+                args.prototype_evidence_entropy_strength),
+            "prototype_evidence_gate_temperature": (
+                args.prototype_evidence_gate_temperature)}
 
 
 def make_criterion(args, device):
@@ -349,6 +363,18 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
                 (-(correct_class_weights
                    * correct_class_weights.clamp_min(1e-12).log())
                  .sum(dim=-1)).detach().cpu())
+            prototype_alpha = output.get("prototype_evidence_alpha")
+            if prototype_alpha is not None:
+                storage.setdefault("prototype_evidence_alpha", []).append(
+                    prototype_alpha[valid].detach().cpu())
+            modality_entropy = output.get(
+                "prototype_evidence_modality_entropy")
+            if modality_entropy is not None:
+                for index, name in enumerate(MODALITIES):
+                    storage.setdefault(
+                        "prototype_evidence_entropy_" + name, []).append(
+                            modality_entropy[..., index][valid]
+                            .detach().cpu())
     if not tical["ready"]:
         return
     for name in MODALITIES:
@@ -412,6 +438,18 @@ def _tical_epoch_metrics(storage, model, utterance_count):
             result["prototype_evidence_gate_entropy"] = 0.0
             for name in MODALITIES:
                 result["prototype_evidence_weight_{}".format(name)] = 0.0
+            if getattr(
+                    model, "prototype_evidence_fusion", "none") == "calibrated":
+                result["prototype_evidence_alpha_mean"] = 0.0
+                result["prototype_evidence_alpha_std"] = 0.0
+                result["prototype_evidence_actual_weight_mean"] = 0.0
+                temperatures = (
+                    model.prototype_evidence_log_temperatures.detach()
+                    .exp().clamp(0.05, 20.0).cpu())
+                for index, name in enumerate(MODALITIES):
+                    result["prototype_evidence_temperature_{}".format(name)] = (
+                        temperatures[index].item())
+                    result["prototype_evidence_entropy_{}".format(name)] = 0.0
     for group in ("low", "medium", "high"):
         result["kappa_{}_frac".format(group)] = 0.0
         result["kappa_{}_accuracy".format(group)] = 0.0
@@ -486,6 +524,21 @@ def _tical_epoch_metrics(storage, model, utterance_count):
                     result["prototype_evidence_weight_{}".format(name)] = (
                         values["prototype_evidence_weight_" + name]
                         .float().mean().item())
+            alpha_key = "prototype_evidence_alpha"
+            if alpha_key in values:
+                alpha = values[alpha_key].float()
+                result["prototype_evidence_alpha_mean"] = alpha.mean().item()
+                result["prototype_evidence_alpha_std"] = alpha.std(
+                    unbiased=False).item()
+                result["prototype_evidence_actual_weight_mean"] = (
+                    model.prototype_evidence_weight
+                    * model.prototype_evidence_progress()
+                    * alpha.mean().item())
+                for name in MODALITIES:
+                    entropy_key = "prototype_evidence_entropy_" + name
+                    if entropy_key in values:
+                        result["prototype_evidence_entropy_{}".format(name)] = (
+                            values[entropy_key].float().mean().item())
     if not storage["kappa"]:
         return result
     n_ready = int(values["kappa"].numel())
@@ -549,6 +602,7 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     model.train(training)
     model.set_tical_epoch(epoch)
     totals, true, predicted, rows = {}, [], [], []
+    sdt_only_predicted, prototype_only_predicted = [], []
     tical_storage = {"tau_" + name: [] for name in MODALITIES}
     tical_storage.update({"pseudo_" + name: [] for name in MODALITIES})
     tical_storage.update({"anchor_tau_" + name: [] for name in MODALITIES})
@@ -634,11 +688,18 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
             for name, value in parts.items():
                 totals[name] = totals.get(name, 0.0) + value.detach().item() * n_valid
             prediction = output["logits"].argmax(dim=-1)
+            sdt_only_prediction = output["sdt_logits"].argmax(dim=-1)
             if compute_loss:
                 _collect_tical_batch(
                     tical_storage, output, labels, prediction, valid)
             true.extend(labels[valid].cpu().tolist())
             predicted.extend(prediction[valid].cpu().tolist())
+            sdt_only_predicted.extend(
+                sdt_only_prediction[valid].cpu().tolist())
+            if output.get("prototype_evidence_logits") is not None:
+                prototype_only_predicted.extend(
+                    output["prototype_evidence_logits"][valid]
+                    .argmax(dim=-1).cpu().tolist())
             if collect_predictions:
                 rows.extend(prediction_rows(batch[6], lengths, labels, prediction, output, errors))
             if profile_phases:
@@ -652,7 +713,26 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     metrics.update({"accuracy": 100.0 * accuracy_score(true, predicted),
                     "weighted_f1": 100.0 * f1_score(true, predicted, average="weighted", zero_division=0),
                     "macro_f1": 100.0 * f1_score(true, predicted, average="macro", zero_division=0),
+                    "sdt_only_accuracy": 100.0 * accuracy_score(
+                        true, sdt_only_predicted),
+                    "sdt_only_weighted_f1": 100.0 * f1_score(
+                        true, sdt_only_predicted, average="weighted",
+                        zero_division=0),
+                    "sdt_only_macro_f1": 100.0 * f1_score(
+                        true, sdt_only_predicted, average="macro",
+                        zero_division=0),
                     "utterances": count})
+    if len(prototype_only_predicted) == len(true):
+        metrics.update({
+            "prototype_only_accuracy": 100.0 * accuracy_score(
+                true, prototype_only_predicted),
+            "prototype_only_weighted_f1": 100.0 * f1_score(
+                true, prototype_only_predicted, average="weighted",
+                zero_division=0),
+            "prototype_only_macro_f1": 100.0 * f1_score(
+                true, prototype_only_predicted, average="macro",
+                zero_division=0),
+        })
     if compute_loss:
         metrics.update(_tical_epoch_metrics(tical_storage, model, count))
     if profile_phases:
@@ -681,6 +761,9 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
     wheel_uncertainty_scales = output.get("wheel_uncertainty_scales")
     prototype_evidence_weights = output.get("prototype_evidence_weights")
     prototype_evidence_logits = output.get("prototype_evidence_logits")
+    prototype_evidence_alpha = output.get("prototype_evidence_alpha")
+    prototype_evidence_entropy = output.get(
+        "prototype_evidence_modality_entropy")
     if reliability is not None:
         reliability = reliability.detach().cpu()
     if variance_norm is not None:
@@ -696,6 +779,11 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
     if prototype_evidence_weights is not None:
         prototype_evidence_weights = prototype_evidence_weights.detach().cpu()
         prototype_evidence_logits = prototype_evidence_logits.detach().cpu()
+        if prototype_evidence_alpha is not None:
+            prototype_evidence_alpha = prototype_evidence_alpha.detach().cpu()
+        if prototype_evidence_entropy is not None:
+            prototype_evidence_entropy = (
+                prototype_evidence_entropy.detach().cpu())
     students = {m: output["student_logits"][m].detach().argmax(dim=-1).cpu() for m in MODALITIES}
     errors = {m: value.detach().cpu() for m, value in errors.items()}
     tical = output.get("tical")
@@ -746,6 +834,13 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
                     row["prototype_evidence_weight_" + name] = float(
                         prototype_evidence_weights[
                             batch_index, index, predicted_class, modal_index])
+                    if prototype_evidence_entropy is not None:
+                        row["prototype_evidence_entropy_" + name] = float(
+                            prototype_evidence_entropy[
+                                batch_index, index, modal_index])
+                if prototype_evidence_alpha is not None:
+                    row["prototype_evidence_alpha"] = float(
+                        prototype_evidence_alpha[batch_index, index])
             for modal_index, name in enumerate(MODALITIES):
                 row[name + "_prediction"] = int(students[name][batch_index, index])
                 row[name + "_gate_mean"] = float(gate[batch_index, index, modal_index])
@@ -833,7 +928,8 @@ def main(argv=None):
             or args.prototype_evidence_weight < 0
             or args.prototype_evidence_hidden_dim < 1
             or args.prototype_evidence_warmup_epochs < 0
-            or args.prototype_evidence_ramp_epochs < 0):
+            or args.prototype_evidence_ramp_epochs < 0
+            or args.prototype_evidence_entropy_strength < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
     if not 0 <= args.anchor_conf_threshold <= 1:
         raise ValueError("--anchor-conf-threshold must be in [0,1]")
@@ -874,6 +970,12 @@ def main(argv=None):
     elif args.prototype_evidence_weight <= 0:
         raise ValueError(
             "prototype evidence fusion requires --prototype-evidence-weight > 0")
+    if not 0 < args.prototype_evidence_initial_alpha < 1:
+        raise ValueError(
+            "--prototype-evidence-initial-alpha must be in (0,1)")
+    if args.prototype_evidence_gate_temperature <= 0:
+        raise ValueError(
+            "--prototype-evidence-gate-temperature must be positive")
     if args.wheel_uncertainty_mode != "none":
         if args.wheel_geometry != "poincare":
             raise ValueError("wheel uncertainty requires Poincare geometry")
@@ -989,7 +1091,10 @@ def main(argv=None):
                      "prototype_evidence_weight",
                      "prototype_evidence_hidden_dim",
                      "prototype_evidence_warmup_epochs",
-                     "prototype_evidence_ramp_epochs"):
+                     "prototype_evidence_ramp_epochs",
+                     "prototype_evidence_initial_alpha",
+                     "prototype_evidence_entropy_strength",
+                     "prototype_evidence_gate_temperature"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -1166,7 +1271,7 @@ def main(argv=None):
                   "wheel(proto/cpcc/radius/structure/align/boundary)="
                   "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
-                  "protofusion(progress/effective/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
+                  "protofusion(progress/max/alpha/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
                 selected_metrics["weighted_f1"], train_metrics["original_distillation"],
@@ -1184,6 +1289,7 @@ def main(argv=None):
                 train_metrics.get("wheel_uncertainty_weight_v", 0.0),
                 train_metrics.get("prototype_evidence_progress", 0.0),
                 train_metrics.get("prototype_evidence_effective_weight", 0.0),
+                train_metrics.get("prototype_evidence_alpha_mean", 0.0),
                 train_metrics.get("prototype_evidence_weight_t", 0.0),
                 train_metrics.get("prototype_evidence_weight_a", 0.0),
                 train_metrics.get("prototype_evidence_weight_v", 0.0),

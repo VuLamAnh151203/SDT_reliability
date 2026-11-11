@@ -459,6 +459,66 @@ class TiCALTests(unittest.TestCase):
             self.assertIsNotNone(prototype_gradient)
             self.assertGreater(prototype_gradient.abs().sum().item(), 0.0)
 
+    def test_calibrated_prototype_fusion_is_selective_and_trainable(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            prototype_evidence_fusion="calibrated",
+            prototype_evidence_weight=0.2,
+            prototype_evidence_hidden_dim=5,
+            prototype_evidence_warmup_epochs=0,
+            prototype_evidence_ramp_epochs=0,
+            prototype_evidence_initial_alpha=0.05,
+            prototype_evidence_entropy_strength=1.0)
+        model.set_tical_epoch(1)
+        output = model(*self.inputs)
+        valid = self.mask.bool()
+        torch.testing.assert_close(
+            output["prototype_evidence_temperatures"],
+            torch.ones(3))
+        torch.testing.assert_close(
+            output["prototype_evidence_alpha"][valid],
+            torch.full_like(
+                output["prototype_evidence_alpha"][valid], 0.05),
+            atol=1e-7, rtol=0)
+        weights = output["prototype_evidence_weights"][valid]
+        torch.testing.assert_close(
+            weights.sum(dim=-1), torch.ones_like(weights[..., 0]))
+        self.assertFalse(torch.allclose(
+            weights, torch.full_like(weights, 1 / 3)))
+        torch.testing.assert_close(
+            output["logits"],
+            output["sdt_logits"]
+            + 0.2
+            * output["prototype_evidence_alpha"].unsqueeze(-1)
+            * output["prototype_evidence_logits"])
+
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        F.cross_entropy(
+            output["logits"][valid], labels[valid]).backward()
+        self.assertGreater(
+            model.prototype_evidence_class_bias.grad.abs().sum().item(), 0.0)
+        self.assertGreater(
+            model.prototype_evidence_log_temperatures.grad.abs().sum().item(),
+            0.0)
+        selector_gradient = (
+            model.prototype_evidence_selector.network[-1].weight.grad)
+        self.assertIsNotNone(selector_gradient)
+        self.assertGreater(selector_gradient.abs().sum().item(), 0.0)
+        for name in MODALITIES:
+            gradient = model.tical.wheel_modality_prototype_tangents[name].grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+        model.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            model.prototype_evidence_selector.network[-1].bias.fill_(-20.0)
+        disabled = model(*self.inputs)
+        torch.testing.assert_close(
+            disabled["logits"], disabled["sdt_logits"],
+            atol=2e-8, rtol=0)
+
     def test_per_class_radius_regularization_enters_total_loss(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

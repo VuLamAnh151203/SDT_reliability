@@ -708,7 +708,8 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
                     loss.backward()
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), grad_clip)
+                            model.parameters(), grad_clip,
+                            error_if_nonfinite=True)
                     optimizer.step()
                     # Query happened in forward against OLD banks. Insert the
                     # current detached batch only after the parameter update.

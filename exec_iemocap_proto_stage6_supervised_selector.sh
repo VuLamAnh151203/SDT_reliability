@@ -40,4 +40,5 @@ exec bash "$SCRIPT_DIR/exec_iemocap_wheel_modality_prototypes.sh" \
   --prototype-selector-target-temperature "${PROTOTYPE_SELECTOR_TARGET_TEMPERATURE:-1.0}" \
   --init-checkpoint "$INIT_CHECKPOINT" \
   --freeze-for-selector \
+  --grad-clip "${PROTO_GRAD_CLIP:-1.0}" \
   "$@"

@@ -55,7 +55,21 @@ class GeometryProjector(nn.Module):
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, features):
+        if not torch.isfinite(features).all():
+            raise FloatingPointError(
+                "nonfinite input features to {} projector".format(
+                    self.geometry))
+        if not torch.isfinite(self.linear.weight).all():
+            raise FloatingPointError(
+                "nonfinite {} projector weight".format(self.geometry))
+        if (self.linear.bias is not None
+                and not torch.isfinite(self.linear.bias).all()):
+            raise FloatingPointError(
+                "nonfinite {} projector bias".format(self.geometry))
         tangent = self.linear(features)
+        if not torch.isfinite(tangent).all():
+            raise FloatingPointError(
+                "nonfinite {} projector tangent".format(self.geometry))
         # Apply this constraint in tangent space so dimensions 3..D cannot
         # influence the Poincare/spherical normalization or receive gradients
         # indirectly through its norm.  The result is a 2-D representation

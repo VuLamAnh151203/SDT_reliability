@@ -12,4 +12,5 @@ exec bash "$SCRIPT_DIR/exec_iemocap_wheel_modality_prototypes.sh" \
   --wheel-prototypes-per-class 1 \
   --prototype-loss-warmup-epochs 0 \
   --prototype-loss-ramp-epochs 0 \
+  --grad-clip "${PROTO_GRAD_CLIP:-1.0}" \
   "$@"

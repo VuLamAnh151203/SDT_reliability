@@ -20,7 +20,7 @@ from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
 from geometry_analysis.geometry import GEOMETRIES, RADIUS_MODES
-from tical import (WHEEL_PROTOTYPE_RADIUS_MODES,
+from tical import (WHEEL_PROTOTYPE_LAYOUTS, WHEEL_PROTOTYPE_RADIUS_MODES,
                    WHEEL_SEMANTIC_CONTROLS)
 
 
@@ -62,12 +62,16 @@ def build_parser():
     parser.add_argument("--beta-gate", type=float, default=1.0)
     parser.add_argument("--lambda-hyp", type=float, default=0.1)
     parser.add_argument("--use-emotion-wheel", action="store_true",
-                        help="constrain TiCAL with fixed hyperbolic emotion-wheel prototypes")
+                        help="constrain TiCAL with hyperbolic emotion-wheel prototypes")
     parser.add_argument(
         "--wheel-feature-source", choices=WHEEL_FEATURE_SOURCES,
         default="pure",
         help="pure=H_TT/H_AA/H_VV; enhanced=H'_T/H'_A/H'_V")
     parser.add_argument("--wheel-prototype-radius", type=float, default=0.75)
+    parser.add_argument(
+        "--wheel-prototype-layout", choices=WHEEL_PROTOTYPE_LAYOUTS,
+        default="fixed-wheel",
+        help="fixed-wheel keeps semantic coordinates; free learns every prototype coordinate")
     parser.add_argument(
         "--wheel-prototype-radius-mode",
         choices=WHEEL_PROTOTYPE_RADIUS_MODES, default="fixed-shared",
@@ -76,6 +80,9 @@ def build_parser():
                         default=0.20)
     parser.add_argument("--wheel-prototype-radius-max", type=float,
                         default=0.90)
+    parser.add_argument("--wheel-free-prototype-max-radius", type=float,
+                        default=0.95,
+                        help="soft boundary threshold for free Poincare prototypes")
     parser.add_argument("--wheel-geometry", choices=GEOMETRIES, default="poincare",
                         help="controlled wheel geometry ablation")
     parser.add_argument("--wheel-radius-mode", choices=RADIUS_MODES,
@@ -92,6 +99,10 @@ def build_parser():
     parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
     parser.add_argument("--lambda-wheel-radius", type=float, default=0.0,
                         help="keep learned per-class prototype radii near their initial value")
+    parser.add_argument("--lambda-wheel-structure", type=float, default=0.0,
+                        help="match free-prototype relative distances to the emotion wheel")
+    parser.add_argument("--lambda-wheel-boundary", type=float, default=0.0,
+                        help="keep free prototypes away from the Poincare boundary")
     parser.add_argument("--wheel-semantic-control",
                         choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
                         help="correct semantic Wheel or a non-isometric random label permutation")
@@ -213,10 +224,13 @@ def make_model_config(args, dataset):
             "wheel_fixed_radius": args.wheel_fixed_radius,
             "wheel_zero_residual": args.wheel_zero_residual,
             "wheel_prototype_radius": args.wheel_prototype_radius,
+            "wheel_prototype_layout": args.wheel_prototype_layout,
             "wheel_prototype_radius_mode": (
                 args.wheel_prototype_radius_mode),
             "wheel_prototype_radius_min": args.wheel_prototype_radius_min,
             "wheel_prototype_radius_max": args.wheel_prototype_radius_max,
+            "wheel_free_prototype_max_radius": (
+                args.wheel_free_prototype_max_radius),
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix,
             "wheel_semantic_control": args.wheel_semantic_control,
@@ -246,7 +260,9 @@ def make_criterion(args, device):
                        args.lambda_wheel_cpcc,
                        args.wheel_uncertainty_mode,
                        args.lambda_wheel_uncertainty,
-                       args.lambda_wheel_radius).to(device)
+                       args.lambda_wheel_radius,
+                       args.lambda_wheel_structure,
+                       args.lambda_wheel_boundary).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -735,6 +751,8 @@ def main(argv=None):
             or args.consistency_k < 0 or args.lambda_wheel_proto < 0
             or args.lambda_wheel_cpcc < 0
             or args.lambda_wheel_radius < 0
+            or args.lambda_wheel_structure < 0
+            or args.lambda_wheel_boundary < 0
             or args.lambda_wheel_uncertainty < 0
             or args.wheel_uncertainty_hidden_dim < 1
             or args.wheel_uncertainty_warmup_epochs < 0
@@ -759,6 +777,9 @@ def main(argv=None):
     if not args.use_emotion_wheel and (
             args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0
             or args.lambda_wheel_radius > 0
+            or args.lambda_wheel_structure > 0
+            or args.lambda_wheel_boundary > 0
+            or args.wheel_prototype_layout != "fixed-wheel"
             or args.wheel_prototype_radius_mode != "fixed-shared"
             or args.wheel_uncertainty_mode != "none"
             or args.lambda_wheel_uncertainty > 0
@@ -800,6 +821,17 @@ def main(argv=None):
                 and args.wheel_geometry != "poincare"):
             raise ValueError(
                 "learnable prototype radii require --wheel-geometry poincare")
+        if args.wheel_prototype_layout == "free":
+            if args.wheel_geometry != "poincare":
+                raise ValueError(
+                    "free prototypes require --wheel-geometry poincare")
+            if args.wheel_prototype_radius_mode != "fixed-shared":
+                raise ValueError(
+                    "free prototypes cannot use learned prototype-radius modes")
+        elif (args.lambda_wheel_structure != 0
+              or args.lambda_wheel_boundary != 0):
+            raise ValueError(
+                "structure/boundary losses require --wheel-prototype-layout free")
         if (args.wheel_prototype_radius_mode == "per-class-regularized"
                 and args.lambda_wheel_radius <= 0):
             raise ValueError(
@@ -811,6 +843,9 @@ def main(argv=None):
                 "--lambda-wheel-radius is only used by per-class-regularized")
         if args.wheel_temperature <= 0:
             raise ValueError("--wheel-temperature must be positive")
+        if not (0 < args.wheel_free_prototype_max_radius < 1 - args.hyp_eps):
+            raise ValueError(
+                "--wheel-free-prototype-max-radius must be in (0, 1-hyp-eps)")
         if not 0 <= args.wheel_anchor_mix <= 1:
             raise ValueError("--wheel-anchor-mix must be in [0,1]")
         if args.wheel_fixed_radius <= 0:
@@ -842,9 +877,11 @@ def main(argv=None):
                      "consistency_t", "consistency_k", "beta_gate",
                      "use_emotion_wheel", "wheel_prototype_radius",
                      "wheel_feature_source",
+                      "wheel_prototype_layout",
                      "wheel_prototype_radius_mode",
                      "wheel_prototype_radius_min",
                      "wheel_prototype_radius_max",
+                      "wheel_free_prototype_max_radius",
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
@@ -866,15 +903,18 @@ def main(argv=None):
                      "no_detach_tau", "no_detach_kappa", "use_emotion_wheel",
                      "wheel_feature_source",
                      "wheel_prototype_radius", "wheel_temperature",
+                      "wheel_prototype_layout",
                      "wheel_prototype_radius_mode",
                      "wheel_prototype_radius_min",
                      "wheel_prototype_radius_max",
+                      "wheel_free_prototype_max_radius",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
                       "wheel_semantic_control", "wheel_permutation_seed",
                       "wheel_detach_features",
                      "wheel_anchor_mix", "lambda_wheel_proto",
                      "lambda_wheel_cpcc", "lambda_wheel_radius",
+                      "lambda_wheel_structure", "lambda_wheel_boundary",
                      "wheel_uncertainty_mode",
                      "lambda_wheel_uncertainty",
                      "wheel_uncertainty_hidden_dim",
@@ -935,6 +975,10 @@ def main(argv=None):
                 str(model_config.get("wheel_fixed_radius", 0.75)).replace(".", "p"))
         prototype_radius_mode = model_config.get(
             "wheel_prototype_radius_mode", "fixed-shared")
+        prototype_layout = model_config.get(
+            "wheel_prototype_layout", "fixed-wheel")
+        if prototype_layout == "free":
+            method_tag += "_freeproto"
         if prototype_radius_mode != "fixed-shared":
             method_tag += "_proto_{}".format(
                 prototype_radius_mode.replace("-", "_"))
@@ -1014,7 +1058,8 @@ def main(argv=None):
         if args.use_tical:
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
-                  "wheel(proto/cpcc/radius)={:.4f}/{:.4f}/{:.4f}; "
+                  "wheel(proto/cpcc/radius/structure/boundary)="
+                  "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
@@ -1023,6 +1068,8 @@ def main(argv=None):
                 train_metrics["weighted_wheel_proto"],
                 train_metrics["weighted_wheel_cpcc"],
                 train_metrics.get("weighted_wheel_radius", 0.0),
+                train_metrics.get("weighted_wheel_structure", 0.0),
+                train_metrics.get("weighted_wheel_boundary", 0.0),
                 train_metrics.get("weighted_wheel_uncertainty", 0.0),
                 train_metrics.get("wheel_uncertainty_progress", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),
@@ -1049,10 +1096,13 @@ def main(argv=None):
                                               epoch=checkpoint.get("epoch", best_epoch))
     save_test_outputs(run_dir, metrics, rows, true, predicted, dataset.n_classes)
     learned_radii = None
+    learned_prototypes = None
     if model_config.get("use_emotion_wheel"):
         learned_radii = model.tical.current_wheel_prototype_radii()
         learned_radii = [float(value) for value in
                          learned_radii.detach().cpu().tolist()]
+        learned_prototypes = model.tical.current_wheel_prototypes()
+        learned_prototypes = learned_prototypes.detach().cpu().tolist()
     write_json(run_dir / "summary.json", {
         "best_epoch": best_epoch,
         "selection_protocol": args.selection_protocol,
@@ -1060,7 +1110,10 @@ def main(argv=None):
         "test": metrics,
         "wheel_prototype_radius_mode": model_config.get(
             "wheel_prototype_radius_mode", "fixed-shared"),
+        "wheel_prototype_layout": model_config.get(
+            "wheel_prototype_layout", "fixed-wheel"),
         "learned_prototype_radii": learned_radii,
+        "learned_prototypes": learned_prototypes,
         "smoke_test": args.max_batches > 0,
     })
     print("Best epoch: {}; test accuracy={:.2f}, weighted F1={:.2f}".format(

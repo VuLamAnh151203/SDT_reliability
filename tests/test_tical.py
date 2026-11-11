@@ -248,6 +248,61 @@ class TiCALTests(unittest.TestCase):
         self.assertTrue((radii < 0.90).all())
         self.assertGreater(radii.std().item(), 0.0)
 
+    def test_free_wheel_prototypes_use_all_dimensions_and_receive_gradients(self):
+        module = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=6, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_layout="free",
+            wheel_free_prototype_max_radius=0.90)
+        self.assertEqual(
+            module.wheel_free_prototype_tangent.shape, (6, 6))
+        initial = module.current_wheel_prototypes()
+        torch.testing.assert_close(initial, module.wheel_prototypes)
+        self.assertTrue((initial.norm(dim=-1) < 1.0).all())
+
+        # Residual coordinates are genuine parameters rather than a fixed
+        # two-dimensional plane.
+        with torch.no_grad():
+            module.wheel_free_prototype_tangent[:, 2:] = torch.linspace(
+                -0.3, 0.3, 24).reshape(6, 4)
+        learned = module.current_wheel_prototypes()
+        self.assertGreater(learned[:, 2:].abs().sum().item(), 0.0)
+        self.assertTrue((learned.norm(dim=-1) < 1.0).all())
+
+        structure = module.wheel_prototype_structure_loss()
+        self.assertTrue(torch.isfinite(structure))
+        structure.backward()
+        gradient = module.wheel_free_prototype_tangent.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_free_prototype_losses_enter_total_objective(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_layout="free",
+            wheel_free_prototype_max_radius=0.70)
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_hyp=0, lambda_wheel_proto=1.0,
+            lambda_wheel_cpcc=0, lambda_wheel_structure=0.5,
+            lambda_wheel_boundary=0.25)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        torch.testing.assert_close(
+            loss,
+            parts["weighted_wheel_proto"]
+            + parts["weighted_wheel_structure"]
+            + parts["weighted_wheel_boundary"])
+        self.assertGreater(parts["wheel_boundary"].item(), 0.0)
+        loss.backward()
+        gradient = model.tical.wheel_free_prototype_tangent.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
     def test_per_class_radius_regularization_enters_total_loss(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

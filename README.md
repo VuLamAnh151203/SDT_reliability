@@ -31,6 +31,44 @@ Kế hoạch, công thức và checklist kiểm thử nằm trong
 `KE_HOACH_SDT_TICAL_EMOTION_WHEEL.md`. Các mode TiCAL cũ không đổi khi không
 truyền `--use-emotion-wheel`.
 
+## Emotion Wheel với prototype Poincaré tự do
+
+```bash
+bash SDT_new/exec_iemocap_wheel_free_prototypes.sh --device cuda --gpu-id 0
+```
+
+Mode `--wheel-prototype-layout free` học một tangent vector `C x D` cho mỗi
+emotion và dùng exponential map tại gốc để prototype luôn nằm trong
+Poincaré ball. Prototype được khởi tạo từ Wheel cố định, nhưng sau đó
+toàn bộ tọa độ, bán kính và các chiều residual đều được học.
+
+`L_wheel_structure` khớp ma trận khoảng cách prototype đã chuẩn hóa
+theo mean với circular Emotion-Wheel distance. Do đó loss không cố định
+vị trí, hướng hay global scale. Runner mặc định dùng:
+
+```text
+hyperbolic_dim                 = 16
+lambda_wheel_proto             = 0.1
+lambda_wheel_structure         = 0.05
+lambda_wheel_boundary          = 0.01
+lambda_wheel_cpcc              = 0
+wheel_free_prototype_max_radius = 0.90
+```
+
+Feature-level Wheel CPCC được tắt trong runner này để tách riêng cơ chế
+prototype learning. Có thể bật lại bằng biến môi trường
+`LAMBDA_WHEEL_CPCC`, ví dụ `LAMBDA_WHEEL_CPCC=0.05`.
+
+Trong VinUni CECS Slurm interactive session, runner một GPU là:
+
+```bash
+bash SDT_new/run_iemocap_freeproto_interactive_1gpu.sh
+```
+
+Nếu allocation hiện tại có hai GPU, chọn GPU thứ hai bằng
+`GPU_SLOT=1`. Script chọn theo vị trí trong `CUDA_VISIBLE_DEVICES` do Slurm
+cấp, không hard-code GPU vật lý của node.
+
 ## Chạy SDT + TiCAL (không dùng COLD)
 
 Script riêng:

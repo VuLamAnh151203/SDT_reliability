@@ -15,7 +15,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from dataloader import BASE_DIR, DialogueDataset, make_loaders, split_dialogues
 from losses import SDTCOLDLoss, wheel_uncertainty_target
 from model import (DISTRIBUTION_INIT_MODES, FUSION_FEATURE_SOURCES,
-                   FUSION_VARIANTS, MODALITIES, WHEEL_FEATURE_SOURCES,
+                   FUSION_VARIANTS, MODALITIES,
+                   PROTOTYPE_EVIDENCE_FUSION_MODES, WHEEL_FEATURE_SOURCES,
                    WHEEL_UNCERTAINTY_MODES,
                    Transformer_Based_Model)
 from reliability_data import OOFReliabilityTable
@@ -105,6 +106,20 @@ def build_parser():
                         help="keep free prototypes away from the Poincare boundary")
     parser.add_argument("--lambda-wheel-alignment", type=float, default=0.0,
                         help="align modality-specific prototypes with shared semantic centers")
+    parser.add_argument(
+        "--prototype-evidence-fusion",
+        choices=PROTOTYPE_EVIDENCE_FUSION_MODES, default="none",
+        help="fuse hyperbolic prototype logits into final SDT logits")
+    parser.add_argument("--prototype-evidence-weight", type=float,
+                        default=0.0,
+                        help="maximum additive prototype-logit residual weight")
+    parser.add_argument("--prototype-evidence-hidden-dim", type=int,
+                        default=32,
+                        help="hidden size of each class-wise modality gate")
+    parser.add_argument("--prototype-evidence-warmup-epochs", type=int,
+                        default=5)
+    parser.add_argument("--prototype-evidence-ramp-epochs", type=int,
+                        default=5)
     parser.add_argument("--wheel-semantic-control",
                         choices=WHEEL_SEMANTIC_CONTROLS, default="correct",
                         help="correct semantic Wheel or a non-isometric random label permutation")
@@ -246,7 +261,15 @@ def make_model_config(args, dataset):
             "wheel_uncertainty_warmup_epochs": (
                 args.wheel_uncertainty_warmup_epochs),
             "wheel_uncertainty_ramp_epochs": (
-                args.wheel_uncertainty_ramp_epochs)}
+                args.wheel_uncertainty_ramp_epochs),
+            "prototype_evidence_fusion": args.prototype_evidence_fusion,
+            "prototype_evidence_weight": args.prototype_evidence_weight,
+            "prototype_evidence_hidden_dim": (
+                args.prototype_evidence_hidden_dim),
+            "prototype_evidence_warmup_epochs": (
+                args.prototype_evidence_warmup_epochs),
+            "prototype_evidence_ramp_epochs": (
+                args.prototype_evidence_ramp_epochs)}
 
 
 def make_criterion(args, device):
@@ -311,6 +334,21 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
                     "wheel_uncertainty_correct_" + name, []).append(
                         output["student_logits"][name][valid].argmax(dim=-1)
                         .eq(valid_labels).detach().cpu())
+        prototype_weights = output.get("prototype_evidence_weights")
+        if prototype_weights is not None:
+            valid_weights = prototype_weights[valid]
+            correct_class_weights = valid_weights.gather(
+                1,
+                valid_labels[:, None, None].expand(
+                    -1, 1, len(MODALITIES))).squeeze(1)
+            for index, name in enumerate(MODALITIES):
+                storage.setdefault(
+                    "prototype_evidence_weight_" + name, []).append(
+                        correct_class_weights[:, index].detach().cpu())
+            storage.setdefault("prototype_evidence_gate_entropy", []).append(
+                (-(correct_class_weights
+                   * correct_class_weights.clamp_min(1e-12).log())
+                 .sum(dim=-1)).detach().cpu())
     if not tical["ready"]:
         return
     for name in MODALITIES:
@@ -365,6 +403,15 @@ def _tical_epoch_metrics(storage, model, utterance_count):
     if getattr(model, "use_emotion_wheel", False):
         result["categorical_discrepancy_mean"] = 0.0
         result["wheel_discrepancy_mean"] = 0.0
+        if getattr(model, "prototype_evidence_fusion", "none") != "none":
+            result["prototype_evidence_progress"] = (
+                model.prototype_evidence_progress())
+            result["prototype_evidence_effective_weight"] = (
+                model.prototype_evidence_weight
+                * model.prototype_evidence_progress())
+            result["prototype_evidence_gate_entropy"] = 0.0
+            for name in MODALITIES:
+                result["prototype_evidence_weight_{}".format(name)] = 0.0
     for group in ("low", "medium", "high"):
         result["kappa_{}_frac".format(group)] = 0.0
         result["kappa_{}_accuracy".format(group)] = 0.0
@@ -431,6 +478,14 @@ def _tical_epoch_metrics(storage, model, utterance_count):
                         (uncertainty[~correct].mean().item()
                          if (~correct).any() else 0.0),
                 })
+        if getattr(model, "prototype_evidence_fusion", "none") != "none":
+            entropy_key = "prototype_evidence_gate_entropy"
+            if entropy_key in values:
+                result[entropy_key] = values[entropy_key].float().mean().item()
+                for name in MODALITIES:
+                    result["prototype_evidence_weight_{}".format(name)] = (
+                        values["prototype_evidence_weight_" + name]
+                        .float().mean().item())
     if not storage["kappa"]:
         return result
     n_ready = int(values["kappa"].numel())
@@ -624,6 +679,8 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
     wheel_uncertainty = output.get("wheel_uncertainty")
     wheel_uncertainty_weights = output.get("wheel_uncertainty_weights")
     wheel_uncertainty_scales = output.get("wheel_uncertainty_scales")
+    prototype_evidence_weights = output.get("prototype_evidence_weights")
+    prototype_evidence_logits = output.get("prototype_evidence_logits")
     if reliability is not None:
         reliability = reliability.detach().cpu()
     if variance_norm is not None:
@@ -636,6 +693,9 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
         wheel_uncertainty_weights = wheel_uncertainty_weights.detach().cpu()
     if wheel_uncertainty_scales is not None:
         wheel_uncertainty_scales = wheel_uncertainty_scales.detach().cpu()
+    if prototype_evidence_weights is not None:
+        prototype_evidence_weights = prototype_evidence_weights.detach().cpu()
+        prototype_evidence_logits = prototype_evidence_logits.detach().cpu()
     students = {m: output["student_logits"][m].detach().argmax(dim=-1).cpu() for m in MODALITIES}
     errors = {m: value.detach().cpu() for m, value in errors.items()}
     tical = output.get("tical")
@@ -677,6 +737,15 @@ def prediction_rows(dialogue_ids, lengths, labels, prediction, output, errors):
                     row["wheel_discrepancy"] = float(
                         tical["wheel_discrepancy"][offset])
             row.update({"prob_{}".format(c): float(p) for c, p in enumerate(probabilities[batch_index, index])})
+            if prototype_evidence_weights is not None:
+                predicted_class = int(prediction[batch_index, index])
+                row["prototype_evidence_logit_predicted"] = float(
+                    prototype_evidence_logits[
+                        batch_index, index, predicted_class])
+                for modal_index, name in enumerate(MODALITIES):
+                    row["prototype_evidence_weight_" + name] = float(
+                        prototype_evidence_weights[
+                            batch_index, index, predicted_class, modal_index])
             for modal_index, name in enumerate(MODALITIES):
                 row[name + "_prediction"] = int(students[name][batch_index, index])
                 row[name + "_gate_mean"] = float(gate[batch_index, index, modal_index])
@@ -760,7 +829,11 @@ def main(argv=None):
             or args.lambda_wheel_uncertainty < 0
             or args.wheel_uncertainty_hidden_dim < 1
             or args.wheel_uncertainty_warmup_epochs < 0
-            or args.wheel_uncertainty_ramp_epochs < 0):
+            or args.wheel_uncertainty_ramp_epochs < 0
+            or args.prototype_evidence_weight < 0
+            or args.prototype_evidence_hidden_dim < 1
+            or args.prototype_evidence_warmup_epochs < 0
+            or args.prototype_evidence_ramp_epochs < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
     if not 0 <= args.anchor_conf_threshold <= 1:
         raise ValueError("--anchor-conf-threshold must be in [0,1]")
@@ -788,10 +861,19 @@ def main(argv=None):
             or args.wheel_prototype_radius_mode != "fixed-shared"
             or args.wheel_uncertainty_mode != "none"
             or args.lambda_wheel_uncertainty > 0
+            or args.prototype_evidence_fusion != "none"
+            or args.prototype_evidence_weight > 0
             or args.wheel_semantic_control != "correct"
             or args.wheel_detach_features
             or args.wheel_feature_source != "pure"):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
+    if args.prototype_evidence_fusion == "none":
+        if args.prototype_evidence_weight != 0:
+            raise ValueError(
+                "--prototype-evidence-weight requires an enabled fusion mode")
+    elif args.prototype_evidence_weight <= 0:
+        raise ValueError(
+            "prototype evidence fusion requires --prototype-evidence-weight > 0")
     if args.wheel_uncertainty_mode != "none":
         if args.wheel_geometry != "poincare":
             raise ValueError("wheel uncertainty requires Poincare geometry")
@@ -902,7 +984,12 @@ def main(argv=None):
                      "wheel_uncertainty_temperature",
                      "wheel_uncertainty_gate_strength",
                      "wheel_uncertainty_warmup_epochs",
-                     "wheel_uncertainty_ramp_epochs"):
+                     "wheel_uncertainty_ramp_epochs",
+                     "prototype_evidence_fusion",
+                     "prototype_evidence_weight",
+                     "prototype_evidence_hidden_dim",
+                     "prototype_evidence_warmup_epochs",
+                     "prototype_evidence_ramp_epochs"):
             if name in checkpoint["model_config"]:
                 setattr(args, name, checkpoint["model_config"][name])
         for name in ("gamma_1", "gamma_2", "gamma_3", "lambda_co", "lambda_reg",
@@ -1006,6 +1093,11 @@ def main(argv=None):
         if model_config.get("wheel_uncertainty_mode", "none") != "none":
             method_tag += "_unc_{}".format(
                 model_config["wheel_uncertainty_mode"])
+        prototype_fusion = model_config.get(
+            "prototype_evidence_fusion", "none")
+        if prototype_fusion != "none":
+            method_tag += "_protofusion_{}".format(
+                prototype_fusion.replace("-", "_"))
     run_name = "{}_{}_{}_seed{}_{}".format(
         args.dataset.lower(), method_tag, init_tag, args.seed,
         datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
@@ -1074,6 +1166,7 @@ def main(argv=None):
                   "wheel(proto/cpcc/radius/structure/align/boundary)="
                   "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
+                  "protofusion(progress/effective/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
                 epoch, train_metrics["total"], train_metrics["weighted_f1"], selection_split,
                 selected_metrics["weighted_f1"], train_metrics["original_distillation"],
@@ -1089,6 +1182,11 @@ def main(argv=None):
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_a", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_v", 0.0),
+                train_metrics.get("prototype_evidence_progress", 0.0),
+                train_metrics.get("prototype_evidence_effective_weight", 0.0),
+                train_metrics.get("prototype_evidence_weight_t", 0.0),
+                train_metrics.get("prototype_evidence_weight_a", 0.0),
+                train_metrics.get("prototype_evidence_weight_v", 0.0),
                 train_metrics.get("kappa_mean", 0.0), train_metrics["tical_ready_rate"],
                 train_metrics["anchor_t_size"], train_metrics["anchor_a_size"],
                 train_metrics["anchor_v_size"], row["seconds"]), flush=True)
@@ -1139,6 +1237,10 @@ def main(argv=None):
             "wheel_prototype_radius_mode", "fixed-shared"),
         "wheel_prototype_layout": model_config.get(
             "wheel_prototype_layout", "fixed-wheel"),
+        "prototype_evidence_fusion": model_config.get(
+            "prototype_evidence_fusion", "none"),
+        "prototype_evidence_weight": model_config.get(
+            "prototype_evidence_weight", 0.0),
         "learned_prototype_radii": learned_radii,
         "learned_prototypes": learned_prototypes,
         "learned_modality_prototype_radii": learned_modality_radii,

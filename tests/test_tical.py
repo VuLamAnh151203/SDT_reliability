@@ -377,6 +377,88 @@ class TiCALTests(unittest.TestCase):
             self.assertIsNotNone(
                 model.tical.wheel_modality_prototype_tangents[name].grad)
 
+    def test_uniform_prototype_evidence_fusion_matches_formula_and_schedule(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            prototype_evidence_fusion="uniform",
+            prototype_evidence_weight=0.3,
+            prototype_evidence_warmup_epochs=2,
+            prototype_evidence_ramp_epochs=2).eval()
+        model.set_tical_epoch(2)
+        warmup = model(*self.inputs)
+        self.assertEqual(warmup["prototype_evidence_progress"], 0.0)
+        torch.testing.assert_close(
+            warmup["logits"], warmup["sdt_logits"], atol=0, rtol=0)
+
+        model.set_tical_epoch(4)
+        output = model(*self.inputs)
+        self.assertEqual(output["prototype_evidence_progress"], 1.0)
+        torch.testing.assert_close(
+            output["prototype_evidence_weights"],
+            torch.full_like(output["prototype_evidence_weights"], 1 / 3),
+            atol=1e-7, rtol=0)
+        valid = self.mask.bool()
+        valid_evidence = torch.stack([
+            output["tical"]["wheel_logits"][name]
+            for name in MODALITIES
+        ], dim=-1).mean(dim=-1)
+        valid_evidence = (
+            valid_evidence
+            - valid_evidence.mean(dim=-1, keepdim=True))
+        torch.testing.assert_close(
+            output["prototype_evidence_logits"][valid], valid_evidence)
+        torch.testing.assert_close(
+            output["logits"],
+            output["sdt_logits"]
+            + 0.3 * output["prototype_evidence_logits"])
+
+    def test_classwise_prototype_evidence_gate_and_prototypes_receive_gradient(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            prototype_evidence_fusion="class-wise",
+            prototype_evidence_weight=0.2,
+            prototype_evidence_hidden_dim=5,
+            prototype_evidence_warmup_epochs=0,
+            prototype_evidence_ramp_epochs=0)
+        model.set_tical_epoch(1)
+        initial = model(*self.inputs)
+        torch.testing.assert_close(
+            initial["prototype_evidence_weights"],
+            torch.full_like(initial["prototype_evidence_weights"], 1 / 3),
+            atol=1e-7, rtol=0)
+
+        with torch.no_grad():
+            model.prototype_evidence_gates["t"].network[-1].bias.copy_(
+                torch.linspace(-1.0, 1.0, 6))
+            model.prototype_evidence_gates["a"].network[-1].bias.copy_(
+                torch.linspace(1.0, -1.0, 6))
+        output = model(*self.inputs)
+        weights = output["prototype_evidence_weights"]
+        self.assertFalse(torch.allclose(
+            weights[..., 0], weights[..., 1]))
+        torch.testing.assert_close(
+            weights.sum(dim=-1), torch.ones_like(weights[..., 0]))
+        self.assertFalse(torch.allclose(
+            output["logits"], output["sdt_logits"]))
+
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        F.cross_entropy(
+            output["logits"][self.mask.bool()],
+            labels[self.mask.bool()]).backward()
+        for name in MODALITIES:
+            gate_gradient = (
+                model.prototype_evidence_gates[name].network[-1].weight.grad)
+            self.assertIsNotNone(gate_gradient)
+            self.assertGreater(gate_gradient.abs().sum().item(), 0.0)
+            prototype_gradient = (
+                model.tical.wheel_modality_prototype_tangents[name].grad)
+            self.assertIsNotNone(prototype_gradient)
+            self.assertGreater(prototype_gradient.abs().sum().item(), 0.0)
+
     def test_per_class_radius_regularization_enters_total_loss(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

@@ -16,6 +16,7 @@ FUSION_FEATURE_SOURCES = ("enhanced", "pure")
 WHEEL_FEATURE_SOURCES = ("pure", "enhanced")
 DISTRIBUTION_INIT_MODES = ("random", "sdt-preserving")
 WHEEL_UNCERTAINTY_MODES = ("none", "gate", "supervise", "full")
+PROTOTYPE_EVIDENCE_FUSION_MODES = ("none", "uniform", "class-wise")
 
 
 def poincare_log_map_zero(points, eps=1e-5):
@@ -47,6 +48,28 @@ class WheelUncertaintyHead(nn.Module):
 
     def forward(self, tangent_features):
         return torch.sigmoid(self.network(tangent_features).squeeze(-1))
+
+
+class PrototypeEvidenceGate(nn.Module):
+    """Predict utterance- and class-specific modality gate scores."""
+
+    def __init__(self, input_dim, hidden_dim, n_classes, dropout):
+        super().__init__()
+        if min(input_dim, hidden_dim, n_classes) < 1:
+            raise ValueError("prototype evidence gate dimensions must be positive")
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_classes),
+        )
+        # Every modality starts with score zero for every class. Softmax over
+        # modalities is therefore exactly uniform before the gate learns.
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.zeros_(self.network[-1].bias)
+
+    def forward(self, projected_features):
+        return self.network(projected_features)
 
 
 class DistributionHead(nn.Module):
@@ -133,7 +156,12 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_prototype_radius_mode="fixed-shared",
                  wheel_prototype_radius_min=0.20,
                   wheel_prototype_radius_max=0.90,
-                  wheel_free_prototype_max_radius=0.95):
+                  wheel_free_prototype_max_radius=0.95,
+                 prototype_evidence_fusion="none",
+                 prototype_evidence_weight=0.0,
+                 prototype_evidence_hidden_dim=32,
+                 prototype_evidence_warmup_epochs=5,
+                 prototype_evidence_ramp_epochs=5):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -162,6 +190,26 @@ class Transformer_Based_Model(SDTBackbone):
         if wheel_uncertainty_mode not in WHEEL_UNCERTAINTY_MODES:
             raise ValueError("unknown wheel uncertainty mode: {}".format(
                 wheel_uncertainty_mode))
+        if prototype_evidence_fusion not in PROTOTYPE_EVIDENCE_FUSION_MODES:
+            raise ValueError("unknown prototype evidence fusion mode: {}".format(
+                prototype_evidence_fusion))
+        if (not math.isfinite(prototype_evidence_weight)
+                or prototype_evidence_weight < 0):
+            raise ValueError("prototype evidence weight must be finite and nonnegative")
+        if (prototype_evidence_hidden_dim < 1
+                or prototype_evidence_warmup_epochs < 0
+                or prototype_evidence_ramp_epochs < 0):
+            raise ValueError("invalid prototype evidence fusion schedule")
+        if prototype_evidence_fusion != "none":
+            if not use_emotion_wheel:
+                raise ValueError(
+                    "prototype evidence fusion requires emotion-wheel prototypes")
+            if prototype_evidence_weight <= 0:
+                raise ValueError(
+                    "prototype evidence fusion requires a positive weight")
+        elif prototype_evidence_weight != 0:
+            raise ValueError(
+                "prototype evidence weight requires an enabled fusion mode")
         if wheel_uncertainty_mode != "none":
             if not use_emotion_wheel or wheel_geometry != "poincare":
                 raise ValueError(
@@ -214,6 +262,12 @@ class Transformer_Based_Model(SDTBackbone):
             wheel_uncertainty_warmup_epochs)
         self.wheel_uncertainty_ramp_epochs = int(
             wheel_uncertainty_ramp_epochs)
+        self.prototype_evidence_fusion = prototype_evidence_fusion
+        self.prototype_evidence_weight = float(prototype_evidence_weight)
+        self.prototype_evidence_warmup_epochs = int(
+            prototype_evidence_warmup_epochs)
+        self.prototype_evidence_ramp_epochs = int(
+            prototype_evidence_ramp_epochs)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -235,6 +289,13 @@ class Transformer_Based_Model(SDTBackbone):
             self.wheel_uncertainty_heads = nn.ModuleDict({
                 name: WheelUncertaintyHead(
                     hyperbolic_dim, wheel_uncertainty_hidden_dim, dropout)
+                for name in MODALITIES
+            })
+        if prototype_evidence_fusion == "class-wise":
+            self.prototype_evidence_gates = nn.ModuleDict({
+                name: PrototypeEvidenceGate(
+                    hyperbolic_dim, prototype_evidence_hidden_dim,
+                    n_classes, dropout)
                 for name in MODALITIES
             })
         if fusion_variant in ("guided", "replace"):
@@ -275,6 +336,10 @@ class Transformer_Based_Model(SDTBackbone):
         wheel_uncertainty_weights = None
         wheel_uncertainty_scales = None
         wheel_uncertainty_progress = self.wheel_uncertainty_progress()
+        prototype_evidence_modality_logits = None
+        prototype_evidence_weights = None
+        prototype_evidence_logits = None
+        prototype_evidence_progress = self.prototype_evidence_progress()
         if self.fusion_variant == "sdt":
             fusion_features = (pure_features
                                if self.fusion_feature_source == "pure"
@@ -376,9 +441,47 @@ class Transformer_Based_Model(SDTBackbone):
             for index, (name, classifier) in enumerate(zip(MODALITIES, (
                 self.t_output_layer, self.a_output_layer, self.v_output_layer)))
         }
-        logits = self.all_output_layer(fused)
+        sdt_logits = self.all_output_layer(fused)
+        logits = sdt_logits
+        if (self.prototype_evidence_fusion != "none"
+                and tical_output is not None
+                and tical_output.get("wheel_logits") is not None):
+            valid = u_mask.bool()
+            valid_modality_logits = torch.stack([
+                tical_output["wheel_logits"][name]
+                for name in MODALITIES
+            ], dim=-1)
+            prototype_evidence_modality_logits = sdt_logits.new_zeros(
+                *sdt_logits.shape, len(MODALITIES))
+            prototype_evidence_modality_logits[valid] = valid_modality_logits
+            if self.prototype_evidence_fusion == "uniform":
+                prototype_evidence_weights = sdt_logits.new_full(
+                    (*sdt_logits.shape, len(MODALITIES)),
+                    1.0 / len(MODALITIES))
+            else:
+                gate_scores = torch.stack([
+                    self.prototype_evidence_gates[name](
+                        tical_output["projected"][name])
+                    for name in MODALITIES
+                ], dim=-1)
+                prototype_evidence_weights = torch.softmax(
+                    gate_scores, dim=-1)
+            prototype_evidence_logits = (
+                prototype_evidence_weights
+                * prototype_evidence_modality_logits).sum(dim=-1)
+            # Per-utterance shifts do not change a softmax, but centering keeps
+            # the additive residual numerically comparable to ordinary logits.
+            prototype_evidence_logits = (
+                prototype_evidence_logits
+                - prototype_evidence_logits.mean(dim=-1, keepdim=True))
+            logits = (
+                sdt_logits
+                + self.prototype_evidence_weight
+                * prototype_evidence_progress
+                * prototype_evidence_logits)
         return {
             "logits": logits,
+            "sdt_logits": sdt_logits,
             "log_prob": F.log_softmax(logits, dim=-1),
             "prob": F.softmax(logits, dim=-1),
             "student_logits": student_logits,
@@ -413,6 +516,15 @@ class Transformer_Based_Model(SDTBackbone):
             "wheel_uncertainty_weights": wheel_uncertainty_weights,
             "wheel_uncertainty_scales": wheel_uncertainty_scales,
             "wheel_uncertainty_progress": wheel_uncertainty_progress,
+            "prototype_evidence_fusion": self.prototype_evidence_fusion,
+            "prototype_evidence_modality_logits": (
+                prototype_evidence_modality_logits),
+            "prototype_evidence_weights": prototype_evidence_weights,
+            "prototype_evidence_logits": prototype_evidence_logits,
+            "prototype_evidence_progress": prototype_evidence_progress,
+            "prototype_evidence_effective_weight": (
+                self.prototype_evidence_weight
+                * prototype_evidence_progress),
         }
 
     def set_tical_epoch(self, epoch):
@@ -427,6 +539,16 @@ class Transformer_Based_Model(SDTBackbone):
         if self.wheel_uncertainty_ramp_epochs == 0:
             return 1.0
         return min(1.0, elapsed / self.wheel_uncertainty_ramp_epochs)
+
+    def prototype_evidence_progress(self):
+        if self.prototype_evidence_fusion == "none":
+            return 0.0
+        elapsed = self.tical_epoch - self.prototype_evidence_warmup_epochs
+        if elapsed <= 0:
+            return 0.0
+        if self.prototype_evidence_ramp_epochs == 0:
+            return 1.0
+        return min(1.0, elapsed / self.prototype_evidence_ramp_epochs)
 
     @torch.no_grad()
     def update_tical_anchors(self, outputs, labels, valid_mask):

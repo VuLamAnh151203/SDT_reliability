@@ -155,7 +155,8 @@ class SDTCOLDLoss(nn.Module):
                  lambda_wheel_diversity=0.0,
                  lambda_wheel_utilization=0.0,
                  lambda_prototype_selector=0.0,
-                 prototype_selector_target_temperature=1.0):
+                 prototype_selector_target_temperature=1.0,
+                 lambda_wheel_private_residual=0.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
@@ -163,7 +164,8 @@ class SDTCOLDLoss(nn.Module):
                    lambda_wheel_radius, lambda_wheel_structure,
                    lambda_wheel_boundary, lambda_wheel_alignment,
                    lambda_wheel_diversity, lambda_wheel_utilization,
-                   lambda_prototype_selector)
+                   lambda_prototype_selector,
+                   lambda_wheel_private_residual)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -182,6 +184,8 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_wheel_diversity = lambda_wheel_diversity
         self.lambda_wheel_utilization = lambda_wheel_utilization
         self.lambda_prototype_selector = lambda_prototype_selector
+        self.lambda_wheel_private_residual = (
+            lambda_wheel_private_residual)
         if (not math.isfinite(prototype_selector_target_temperature)
                 or prototype_selector_target_temperature <= 0):
             raise ValueError(
@@ -309,6 +313,7 @@ class SDTCOLDLoss(nn.Module):
         wheel_boundary = zero
         wheel_diversity = zero
         wheel_utilization = zero
+        wheel_private_residual = zero
         if wheel_ready:
             wheel_structure = tical_output.get(
                 "wheel_prototype_structure", zero)
@@ -318,6 +323,8 @@ class SDTCOLDLoss(nn.Module):
                 "wheel_prototype_boundary", zero)
             wheel_diversity = tical_output.get(
                 "wheel_prototype_diversity", zero)
+            wheel_private_residual = tical_output.get(
+                "wheel_private_residual", zero)
             subprototype_distances = tical_output.get(
                 "wheel_subprototype_distances")
             if subprototype_distances is not None:
@@ -357,6 +364,9 @@ class SDTCOLDLoss(nn.Module):
         weighted_wheel_utilization = (
             self.lambda_wheel_utilization * prototype_loss_progress
             * wheel_utilization)
+        weighted_wheel_private_residual = (
+            self.lambda_wheel_private_residual * prototype_loss_progress
+            * wheel_private_residual)
         wheel_uncertainty = zero
         wheel_uncertainty_by_modality = {
             name: zero for name in MODALITIES}
@@ -422,6 +432,7 @@ class SDTCOLDLoss(nn.Module):
                  + weighted_wheel_boundary
                  + weighted_wheel_diversity
                  + weighted_wheel_utilization
+                 + weighted_wheel_private_residual
                  + weighted_wheel_uncertainty
                  + weighted_prototype_selector)
         sample_keep_rate = (torch.ones((), device=total.device) if sample_keep_mask is None
@@ -448,6 +459,9 @@ class SDTCOLDLoss(nn.Module):
                   "weighted_wheel_diversity": weighted_wheel_diversity,
                   "wheel_utilization": wheel_utilization,
                   "weighted_wheel_utilization": weighted_wheel_utilization,
+                  "wheel_private_residual": wheel_private_residual,
+                  "weighted_wheel_private_residual": (
+                      weighted_wheel_private_residual),
                  "prototype_loss_progress": zero + prototype_loss_progress,
                  "prototype_selector": prototype_selector,
                  "weighted_prototype_selector": (

@@ -277,6 +277,74 @@ class TiCALTests(unittest.TestCase):
         self.assertIsNotNone(gradient)
         self.assertGreater(gradient.abs().sum().item(), 0.0)
 
+    def test_random_free_prototypes_start_outside_fixed_wheel_plane(self):
+        module = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=16, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_layout="free",
+            wheel_free_prototype_init="random")
+        prototypes = module.current_wheel_prototypes()
+        self.assertEqual(prototypes.shape, (6, 16))
+        self.assertGreater(prototypes[:, 2:].abs().sum().item(), 0.0)
+        self.assertFalse(torch.allclose(prototypes, module.wheel_prototypes))
+        torch.testing.assert_close(
+            prototypes.norm(dim=-1), torch.full((6,), 0.75),
+            atol=1e-6, rtol=1e-6)
+
+    def test_ordinal_wheel_loss_is_finite_and_trains_free_prototypes(self):
+        module = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=16, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_layout="free",
+            wheel_free_prototype_init="random",
+            wheel_prototype_structure_mode="ordinal",
+            wheel_ordinal_margin=0.2)
+        ordinal = module.wheel_prototype_structure_loss()
+        self.assertTrue(torch.isfinite(ordinal))
+        self.assertGreaterEqual(ordinal.item(), 0.0)
+        ordinal.backward()
+        gradient = module.wheel_free_prototype_tangent.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_shared_private_prototypes_center_residuals_and_backpropagate(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="shared-private",
+            wheel_free_prototype_init="random",
+            wheel_prototype_structure_mode="ordinal",
+            wheel_private_residual_init_std=0.02)
+        residuals = model.tical.current_wheel_private_residuals()
+        torch.testing.assert_close(
+            sum(residuals.values()), torch.zeros_like(residuals["t"]),
+            atol=1e-7, rtol=0)
+        shared = model.tical.current_wheel_prototypes()
+        self.assertEqual(shared.shape, (6, 16))
+        self.assertTrue(any(
+            not torch.allclose(
+                model.tical.current_wheel_prototypes(name), shared)
+            for name in MODALITIES))
+
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=1.0, lambda_wheel_structure=0.1,
+            lambda_wheel_private_residual=0.1)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertGreater(parts["wheel_private_residual"].item(), 0.0)
+        loss.backward()
+        self.assertGreater(
+            model.tical.wheel_shared_center_tangent.grad.abs().sum().item(),
+            0.0)
+        for name in MODALITIES:
+            gradient = model.tical.wheel_modality_private_tangents[name].grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(gradient.abs().sum().item(), 0.0)
+
     def test_free_prototype_losses_enter_total_objective(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

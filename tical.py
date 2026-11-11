@@ -25,7 +25,10 @@ WHEEL_PROTOTYPE_RADIUS_MODES = (
     "learnable-per-class",
     "per-class-regularized",
 )
-WHEEL_PROTOTYPE_LAYOUTS = ("fixed-wheel", "free", "modality-specific")
+WHEEL_PROTOTYPE_LAYOUTS = (
+    "fixed-wheel", "free", "modality-specific", "shared-private")
+WHEEL_PROTOTYPE_STRUCTURE_MODES = ("pairwise-mse", "ordinal")
+WHEEL_FREE_PROTOTYPE_INITS = ("wheel", "random")
 EMOTION_WHEEL_ORDERS = {
     "IEMOCAP": (0, 4, 3, 5, 1, 2),
     "MELD": (4, 1, 2, 6, 5, 3, 0),
@@ -355,7 +358,11 @@ class TiCALModule(nn.Module):
                  wheel_prototypes_per_class=1,
                  wheel_multi_prototype_temperature=0.2,
                  wheel_multi_prototype_init_std=0.02,
-                 wheel_prototype_diversity_margin=0.5):
+                 wheel_prototype_diversity_margin=0.5,
+                 wheel_prototype_structure_mode="pairwise-mse",
+                 wheel_ordinal_margin=0.2,
+                 wheel_free_prototype_init="wheel",
+                 wheel_private_residual_init_std=0.02):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -411,6 +418,25 @@ class TiCALModule(nn.Module):
         self.wheel_prototype_radius_max = float(wheel_prototype_radius_max)
         self.wheel_free_prototype_max_radius = float(
             wheel_free_prototype_max_radius)
+        if wheel_prototype_structure_mode not in (
+                WHEEL_PROTOTYPE_STRUCTURE_MODES):
+            raise ValueError("unknown prototype structure mode: {}".format(
+                wheel_prototype_structure_mode))
+        if wheel_free_prototype_init not in WHEEL_FREE_PROTOTYPE_INITS:
+            raise ValueError("unknown free prototype initialization: {}".format(
+                wheel_free_prototype_init))
+        if (not math.isfinite(wheel_ordinal_margin)
+                or wheel_ordinal_margin < 0):
+            raise ValueError("Wheel ordinal margin must be nonnegative")
+        if (not math.isfinite(wheel_private_residual_init_std)
+                or wheel_private_residual_init_std < 0):
+            raise ValueError("private residual init std must be nonnegative")
+        self.wheel_prototype_structure_mode = (
+            wheel_prototype_structure_mode)
+        self.wheel_ordinal_margin = float(wheel_ordinal_margin)
+        self.wheel_free_prototype_init = wheel_free_prototype_init
+        self.wheel_private_residual_init_std = float(
+            wheel_private_residual_init_std)
         if wheel_prototypes_per_class < 1:
             raise ValueError("prototypes per class must be positive")
         if (wheel_prototypes_per_class > 1
@@ -435,6 +461,7 @@ class TiCALModule(nn.Module):
         self.register_parameter("wheel_free_prototype_tangent", None)
         self.register_parameter("wheel_shared_center_tangent", None)
         self.wheel_modality_prototype_tangents = nn.ParameterDict()
+        self.wheel_modality_private_tangents = nn.ParameterDict()
         if self.use_emotion_wheel:
             if not math.isfinite(self.wheel_temperature) or self.wheel_temperature <= 0:
                 raise ValueError("wheel temperature must be finite and positive")
@@ -459,11 +486,13 @@ class TiCALModule(nn.Module):
                     < 1.0 - self.hyp_eps):
                 raise ValueError(
                     "free prototype maximum radius must be in (0, 1-eps)")
-            if (self.wheel_prototype_layout in ("free", "modality-specific")
+            if (self.wheel_prototype_layout in (
+                    "free", "modality-specific", "shared-private")
                     and self.wheel_geometry != "poincare"):
                 raise ValueError(
                     "free Wheel prototype layouts require Poincare geometry")
-            if (self.wheel_prototype_layout in ("free", "modality-specific")
+            if (self.wheel_prototype_layout in (
+                    "free", "modality-specific", "shared-private")
                     and self.wheel_prototype_radius_mode != "fixed-shared"):
                 raise ValueError(
                     "free Wheel prototype layouts are incompatible with learned radius modes")
@@ -485,26 +514,27 @@ class TiCALModule(nn.Module):
                 wheel_prototypes(
                     wheel_angles, hyperbolic_dim, wheel_geometry,
                     wheel_prototype_radius, hyp_eps))
+            initial_norm = self.wheel_prototypes.norm(
+                p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
+            wheel_initial_tangent = (
+                torch.atanh(initial_norm.clamp(max=1.0 - self.hyp_eps))
+                * self.wheel_prototypes / initial_norm)
+            if self.wheel_free_prototype_init == "random":
+                random_direction = torch.randn_like(wheel_initial_tangent)
+                random_direction = random_direction / random_direction.norm(
+                    p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
+                initial_tangent = (
+                    torch.atanh(initial_norm) * random_direction)
+            else:
+                initial_tangent = wheel_initial_tangent
             if self.wheel_prototype_layout == "free":
                 # Optimize unconstrained class vectors in the tangent space at
                 # the origin.  Exp_0 maps them into the Poincare ball on every
                 # forward pass.  Initialization recovers the fixed semantic
                 # wheel exactly, but every coordinate is subsequently free.
-                initial_tangent = self.wheel_prototypes.clone()
-                initial_norm = initial_tangent.norm(
-                    p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
-                initial_tangent = (
-                    torch.atanh(initial_norm.clamp(max=1.0 - self.hyp_eps))
-                    * initial_tangent / initial_norm)
                 self.wheel_free_prototype_tangent = nn.Parameter(
-                    initial_tangent)
+                    initial_tangent.clone())
             elif self.wheel_prototype_layout == "modality-specific":
-                initial_tangent = self.wheel_prototypes.clone()
-                initial_norm = initial_tangent.norm(
-                    p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
-                initial_tangent = (
-                    torch.atanh(initial_norm.clamp(max=1.0 - self.hyp_eps))
-                    * initial_tangent / initial_norm)
                 # q_c: the shared semantic centers constrained by the Wheel.
                 self.wheel_shared_center_tangent = nn.Parameter(
                     initial_tangent.clone())
@@ -523,6 +553,25 @@ class TiCALModule(nn.Module):
                 self.wheel_modality_prototype_tangents = nn.ParameterDict({
                     name: nn.Parameter(modality_initial.clone())
                     for name in MODALITIES
+                })
+            elif self.wheel_prototype_layout == "shared-private":
+                # s_c is a shared, fully learned class tangent. Each modality
+                # adds a centered private residual r_c^m before Exp_0. The
+                # zero-mean constraint makes s_c the exact tangent barycenter
+                # while leaving modality-specific evidence unconstrained.
+                self.wheel_shared_center_tangent = nn.Parameter(
+                    initial_tangent.clone())
+                residual_stack = (
+                    self.wheel_private_residual_init_std
+                    * torch.randn(
+                        len(MODALITIES), *initial_tangent.shape,
+                        device=initial_tangent.device,
+                        dtype=initial_tangent.dtype))
+                residual_stack = residual_stack - residual_stack.mean(
+                    dim=0, keepdim=True)
+                self.wheel_modality_private_tangents = nn.ParameterDict({
+                    name: nn.Parameter(residual_stack[index].clone())
+                    for index, name in enumerate(MODALITIES)
                 })
             elif self.wheel_prototype_radius_mode != "fixed-shared":
                 fraction = ((self.wheel_prototype_radius
@@ -567,7 +616,8 @@ class TiCALModule(nn.Module):
         """Return the bounded Euclidean ball radius of every class prototype."""
         if not self.use_emotion_wheel:
             return None
-        if self.wheel_prototype_layout == "modality-specific":
+        if self.wheel_prototype_layout in (
+                "modality-specific", "shared-private"):
             return self.current_wheel_prototypes(modality).norm(p=2, dim=-1)
         if self.wheel_free_prototype_tangent is not None:
             return self.current_wheel_prototypes().norm(p=2, dim=-1)
@@ -585,9 +635,9 @@ class TiCALModule(nn.Module):
     def current_wheel_prototypes(self, modality=None):
         """Build shared centers or the requested modality prototypes.
 
-        With the modality-specific layout, ``modality=None`` returns q_c, the
-        shared semantic centers. Passing t/a/v returns p_c^T/p_c^A/p_c^V.
-        Other layouts ignore ``modality`` because they share one prototype bank.
+        With a modality-aware layout, ``modality=None`` returns shared q_c.
+        Passing t/a/v returns the corresponding full modality prototypes.
+        Other layouts ignore ``modality`` and share one prototype bank.
         """
         if not self.use_emotion_wheel:
             return None
@@ -599,6 +649,17 @@ class TiCALModule(nn.Module):
                     raise ValueError("unknown prototype modality: {}".format(
                         modality))
                 tangent = self.wheel_modality_prototype_tangents[modality]
+            return self._exp_map_free_prototypes(tangent)
+        if self.wheel_prototype_layout == "shared-private":
+            if modality is None:
+                tangent = self.wheel_shared_center_tangent
+            else:
+                if modality not in MODALITIES:
+                    raise ValueError("unknown prototype modality: {}".format(
+                        modality))
+                residuals = self.current_wheel_private_residuals()
+                tangent = (self.wheel_shared_center_tangent
+                           + residuals[modality])
             return self._exp_map_free_prototypes(tangent)
         if self.wheel_free_prototype_tangent is not None:
             return self._exp_map_free_prototypes(
@@ -615,6 +676,31 @@ class TiCALModule(nn.Module):
                     directions.size(0), self.wheel_prototypes.size(-1) - 2),
             ), dim=-1)
         return directions * self.current_wheel_prototype_radii().unsqueeze(-1)
+
+    def current_wheel_private_residuals(self):
+        """Return zero-mean modality-private tangent residuals."""
+        if self.wheel_prototype_layout != "shared-private":
+            return None
+        stacked = torch.stack([
+            self.wheel_modality_private_tangents[name]
+            for name in MODALITIES
+        ], dim=0)
+        centered = stacked - stacked.mean(dim=0, keepdim=True)
+        return {
+            name: centered[index]
+            for index, name in enumerate(MODALITIES)
+        }
+
+    def wheel_private_residual_regularization(self):
+        """Keep private evidence residuals bounded without removing them."""
+        residuals = self.current_wheel_private_residuals()
+        if residuals is None:
+            if self.use_emotion_wheel:
+                return self.wheel_prototypes.sum() * 0.0
+            return torch.tensor(0.0)
+        return sum(
+            residual.square().mean() for residual in residuals.values()
+        ) / len(MODALITIES)
 
     def current_wheel_prototype_barycenters(self, modality):
         """Return one Poincare barycenter per class for a modality bank."""
@@ -669,17 +755,35 @@ class TiCALModule(nn.Module):
         """
         if (not self.use_emotion_wheel
                 or self.wheel_prototype_layout not in (
-                    "free", "modality-specific")):
+                    "free", "modality-specific", "shared-private")):
             if self.use_emotion_wheel:
                 return self.wheel_prototypes.sum() * 0.0
             return torch.tensor(0.0)
         prototypes = self.current_wheel_prototypes()
+        learned_matrix = geometry_distance(
+            prototypes[:, None, :], prototypes[None, :, :],
+            "poincare", self.hyp_eps)
+        target_matrix = self.wheel_class_distances.type_as(learned_matrix)
+        if self.wheel_prototype_structure_mode == "ordinal":
+            count = prototypes.size(0)
+            class_index = torch.arange(count, device=prototypes.device)
+            anchor = class_index[:, None, None]
+            near = class_index[None, :, None]
+            far = class_index[None, None, :]
+            ordered = (
+                target_matrix[:, :, None] + self.typicality_eps
+                < target_matrix[:, None, :])
+            valid = ordered & (near != anchor) & (far != anchor)
+            violations = torch.relu(
+                self.wheel_ordinal_margin
+                + learned_matrix[:, :, None]
+                - learned_matrix[:, None, :])
+            return violations[valid].mean()
         row, column = torch.triu_indices(
             prototypes.size(0), prototypes.size(0), offset=1,
             device=prototypes.device)
-        learned = geometry_distance(
-            prototypes[row], prototypes[column], "poincare", self.hyp_eps)
-        target = self.wheel_class_distances[row, column].type_as(learned)
+        learned = learned_matrix[row, column]
+        target = target_matrix[row, column]
         learned = learned / learned.mean().clamp_min(self.typicality_eps)
         target = target / target.mean().clamp_min(self.typicality_eps)
         return (learned - target).square().mean()
@@ -725,7 +829,7 @@ class TiCALModule(nn.Module):
         """Softly keep free prototypes away from the unstable ball boundary."""
         if (not self.use_emotion_wheel
                 or self.wheel_prototype_layout not in (
-                    "free", "modality-specific")):
+                    "free", "modality-specific", "shared-private")):
             if self.use_emotion_wheel:
                 return self.wheel_prototypes.sum() * 0.0
             return torch.tensor(0.0)
@@ -734,10 +838,16 @@ class TiCALModule(nn.Module):
         # prototype has already moved close to radius one.
         if self.wheel_prototype_layout == "free":
             tangents = [self.wheel_free_prototype_tangent]
-        else:
+        elif self.wheel_prototype_layout == "modality-specific":
             tangents = [self.wheel_shared_center_tangent]
             tangents.extend(
                 self.wheel_modality_prototype_tangents[name]
+                for name in MODALITIES)
+        else:
+            tangents = [self.wheel_shared_center_tangent]
+            residuals = self.current_wheel_private_residuals()
+            tangents.extend(
+                self.wheel_shared_center_tangent + residuals[name]
                 for name in MODALITIES)
         tangent_radii = torch.cat([
             tangent.norm(p=2, dim=-1).reshape(-1) for tangent in tangents])
@@ -780,8 +890,15 @@ class TiCALModule(nn.Module):
                       self.wheel_radius_regularization()),
                   "wheel_prototype_structure": (
                       self.wheel_prototype_structure_loss()),
+                  "wheel_prototype_structure_mode": (
+                      self.wheel_prototype_structure_mode),
+                  "wheel_ordinal_margin": self.wheel_ordinal_margin,
                   "wheel_prototype_alignment": (
                       self.wheel_prototype_alignment_loss()),
+                  "wheel_private_residual": (
+                      self.wheel_private_residual_regularization()),
+                  "wheel_free_prototype_init": (
+                      self.wheel_free_prototype_init),
                   "wheel_prototype_diversity": (
                       self.wheel_prototype_diversity_loss()),
                   "wheel_prototype_boundary": (

@@ -362,7 +362,11 @@ class TiCALModule(nn.Module):
                  wheel_prototype_structure_mode="pairwise-mse",
                  wheel_ordinal_margin=0.2,
                  wheel_free_prototype_init="wheel",
-                 wheel_private_residual_init_std=0.02):
+                 wheel_private_residual_init_std=0.02,
+                 use_data_prototypes=False,
+                 data_prototype_warmup_epochs=5,
+                 data_prototype_ramp_epochs=10,
+                 data_prototype_temperature=1.0):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -437,6 +441,20 @@ class TiCALModule(nn.Module):
         self.wheel_free_prototype_init = wheel_free_prototype_init
         self.wheel_private_residual_init_std = float(
             wheel_private_residual_init_std)
+        if (data_prototype_warmup_epochs < 0
+                or data_prototype_ramp_epochs < 0):
+            raise ValueError("data prototype schedule must be nonnegative")
+        if (not math.isfinite(data_prototype_temperature)
+                or data_prototype_temperature <= 0):
+            raise ValueError("data prototype temperature must be positive")
+        self.use_data_prototypes = bool(use_data_prototypes)
+        if self.use_data_prototypes and not self.use_emotion_wheel:
+            raise ValueError("data prototypes require emotion-wheel mode")
+        self.data_prototype_warmup_epochs = int(
+            data_prototype_warmup_epochs)
+        self.data_prototype_ramp_epochs = int(data_prototype_ramp_epochs)
+        self.data_prototype_temperature = float(data_prototype_temperature)
+        self.data_prototype_epoch = 0
         if wheel_prototypes_per_class < 1:
             raise ValueError("prototypes per class must be positive")
         if (wheel_prototypes_per_class > 1
@@ -462,6 +480,17 @@ class TiCALModule(nn.Module):
         self.register_parameter("wheel_shared_center_tangent", None)
         self.wheel_modality_prototype_tangents = nn.ParameterDict()
         self.wheel_modality_private_tangents = nn.ParameterDict()
+        self.register_parameter("data_prototype_tangent", None)
+        self.register_buffer(
+            "data_prototype_centroid_sum",
+            torch.zeros(n_classes, hyperbolic_dim),
+            persistent=self.use_data_prototypes)
+        self.register_buffer(
+            "data_prototype_centroid_count",
+            torch.zeros(n_classes), persistent=self.use_data_prototypes)
+        self.register_buffer(
+            "data_prototype_initialized",
+            torch.tensor(False), persistent=self.use_data_prototypes)
         if self.use_emotion_wheel:
             if not math.isfinite(self.wheel_temperature) or self.wheel_temperature <= 0:
                 raise ValueError("wheel temperature must be finite and positive")
@@ -514,6 +543,17 @@ class TiCALModule(nn.Module):
                 wheel_prototypes(
                     wheel_angles, hyperbolic_dim, wheel_geometry,
                     wheel_prototype_radius, hyp_eps))
+            if self.use_data_prototypes:
+                if self.wheel_geometry != "poincare":
+                    raise ValueError(
+                        "data prototypes require Poincare Wheel geometry")
+                if self.wheel_prototype_layout != "fixed-wheel":
+                    raise ValueError(
+                        "dual data prototypes require fixed-wheel anchors")
+                # This parameter is present before optimizer construction but
+                # receives no gradient until centroid initialization finishes.
+                self.data_prototype_tangent = nn.Parameter(
+                    torch.zeros(n_classes, hyperbolic_dim))
             initial_norm = self.wheel_prototypes.norm(
                 p=2, dim=-1, keepdim=True).clamp_min(self.hyp_eps)
             wheel_initial_tangent = (
@@ -599,6 +639,66 @@ class TiCALModule(nn.Module):
                 balance_mode=anchor_balance, geometry=wheel_geometry)
             for name in MODALITIES
         })
+
+    def set_epoch(self, epoch):
+        """Advance the centroid-initialization and auxiliary-loss schedule."""
+        epoch = int(epoch)
+        if (self.use_data_prototypes
+                and not bool(self.data_prototype_initialized)
+                and epoch != self.data_prototype_epoch):
+            if 0 < epoch <= self.data_prototype_warmup_epochs:
+                # Keep only the most recent warm-up epoch. Its centroids match
+                # the latest projector better than an average over old models.
+                self.data_prototype_centroid_sum.zero_()
+                self.data_prototype_centroid_count.zero_()
+            elif epoch > self.data_prototype_warmup_epochs:
+                self._initialize_data_prototypes()
+        self.data_prototype_epoch = epoch
+
+    def data_prototype_progress(self):
+        if (not self.use_data_prototypes
+                or not bool(self.data_prototype_initialized)):
+            return 0.0
+        elapsed = (self.data_prototype_epoch
+                   - self.data_prototype_warmup_epochs)
+        if elapsed <= 0:
+            return 0.0
+        if self.data_prototype_ramp_epochs == 0:
+            return 1.0
+        return min(1.0, elapsed / self.data_prototype_ramp_epochs)
+
+    @torch.no_grad()
+    def _initialize_data_prototypes(self):
+        """Copy class centroids into the learnable full-D tangent bank once."""
+        if (not self.use_data_prototypes
+                or bool(self.data_prototype_initialized)):
+            return False
+        if not (self.data_prototype_centroid_count > 0).all():
+            return False
+        centroid = (self.data_prototype_centroid_sum
+                    / self.data_prototype_centroid_count.unsqueeze(-1))
+        if not torch.isfinite(centroid).all():
+            raise FloatingPointError("nonfinite data prototype centroid")
+        self.data_prototype_tangent.copy_(centroid)
+        self.data_prototype_initialized.fill_(True)
+        return True
+
+    def current_data_prototypes(self):
+        if (not self.use_data_prototypes
+                or not bool(self.data_prototype_initialized)):
+            return None
+        return self._exp_map_free_prototypes(self.data_prototype_tangent)
+
+    def data_prototype_cpcc_loss(self):
+        """Correlate learned prototype distances with semantic Wheel order."""
+        prototypes = self.current_data_prototypes()
+        if prototypes is None:
+            return self.wheel_prototypes.sum() * 0.0
+        labels = torch.arange(
+            prototypes.size(0), device=prototypes.device)
+        return geometry_cpcc_loss(
+            prototypes, labels, "poincare", self.typicality_eps,
+            self.hyp_eps, self.wheel_class_distances)
 
     def _exp_map_free_prototypes(self, tangent):
         """Map arbitrary tangent parameters safely into the Poincare ball."""
@@ -919,6 +1019,20 @@ class TiCALModule(nn.Module):
                   "wheel_distances": None, "wheel_logits": None,
                   "wheel_subprototype_distances": None,
                   "wheel_pseudo_labels": None, "prototype_tau": None,
+                  "data_prototype_enabled": self.use_data_prototypes,
+                  "data_prototype_ready": bool(
+                      self.data_prototype_initialized),
+                  "data_prototype_progress": (
+                      self.data_prototype_progress()),
+                  "data_prototype_logits": None,
+                  "data_prototype_distances": None,
+                  "data_prototype_cpcc": (
+                      self.data_prototype_cpcc_loss()
+                      if self.use_data_prototypes
+                      else next(iter(projected.values())).sum() * 0.0),
+                  "data_prototype_counts": (
+                      self.data_prototype_centroid_count
+                      if self.use_data_prototypes else None),
                   "wheel_class_distances": (
                       self.wheel_class_distances
                       if self.use_emotion_wheel else None)}
@@ -944,6 +1058,20 @@ class TiCALModule(nn.Module):
                 "wheel_pseudo_labels": wheel_pseudo,
                 "prototype_tau": prototype_tau,
             })
+            data_prototypes = self.current_data_prototypes()
+            if data_prototypes is not None:
+                data_distances, data_logits = {}, {}
+                for name in MODALITIES:
+                    (data_distances[name], data_logits[name], _, _, _) = (
+                        self.wheel_prototype_outputs(
+                            projected[name][valid], data_prototypes))
+                    # Keep a separate temperature without changing the fixed
+                    # Wheel classifier used by the original 75.31 setup.
+                    data_logits[name] = (
+                        -data_distances[name]
+                        / self.data_prototype_temperature)
+                result["data_prototype_distances"] = data_distances
+                result["data_prototype_logits"] = data_logits
         if not query_enabled or not self.banks_ready() or not valid.any():
             return result
 
@@ -993,6 +1121,22 @@ class TiCALModule(nn.Module):
         if not self.training:
             raise RuntimeError("TiCAL anchor banks are frozen during validation/test")
         probability = teacher_logits.softmax(dim=-1)
+        if (self.use_data_prototypes
+                and not bool(self.data_prototype_initialized)):
+            valid_labels = labels[valid_mask.bool()]
+            for name in MODALITIES:
+                valid_projected = projected[name][valid_mask.bool()].detach()
+                tangent = poincare_log_map(
+                    torch.zeros_like(valid_projected), valid_projected,
+                    self.hyp_eps)
+                self.data_prototype_centroid_sum.index_add_(
+                    0, valid_labels, tangent)
+                self.data_prototype_centroid_count.index_add_(
+                    0, valid_labels,
+                    torch.ones_like(valid_labels, dtype=(
+                        self.data_prototype_centroid_count.dtype)))
+            if self.data_prototype_epoch > self.data_prototype_warmup_epochs:
+                self._initialize_data_prototypes()
         confidence, prediction = probability.max(dim=-1)
         base_eligible = (valid_mask.bool() & prediction.eq(labels)
                          & confidence.gt(self.anchor_conf_threshold))

@@ -200,7 +200,11 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_prototype_structure_mode="pairwise-mse",
                  wheel_ordinal_margin=0.2,
                  wheel_free_prototype_init="wheel",
-                 wheel_private_residual_init_std=0.02):
+                 wheel_private_residual_init_std=0.02,
+                 use_data_prototypes=False,
+                 data_prototype_warmup_epochs=5,
+                 data_prototype_ramp_epochs=10,
+                 data_prototype_temperature=1.0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -328,6 +332,7 @@ class Transformer_Based_Model(SDTBackbone):
         self.prototype_loss_warmup_epochs = int(
             prototype_loss_warmup_epochs)
         self.prototype_loss_ramp_epochs = int(prototype_loss_ramp_epochs)
+        self.use_data_prototypes = bool(use_data_prototypes)
         self.tical_epoch = 0
         if use_tical:
             self.tical = TiCALModule(
@@ -352,7 +357,11 @@ class Transformer_Based_Model(SDTBackbone):
                  wheel_prototype_structure_mode,
                  wheel_ordinal_margin,
                  wheel_free_prototype_init,
-                 wheel_private_residual_init_std)
+                 wheel_private_residual_init_std,
+                 use_data_prototypes,
+                 data_prototype_warmup_epochs,
+                 data_prototype_ramp_epochs,
+                 data_prototype_temperature)
         if wheel_uncertainty_mode != "none":
             self.wheel_uncertainty_heads = nn.ModuleDict({
                 name: WheelUncertaintyHead(
@@ -686,6 +695,8 @@ class Transformer_Based_Model(SDTBackbone):
 
     def set_tical_epoch(self, epoch):
         self.tical_epoch = int(epoch)
+        if self.use_tical:
+            self.tical.set_epoch(epoch)
 
     def wheel_uncertainty_progress(self):
         if self.wheel_uncertainty_mode == "none":

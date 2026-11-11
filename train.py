@@ -138,6 +138,17 @@ def build_parser():
     parser.add_argument("--prototype-loss-warmup-epochs", type=int, default=0)
     parser.add_argument("--prototype-loss-ramp-epochs", type=int, default=0)
     parser.add_argument(
+        "--use-data-prototypes", action="store_true",
+        help="add a learned full-D class-prototype bank beside fixed Wheel anchors")
+    parser.add_argument("--lambda-data-prototype", type=float, default=0.0,
+                        help="CE weight for the learned data prototype bank")
+    parser.add_argument("--lambda-data-prototype-cpcc", type=float, default=0.0,
+                        help="Wheel CPCC weight between learned class prototypes")
+    parser.add_argument("--data-prototype-warmup-epochs", type=int, default=5,
+                        help="collect class centroids before learning the data bank")
+    parser.add_argument("--data-prototype-ramp-epochs", type=int, default=10)
+    parser.add_argument("--data-prototype-temperature", type=float, default=1.0)
+    parser.add_argument(
         "--prototype-evidence-fusion",
         choices=PROTOTYPE_EVIDENCE_FUSION_MODES, default="none",
         help="fuse hyperbolic prototype logits into final SDT logits")
@@ -311,6 +322,11 @@ def make_model_config(args, dataset):
             "prototype_loss_warmup_epochs": (
                 args.prototype_loss_warmup_epochs),
             "prototype_loss_ramp_epochs": args.prototype_loss_ramp_epochs,
+            "use_data_prototypes": args.use_data_prototypes,
+            "data_prototype_warmup_epochs": (
+                args.data_prototype_warmup_epochs),
+            "data_prototype_ramp_epochs": args.data_prototype_ramp_epochs,
+            "data_prototype_temperature": args.data_prototype_temperature,
             "wheel_temperature": args.wheel_temperature,
             "wheel_anchor_mix": args.wheel_anchor_mix,
             "wheel_semantic_control": args.wheel_semantic_control,
@@ -362,7 +378,9 @@ def make_criterion(args, device):
                        args.lambda_wheel_utilization,
                        args.lambda_prototype_selector,
                        args.prototype_selector_target_temperature,
-                       args.lambda_wheel_private_residual).to(device)
+                       args.lambda_wheel_private_residual,
+                       args.lambda_data_prototype,
+                       args.lambda_data_prototype_cpcc).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -389,6 +407,11 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
                 correct_distance.detach().cpu())
             storage["prototype_margin_" + name].append(
                 (nearest_wrong - correct_distance).detach().cpu())
+            if tical.get("data_prototype_logits") is not None:
+                storage.setdefault(
+                    "data_prototype_correct_" + name, []).append(
+                    tical["data_prototype_logits"][name].argmax(dim=-1)
+                    .eq(valid_labels).detach().cpu())
             if output.get("wheel_uncertainty") is not None:
                 target = wheel_uncertainty_target(
                     tical["wheel_logits"][name], valid_labels,
@@ -479,6 +502,8 @@ def _tical_epoch_metrics(storage, model, utterance_count):
             result["geometry_{}_off_plane_norm_mean".format(name)] = 0.0
             result["wheel_{}_correct_distance_mean".format(name)] = 0.0
             result["wheel_{}_prototype_margin_mean".format(name)] = 0.0
+            if getattr(model, "use_data_prototypes", False):
+                result["data_prototype_{}_accuracy".format(name)] = 0.0
             if getattr(model, "wheel_uncertainty_mode", "none") != "none":
                 for statistic in (
                         "prediction_mean", "prediction_std", "target_mean",
@@ -538,6 +563,10 @@ def _tical_epoch_metrics(storage, model, utterance_count):
                 "wheel_{}_prototype_margin_mean".format(name): values[
                     "prototype_margin_" + name].float().mean().item(),
             })
+            data_key = "data_prototype_correct_" + name
+            if data_key in values:
+                result["data_prototype_{}_accuracy".format(name)] = (
+                    100.0 * values[data_key].float().mean().item())
             uncertainty_key = "wheel_uncertainty_prediction_" + name
             if uncertainty_key in values:
                 uncertainty = values[uncertainty_key].float()
@@ -1001,11 +1030,15 @@ def main(argv=None):
             or args.lambda_wheel_boundary < 0
             or args.lambda_wheel_alignment < 0
             or args.lambda_wheel_private_residual < 0
+            or args.lambda_data_prototype < 0
+            or args.lambda_data_prototype_cpcc < 0
             or args.lambda_wheel_diversity < 0
             or args.lambda_wheel_utilization < 0
             or args.lambda_prototype_selector < 0
             or args.prototype_loss_warmup_epochs < 0
             or args.prototype_loss_ramp_epochs < 0
+            or args.data_prototype_warmup_epochs < 0
+            or args.data_prototype_ramp_epochs < 0
             or args.lambda_wheel_uncertainty < 0
             or args.wheel_uncertainty_hidden_dim < 1
             or args.wheel_uncertainty_warmup_epochs < 0
@@ -1019,6 +1052,8 @@ def main(argv=None):
     if (args.wheel_ordinal_margin < 0
             or args.wheel_private_residual_init_std < 0):
         raise ValueError("ordinal margin/private residual init must be nonnegative")
+    if args.data_prototype_temperature <= 0:
+        raise ValueError("--data-prototype-temperature must be positive")
     if args.eval_checkpoint and args.init_checkpoint:
         raise ValueError("--eval-checkpoint and --init-checkpoint are mutually exclusive")
     if args.wheel_prototypes_per_class < 1:
@@ -1054,6 +1089,9 @@ def main(argv=None):
             or args.lambda_wheel_boundary > 0
             or args.lambda_wheel_alignment > 0
             or args.lambda_wheel_private_residual > 0
+            or args.use_data_prototypes
+            or args.lambda_data_prototype > 0
+            or args.lambda_data_prototype_cpcc > 0
             or args.lambda_wheel_diversity > 0
             or args.lambda_wheel_utilization > 0
             or args.wheel_prototypes_per_class != 1
@@ -1070,6 +1108,20 @@ def main(argv=None):
             or args.wheel_detach_features
             or args.wheel_feature_source != "pure"):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
+    if args.use_data_prototypes:
+        if args.wheel_geometry != "poincare":
+            raise ValueError("data prototypes require Poincare geometry")
+        if args.wheel_prototype_layout != "fixed-wheel":
+            raise ValueError(
+                "dual data prototypes require --wheel-prototype-layout fixed-wheel")
+        if (args.lambda_data_prototype == 0
+                and args.lambda_data_prototype_cpcc == 0):
+            raise ValueError(
+                "data prototypes require at least one positive loss weight")
+    elif (args.lambda_data_prototype != 0
+          or args.lambda_data_prototype_cpcc != 0):
+        raise ValueError(
+            "data prototype loss weights require --use-data-prototypes")
     if args.prototype_evidence_fusion == "none":
         if args.prototype_evidence_weight != 0:
             raise ValueError(
@@ -1222,6 +1274,10 @@ def main(argv=None):
                      "wheel_prototype_diversity_margin",
                      "prototype_loss_warmup_epochs",
                      "prototype_loss_ramp_epochs",
+                     "use_data_prototypes",
+                     "data_prototype_warmup_epochs",
+                     "data_prototype_ramp_epochs",
+                     "data_prototype_temperature",
                      "wheel_temperature", "wheel_anchor_mix",
                      "wheel_geometry", "wheel_radius_mode",
                      "wheel_fixed_radius", "wheel_zero_residual",
@@ -1265,6 +1321,8 @@ def main(argv=None):
                       "lambda_wheel_structure", "lambda_wheel_boundary",
                       "lambda_wheel_alignment",
                       "lambda_wheel_private_residual",
+                     "lambda_data_prototype",
+                     "lambda_data_prototype_cpcc",
                      "lambda_wheel_diversity",
                      "lambda_wheel_utilization",
                      "lambda_prototype_selector",
@@ -1392,6 +1450,8 @@ def main(argv=None):
                 model_config.get("wheel_permutation_seed", 1729))
         if model_config.get("wheel_detach_features", False):
             method_tag += "_detachwheel"
+        if model_config.get("use_data_prototypes", False):
+            method_tag += "_dualdata"
         method_tag += "_d{}".format(model_config["hyperbolic_dim"])
         if model_config.get("wheel_uncertainty_mode", "none") != "none":
             method_tag += "_unc_{}".format(
@@ -1497,6 +1557,7 @@ def main(argv=None):
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
                   "wheel(proto/cpcc/radius/structure/align/private/boundary/div/use/progress)="
                   "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.2f}; "
+                  "data_proto(ce/cpcc/progress)={:.4f}/{:.4f}/{:.2f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "protofusion(progress/max/alpha/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
@@ -1513,6 +1574,9 @@ def main(argv=None):
                 train_metrics.get("weighted_wheel_diversity", 0.0),
                 train_metrics.get("weighted_wheel_utilization", 0.0),
                 train_metrics.get("prototype_loss_progress", 0.0),
+                train_metrics.get("weighted_data_prototype", 0.0),
+                train_metrics.get("weighted_data_prototype_cpcc", 0.0),
+                train_metrics.get("data_prototype_progress", 0.0),
                 train_metrics.get("weighted_wheel_uncertainty", 0.0),
                 train_metrics.get("wheel_uncertainty_progress", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),
@@ -1567,6 +1631,8 @@ def main(argv=None):
     learned_modality_radii = None
     learned_modality_prototypes = None
     learned_private_residuals = None
+    learned_data_prototypes = None
+    data_prototype_counts = None
     if model_config.get("use_emotion_wheel"):
         learned_radii = model.tical.current_wheel_prototype_radii()
         learned_radii = [float(value) for value in
@@ -1591,6 +1657,14 @@ def main(argv=None):
                 name: private_residuals[name].detach().cpu().tolist()
                 for name in MODALITIES
             }
+        if model_config.get("use_data_prototypes", False):
+            data_prototypes = model.tical.current_data_prototypes()
+            if data_prototypes is not None:
+                learned_data_prototypes = (
+                    data_prototypes.detach().cpu().tolist())
+            data_prototype_counts = (
+                model.tical.data_prototype_centroid_count.detach()
+                .cpu().tolist())
     write_json(run_dir / "summary.json", {
         "best_epoch": best_epoch,
         "selection_protocol": args.selection_protocol,
@@ -1620,6 +1694,10 @@ def main(argv=None):
         "learned_modality_prototype_radii": learned_modality_radii,
         "learned_modality_prototypes": learned_modality_prototypes,
         "learned_private_tangent_residuals": learned_private_residuals,
+        "use_data_prototypes": model_config.get(
+            "use_data_prototypes", False),
+        "learned_data_prototypes": learned_data_prototypes,
+        "data_prototype_centroid_counts": data_prototype_counts,
         "smoke_test": args.max_batches > 0,
     })
     print("Best epoch: {}; test accuracy={:.2f}, weighted F1={:.2f}".format(

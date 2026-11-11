@@ -345,6 +345,72 @@ class TiCALTests(unittest.TestCase):
             self.assertIsNotNone(gradient)
             self.assertGreater(gradient.abs().sum().item(), 0.0)
 
+    def test_dual_data_prototypes_initialize_from_centroids_and_train(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="fixed-wheel",
+            use_data_prototypes=True,
+            data_prototype_warmup_epochs=0,
+            data_prototype_ramp_epochs=0)
+        model.train()
+        model.set_tical_epoch(1)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 2]])
+        full_mask = torch.ones_like(self.mask)
+        full_inputs = (*self.inputs[:3], full_mask, self.inputs[4], [3, 3])
+
+        first = model(*full_inputs)
+        self.assertIsNone(first["tical"]["data_prototype_logits"])
+        fixed_before = model.tical.current_wheel_prototypes().clone()
+        model.update_tical_anchors(first, labels, full_mask.bool())
+        self.assertTrue(bool(model.tical.data_prototype_initialized))
+        self.assertTrue((model.tical.data_prototype_centroid_count > 0).all())
+
+        learned = model.tical.current_data_prototypes()
+        self.assertEqual(learned.shape, (6, 16))
+        self.assertGreater(learned[:, 2:].abs().sum().item(), 0.0)
+        torch.testing.assert_close(
+            model.tical.current_wheel_prototypes(), fixed_before)
+
+        output = model(*full_inputs)
+        self.assertIsNotNone(output["tical"]["data_prototype_logits"])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=0, lambda_wheel_cpcc=0,
+            lambda_data_prototype=0.02,
+            lambda_data_prototype_cpcc=0.01)
+        loss, parts, _ = criterion(output, labels, full_mask.bool())
+        torch.testing.assert_close(
+            loss,
+            parts["weighted_data_prototype"]
+            + parts["weighted_data_prototype_cpcc"])
+        self.assertTrue(torch.isfinite(parts["data_prototype_cpcc"]))
+        loss.backward()
+        gradient = model.tical.data_prototype_tangent.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_data_prototype_schedule_preserves_fixed_wheel_warmup(self):
+        module = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=16, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_layout="fixed-wheel",
+            use_data_prototypes=True,
+            data_prototype_warmup_epochs=5,
+            data_prototype_ramp_epochs=10)
+        for epoch in range(1, 6):
+            module.set_epoch(epoch)
+            self.assertEqual(module.data_prototype_progress(), 0.0)
+        with torch.no_grad():
+            module.data_prototype_centroid_sum.copy_(torch.randn(6, 16))
+            module.data_prototype_centroid_count.fill_(2.0)
+        module.set_epoch(6)
+        self.assertTrue(bool(module.data_prototype_initialized))
+        self.assertAlmostEqual(module.data_prototype_progress(), 0.1)
+        module.set_epoch(15)
+        self.assertEqual(module.data_prototype_progress(), 1.0)
+
     def test_free_prototype_losses_enter_total_objective(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

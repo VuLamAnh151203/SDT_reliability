@@ -156,7 +156,9 @@ class SDTCOLDLoss(nn.Module):
                  lambda_wheel_utilization=0.0,
                  lambda_prototype_selector=0.0,
                  prototype_selector_target_temperature=1.0,
-                 lambda_wheel_private_residual=0.0):
+                 lambda_wheel_private_residual=0.0,
+                 lambda_data_prototype=0.0,
+                 lambda_data_prototype_cpcc=0.0):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
@@ -165,7 +167,8 @@ class SDTCOLDLoss(nn.Module):
                    lambda_wheel_boundary, lambda_wheel_alignment,
                    lambda_wheel_diversity, lambda_wheel_utilization,
                    lambda_prototype_selector,
-                   lambda_wheel_private_residual)
+                   lambda_wheel_private_residual,
+                   lambda_data_prototype, lambda_data_prototype_cpcc)
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("loss weights must be finite and nonnegative")
         self.gamma_1, self.gamma_2, self.gamma_3 = weights[:3]
@@ -186,6 +189,8 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_prototype_selector = lambda_prototype_selector
         self.lambda_wheel_private_residual = (
             lambda_wheel_private_residual)
+        self.lambda_data_prototype = lambda_data_prototype
+        self.lambda_data_prototype_cpcc = lambda_data_prototype_cpcc
         if (not math.isfinite(prototype_selector_target_temperature)
                 or prototype_selector_target_temperature <= 0):
             raise ValueError(
@@ -302,6 +307,27 @@ class SDTCOLDLoss(nn.Module):
         weighted_wheel_proto = (
             self.lambda_wheel_proto * prototype_loss_progress * wheel_proto)
         weighted_wheel_cpcc = self.lambda_wheel_cpcc * wheel_cpcc
+        data_prototype = zero
+        data_prototype_cpcc = zero
+        data_prototype_progress = 0.0
+        if (wheel_ready
+                and tical_output.get("data_prototype_logits") is not None):
+            data_prototype = sum(
+                F.cross_entropy(
+                    tical_output["data_prototype_logits"][name],
+                    valid_targets)
+                for name in MODALITIES
+            ) / len(MODALITIES)
+            data_prototype_cpcc = tical_output.get(
+                "data_prototype_cpcc", zero)
+            data_prototype_progress = float(tical_output.get(
+                "data_prototype_progress", 1.0))
+        weighted_data_prototype = (
+            self.lambda_data_prototype * data_prototype_progress
+            * data_prototype)
+        weighted_data_prototype_cpcc = (
+            self.lambda_data_prototype_cpcc * data_prototype_progress
+            * data_prototype_cpcc)
         wheel_radius = zero
         if wheel_ready:
             wheel_radius = tical_output.get(
@@ -427,6 +453,8 @@ class SDTCOLDLoss(nn.Module):
         total = (sdt + weighted_cold + weighted_reg
                  + weighted_reliability + weighted_hyp
                  + weighted_wheel_proto + weighted_wheel_cpcc
+                 + weighted_data_prototype
+                 + weighted_data_prototype_cpcc
                  + weighted_wheel_radius
                  + weighted_wheel_structure + weighted_wheel_alignment
                  + weighted_wheel_boundary
@@ -447,6 +475,13 @@ class SDTCOLDLoss(nn.Module):
                  "weighted_wheel_proto": weighted_wheel_proto,
                  "wheel_cpcc": wheel_cpcc,
                  "weighted_wheel_cpcc": weighted_wheel_cpcc,
+                 "data_prototype": data_prototype,
+                 "weighted_data_prototype": weighted_data_prototype,
+                 "data_prototype_cpcc": data_prototype_cpcc,
+                 "weighted_data_prototype_cpcc": (
+                     weighted_data_prototype_cpcc),
+                 "data_prototype_progress": (
+                     zero + data_prototype_progress),
                  "wheel_radius": wheel_radius,
                  "weighted_wheel_radius": weighted_wheel_radius,
                   "wheel_structure": wheel_structure,

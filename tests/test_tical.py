@@ -303,6 +303,80 @@ class TiCALTests(unittest.TestCase):
         self.assertIsNotNone(gradient)
         self.assertGreater(gradient.abs().sum().item(), 0.0)
 
+    def test_modality_prototypes_align_to_shared_wheel_centers(self):
+        module = TiCALModule(
+            hidden_dim=8, hyperbolic_dim=6, n_classes=6,
+            dataset="IEMOCAP", use_emotion_wheel=True,
+            wheel_prototype_radius=0.75,
+            wheel_prototype_layout="modality-specific",
+            wheel_free_prototype_max_radius=0.90)
+        self.assertEqual(module.wheel_shared_center_tangent.shape, (6, 6))
+        self.assertEqual(
+            set(module.wheel_modality_prototype_tangents.keys()),
+            set(MODALITIES))
+        centers = module.current_wheel_prototypes()
+        for name in MODALITIES:
+            torch.testing.assert_close(
+                module.current_wheel_prototypes(name), centers)
+
+        with torch.no_grad():
+            for index, name in enumerate(MODALITIES):
+                module.wheel_modality_prototype_tangents[name][
+                    :, 2 + index] += torch.linspace(-0.2, 0.2, 6)
+        alignment = module.wheel_prototype_alignment_loss()
+        structure = module.wheel_prototype_structure_loss()
+        self.assertGreater(alignment.item(), 0.0)
+        self.assertTrue(torch.isfinite(structure))
+        (alignment + structure).backward()
+        self.assertIsNotNone(module.wheel_shared_center_tangent.grad)
+        self.assertGreater(
+            module.wheel_shared_center_tangent.grad.abs().sum().item(), 0.0)
+        for name in MODALITIES:
+            gradient = module.wheel_modality_prototype_tangents[name].grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(gradient.abs().sum().item(), 0.0)
+
+    def test_modality_prototype_losses_and_distance_banks_are_integrated(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=4, use_emotion_wheel=True,
+            wheel_prototype_layout="modality-specific",
+            wheel_free_prototype_max_radius=0.70)
+        with torch.no_grad():
+            offsets = {"t": -0.15, "a": 0.10, "v": 0.20}
+            for name, offset in offsets.items():
+                model.tical.wheel_modality_prototype_tangents[name][
+                    :, 2] += offset
+        output = model(*self.inputs)
+        valid = self.mask.bool()
+        for name in MODALITIES:
+            expected = poincare_distance(
+                output["tical"]["projected"][name][valid].unsqueeze(1),
+                model.tical.current_wheel_prototypes(name).unsqueeze(0))
+            torch.testing.assert_close(
+                output["tical"]["wheel_distances"][name], expected)
+
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_hyp=0, lambda_wheel_proto=1.0,
+            lambda_wheel_cpcc=0, lambda_wheel_structure=0.5,
+            lambda_wheel_alignment=0.25, lambda_wheel_boundary=0.1)
+        loss, parts, _ = criterion(output, labels, valid)
+        torch.testing.assert_close(
+            loss,
+            parts["weighted_wheel_proto"]
+            + parts["weighted_wheel_structure"]
+            + parts["weighted_wheel_alignment"]
+            + parts["weighted_wheel_boundary"])
+        self.assertGreater(parts["wheel_alignment"].item(), 0.0)
+        loss.backward()
+        self.assertIsNotNone(model.tical.wheel_shared_center_tangent.grad)
+        for name in MODALITIES:
+            self.assertIsNotNone(
+                model.tical.wheel_modality_prototype_tangents[name].grad)
+
     def test_per_class_radius_regularization_enters_total_loss(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

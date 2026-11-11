@@ -77,6 +77,11 @@ fi
 CPU_THREADS="${CPU_THREADS:-$DEFAULT_CPU_THREADS}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/results/freeproto_1gpu}"
+EXPERIMENT_SCRIPT="${EXPERIMENT_SCRIPT:-exec_iemocap_wheel_free_prototypes.sh}"
+if [[ "$EXPERIMENT_SCRIPT" == */* || ! -f "$SCRIPT_DIR/$EXPERIMENT_SCRIPT" ]]; then
+  echo "Error: invalid experiment runner '$EXPERIMENT_SCRIPT'." >&2
+  exit 2
+fi
 
 echo "Slurm job:       $SLURM_JOB_ID"
 echo "Allocated GPUs:  ${ALLOCATED_DEVICES:-<not set>}"
@@ -85,6 +90,7 @@ echo "CPU threads:     $CPU_THREADS"
 echo "Data workers:    $NUM_WORKERS"
 echo "Python:          $PYTHON_BIN"
 echo "Output:          $OUTPUT_DIR"
+echo "Experiment:      $EXPERIMENT_SCRIPT"
 
 export OMP_NUM_THREADS="$CPU_THREADS"
 export MKL_NUM_THREADS="$CPU_THREADS"
@@ -106,7 +112,7 @@ sys.stdout.flush()
 PY
 
 export PYTHON="$PYTHON_BIN"
-exec bash "$SCRIPT_DIR/exec_iemocap_wheel_free_prototypes.sh" \
+exec bash "$SCRIPT_DIR/$EXPERIMENT_SCRIPT" \
   --device cuda \
   --gpu-id 0 \
   --num-threads "$CPU_THREADS" \

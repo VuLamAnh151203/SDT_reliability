@@ -65,6 +65,39 @@ Trong VinUni CECS Slurm interactive session, runner một GPU là:
 bash SDT_new/run_iemocap_freeproto_interactive_1gpu.sh
 ```
 
+## Prototype riêng cho từng modality và shared semantic center
+
+Kiến trúc `--wheel-prototype-layout modality-specific` học bốn bank độc lập
+trong Poincaré ball:
+
+- `p_c^T`, `p_c^A`, `p_c^V` là prototype phân loại riêng cho text, audio và
+  visual;
+- `q_c` là shared semantic center, không được dùng trực tiếp để phân
+  loại;
+- `L_wheel_structure(q)` chỉ ép khoảng cách tương đối giữa các `q_c`
+  theo Emotion Wheel;
+- `L_align` là trung bình bình phương khoảng cách Poincaré
+  `d(p_c^m, q_c)^2`, nên ba prototype modality vẫn tự do nhưng chia sẻ cấu
+  trúc semantic thông qua `q_c`.
+
+Runner mặc định dùng `D=16`, `lambda_wheel_proto=0.1`,
+`lambda_wheel_structure=0.05`, `lambda_wheel_alignment=0.05` và
+`lambda_wheel_boundary=0.01`:
+
+```bash
+bash SDT_new/exec_iemocap_wheel_modality_prototypes.sh --device cuda --gpu-id 0
+```
+
+Trong interactive Slurm session, chạy đúng một GPU bằng:
+
+```bash
+GPU_SLOT=0 bash SDT_new/run_iemocap_modality_proto_interactive_1gpu.sh
+```
+
+Có thể override từng hệ số qua `LAMBDA_WHEEL_PROTO`,
+`LAMBDA_WHEEL_STRUCTURE`, `LAMBDA_WHEEL_ALIGNMENT`, `LAMBDA_WHEEL_BOUNDARY`
+và số chiều qua `WHEEL_HYPERBOLIC_DIM`.
+
 Nếu allocation hiện tại có hai GPU, chọn GPU thứ hai bằng
 `GPU_SLOT=1`. Script chọn theo vị trí trong `CUDA_VISIBLE_DEVICES` do Slurm
 cấp, không hard-code GPU vật lý của node.

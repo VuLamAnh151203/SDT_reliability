@@ -127,6 +127,25 @@ def build_parser():
     parser.add_argument("--wheel-anchor-mix", type=float, default=0.5,
                         help="0=anchor typicality, 1=prototype typicality")
     parser.add_argument("--lambda-wheel-proto", type=float, default=0.0)
+    parser.add_argument(
+        "--prototype-modality-weight-mode",
+        choices=("uniform", "fixed", "adaptive"), default="uniform",
+        help="weight T/A/V Prototype CE uniformly, by fixed weights, or detached EMA")
+    parser.add_argument(
+        "--prototype-modality-weights", type=float, nargs=3,
+        default=(1.0, 1.0, 1.0), metavar=("T", "A", "V"),
+        help="target T/A/V weights used by fixed mode")
+    parser.add_argument(
+        "--prototype-modality-weight-warmup-epochs", type=int, default=0)
+    parser.add_argument(
+        "--prototype-modality-weight-ramp-epochs", type=int, default=0)
+    parser.add_argument(
+        "--prototype-modality-weight-ema-momentum", type=float, default=0.9)
+    parser.add_argument(
+        "--prototype-modality-weight-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--prototype-modality-weight-minimum", type=float, default=0.15,
+        help="minimum adaptive modality weight before renormalization")
     parser.add_argument("--lambda-wheel-cpcc", type=float, default=0.0)
     parser.add_argument("--lambda-wheel-radius", type=float, default=0.0,
                         help="keep learned per-class prototype radii near their initial value")
@@ -423,7 +442,14 @@ def make_criterion(args, device):
                        args.prototype_selector_target_temperature,
                        args.lambda_wheel_private_residual,
                        args.lambda_data_prototype,
-                       args.lambda_data_prototype_cpcc).to(device)
+                       args.lambda_data_prototype_cpcc,
+                       args.prototype_modality_weight_mode,
+                       args.prototype_modality_weights,
+                       args.prototype_modality_weight_warmup_epochs,
+                       args.prototype_modality_weight_ramp_epochs,
+                       args.prototype_modality_weight_ema_momentum,
+                       args.prototype_modality_weight_temperature,
+                       args.prototype_modality_weight_minimum).to(device)
 
 
 def _collect_tical_batch(storage, output, labels, prediction, valid):
@@ -739,6 +765,9 @@ def run_epoch(model, criterion, loader, device, optimizer=None, max_batches=0,
     if collect_predictions and not compute_loss:
         raise ValueError("prediction export requires compute_loss=True")
     model.train(training)
+    criterion.train(training)
+    if hasattr(criterion, "set_epoch"):
+        criterion.set_epoch(epoch)
     if training and getattr(model, "selector_only_training", False):
         # Keep the frozen backbone deterministic while retaining dropout in
         # the newly introduced selector/fusion heads.
@@ -1100,6 +1129,20 @@ def main(argv=None):
             or args.prototype_evidence_ramp_epochs < 0
             or args.prototype_evidence_entropy_strength < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
+    if (args.prototype_modality_weight_warmup_epochs < 0
+            or args.prototype_modality_weight_ramp_epochs < 0):
+        raise ValueError("prototype modality weight schedule must be nonnegative")
+    if (len(args.prototype_modality_weights) != len(MODALITIES)
+            or any(not np.isfinite(value) or value < 0
+                   for value in args.prototype_modality_weights)
+            or sum(args.prototype_modality_weights) <= 0):
+        raise ValueError("prototype modality weights must be finite and nonnegative")
+    if not 0 <= args.prototype_modality_weight_ema_momentum < 1:
+        raise ValueError("prototype modality EMA momentum must be in [0,1)")
+    if args.prototype_modality_weight_temperature <= 0:
+        raise ValueError("prototype modality weight temperature must be positive")
+    if not 0 <= args.prototype_modality_weight_minimum < 1 / len(MODALITIES):
+        raise ValueError("prototype modality minimum must be in [0,1/3)")
     if (args.wheel_ordinal_margin < 0
             or args.wheel_private_residual_init_std < 0
             or args.wheel_angular_residual_scale < 0
@@ -1166,7 +1209,10 @@ def main(argv=None):
             or args.lambda_prototype_selector > 0
             or args.wheel_semantic_control != "correct"
             or args.wheel_detach_features
-            or args.wheel_feature_source != "pure"):
+            or args.wheel_feature_source != "pure"
+            or args.prototype_modality_weight_mode != "uniform"
+            or args.prototype_modality_weight_warmup_epochs != 0
+            or args.prototype_modality_weight_ramp_epochs != 0):
         raise ValueError("wheel loss weights require --use-emotion-wheel")
     if args.use_data_prototypes:
         if args.wheel_geometry != "poincare":
@@ -1415,6 +1461,13 @@ def main(argv=None):
                      "prototype_selector_target_temperature",
                      "wheel_uncertainty_mode",
                      "lambda_wheel_uncertainty",
+                     "prototype_modality_weight_mode",
+                     "prototype_modality_weights",
+                     "prototype_modality_weight_warmup_epochs",
+                     "prototype_modality_weight_ramp_epochs",
+                     "prototype_modality_weight_ema_momentum",
+                     "prototype_modality_weight_temperature",
+                     "prototype_modality_weight_minimum",
                      "wheel_uncertainty_hidden_dim",
                      "wheel_uncertainty_temperature",
                      "wheel_uncertainty_gate_strength",
@@ -1543,6 +1596,9 @@ def main(argv=None):
                 model_config.get("wheel_permutation_seed", 1729))
         if model_config.get("wheel_detach_features", False):
             method_tag += "_detachwheel"
+        if args.prototype_modality_weight_mode != "uniform":
+            method_tag += "_protow_{}".format(
+                args.prototype_modality_weight_mode)
         if model_config.get("use_data_prototypes", False):
             method_tag += ("_learnedwheel"
                            if model_config.get(
@@ -1657,6 +1713,7 @@ def main(argv=None):
                   "wheel(proto/cpcc/radius/structure/anchor/align/private/boundary/div/use/progress)="
                   "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.2f}; "
                   "data_proto(ce/cpcc/progress)={:.4f}/{:.4f}/{:.2f}; "
+                  "proto_w(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "protofusion(progress/max/alpha/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
                   "kappa={:.3f} ready={:.3f}; anchors(T/A/V)={:.0f}/{:.0f}/{:.0f} ({:.1f}s)".format(
@@ -1677,6 +1734,9 @@ def main(argv=None):
                 train_metrics.get("weighted_data_prototype", 0.0),
                 train_metrics.get("weighted_data_prototype_cpcc", 0.0),
                 train_metrics.get("data_prototype_progress", 0.0),
+                train_metrics.get("wheel_proto_weight_t", 1.0 / 3.0),
+                train_metrics.get("wheel_proto_weight_a", 1.0 / 3.0),
+                train_metrics.get("wheel_proto_weight_v", 1.0 / 3.0),
                 train_metrics.get("weighted_wheel_uncertainty", 0.0),
                 train_metrics.get("wheel_uncertainty_progress", 0.0),
                 train_metrics.get("wheel_uncertainty_weight_t", 0.0),

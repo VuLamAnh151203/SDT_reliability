@@ -355,6 +355,56 @@ class TiCALTests(unittest.TestCase):
         self.assertGreater(
             model.tical.wheel_angular_residual.grad.abs().sum().item(), 0.0)
 
+    def test_prototype_modality_fixed_and_adaptive_weights(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="angular-residual",
+            wheel_prototype_structure_mode="relational-kl")
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        fixed = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=1.0,
+            prototype_modality_weight_mode="fixed",
+            prototype_modality_weights=(0.45, 0.35, 0.20),
+            prototype_modality_weight_warmup_epochs=5,
+            prototype_modality_weight_ramp_epochs=10)
+        expected_by_epoch = {
+            5: torch.tensor([1 / 3, 1 / 3, 1 / 3]),
+            10: torch.tensor([0.39166668, 0.34166667, 0.26666668]),
+            15: torch.tensor([0.45, 0.35, 0.20]),
+        }
+        for epoch, expected in expected_by_epoch.items():
+            fixed.set_epoch(epoch)
+            _, parts, _ = fixed(output, labels, self.mask.bool())
+            actual = torch.stack([
+                parts["wheel_proto_weight_" + name] for name in MODALITIES
+            ]).cpu()
+            torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
+
+        adaptive = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=1.0,
+            prototype_modality_weight_mode="adaptive",
+            prototype_modality_weight_warmup_epochs=0,
+            prototype_modality_weight_ramp_epochs=0,
+            prototype_modality_weight_ema_momentum=0.9,
+            prototype_modality_weight_temperature=1.0,
+            prototype_modality_weight_minimum=0.15)
+        adaptive.train()
+        adaptive.set_epoch(1)
+        _, parts, _ = adaptive(output, labels, self.mask.bool())
+        weights = torch.stack([
+            parts["wheel_proto_weight_" + name] for name in MODALITIES
+        ])
+        torch.testing.assert_close(
+            weights.sum(), torch.ones_like(weights.sum()))
+        self.assertTrue((weights >= 0.15).all())
+        self.assertFalse(weights.requires_grad)
+
     def test_shared_private_prototypes_center_residuals_and_backpropagate(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

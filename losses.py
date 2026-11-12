@@ -159,7 +159,14 @@ class SDTCOLDLoss(nn.Module):
                  prototype_selector_target_temperature=1.0,
                  lambda_wheel_private_residual=0.0,
                  lambda_data_prototype=0.0,
-                 lambda_data_prototype_cpcc=0.0):
+                 lambda_data_prototype_cpcc=0.0,
+                 prototype_modality_weight_mode="uniform",
+                 prototype_modality_weights=(1.0, 1.0, 1.0),
+                 prototype_modality_weight_warmup_epochs=0,
+                 prototype_modality_weight_ramp_epochs=0,
+                 prototype_modality_weight_ema_momentum=0.9,
+                 prototype_modality_weight_temperature=1.0,
+                 prototype_modality_weight_minimum=0.15):
         super().__init__()
         weights = (gamma_1, gamma_2, gamma_3, lambda_co, lambda_reg,
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
@@ -194,6 +201,45 @@ class SDTCOLDLoss(nn.Module):
             lambda_wheel_private_residual)
         self.lambda_data_prototype = lambda_data_prototype
         self.lambda_data_prototype_cpcc = lambda_data_prototype_cpcc
+        if prototype_modality_weight_mode not in (
+                "uniform", "fixed", "adaptive"):
+            raise ValueError("unknown prototype modality weight mode")
+        if len(prototype_modality_weights) != len(MODALITIES):
+            raise ValueError("prototype modality weights must contain T/A/V")
+        modality_weights = torch.tensor(
+            prototype_modality_weights, dtype=torch.float32)
+        if (not torch.isfinite(modality_weights).all()
+                or (modality_weights < 0).any()
+                or modality_weights.sum() <= 0):
+            raise ValueError("prototype modality weights must be finite and nonnegative")
+        if (prototype_modality_weight_warmup_epochs < 0
+                or prototype_modality_weight_ramp_epochs < 0):
+            raise ValueError("prototype modality weight schedule must be nonnegative")
+        if not 0 <= prototype_modality_weight_ema_momentum < 1:
+            raise ValueError("prototype modality EMA momentum must be in [0,1)")
+        if prototype_modality_weight_temperature <= 0:
+            raise ValueError("prototype modality weight temperature must be positive")
+        if not 0 <= prototype_modality_weight_minimum < 1 / len(MODALITIES):
+            raise ValueError("prototype modality minimum must be in [0,1/3)")
+        self.prototype_modality_weight_mode = prototype_modality_weight_mode
+        self.prototype_modality_weight_warmup_epochs = int(
+            prototype_modality_weight_warmup_epochs)
+        self.prototype_modality_weight_ramp_epochs = int(
+            prototype_modality_weight_ramp_epochs)
+        self.prototype_modality_weight_ema_momentum = float(
+            prototype_modality_weight_ema_momentum)
+        self.prototype_modality_weight_temperature = float(
+            prototype_modality_weight_temperature)
+        self.prototype_modality_weight_minimum = float(
+            prototype_modality_weight_minimum)
+        self.prototype_modality_weight_epoch = 0
+        self.register_buffer(
+            "prototype_modality_fixed_weights",
+            modality_weights / modality_weights.sum())
+        self.register_buffer(
+            "prototype_modality_loss_ema", torch.ones(len(MODALITIES)))
+        self.register_buffer(
+            "prototype_modality_ema_initialized", torch.tensor(False))
         if (not math.isfinite(prototype_selector_target_temperature)
                 or prototype_selector_target_temperature <= 0):
             raise ValueError(
@@ -209,6 +255,54 @@ class SDTCOLDLoss(nn.Module):
         self.ce = MaskedNLLLoss(class_weights)
         self.kl = MaskedKLDivLoss()
         self.cold = COLDLoss(detach_errors=detach_errors)
+
+    def set_epoch(self, epoch):
+        self.prototype_modality_weight_epoch = int(epoch)
+
+    def prototype_modality_weight_progress(self):
+        if self.prototype_modality_weight_mode == "uniform":
+            return 0.0
+        completed = (self.prototype_modality_weight_epoch
+                     - self.prototype_modality_weight_warmup_epochs)
+        if completed <= 0:
+            return 0.0
+        if self.prototype_modality_weight_ramp_epochs == 0:
+            return 1.0
+        return min(1.0, completed
+                   / self.prototype_modality_weight_ramp_epochs)
+
+    def current_prototype_modality_weights(self, modality_losses=None):
+        """Return detached T/A/V weights, updating EMA only while training."""
+        uniform = self.prototype_modality_fixed_weights.new_full(
+            (len(MODALITIES),), 1.0 / len(MODALITIES))
+        if self.prototype_modality_weight_mode == "uniform":
+            return uniform
+        if self.prototype_modality_weight_mode == "fixed":
+            target = self.prototype_modality_fixed_weights
+        else:
+            if modality_losses is not None and self.training:
+                observed = torch.stack([
+                    modality_losses[name].detach() for name in MODALITIES
+                ]).to(self.prototype_modality_loss_ema)
+                with torch.no_grad():
+                    if not bool(self.prototype_modality_ema_initialized):
+                        self.prototype_modality_loss_ema.copy_(observed)
+                        self.prototype_modality_ema_initialized.fill_(True)
+                    else:
+                        momentum = self.prototype_modality_weight_ema_momentum
+                        self.prototype_modality_loss_ema.mul_(momentum).add_(
+                            observed, alpha=1.0 - momentum)
+            if not bool(self.prototype_modality_ema_initialized):
+                target = uniform
+            else:
+                target = torch.softmax(
+                    -self.prototype_modality_loss_ema
+                    / self.prototype_modality_weight_temperature, dim=0)
+                minimum = self.prototype_modality_weight_minimum
+                target = (minimum
+                          + (1.0 - len(MODALITIES) * minimum) * target)
+        progress = self.prototype_modality_weight_progress()
+        return ((1.0 - progress) * uniform + progress * target).detach()
 
     def forward(self, outputs, labels, valid_mask, reliability_targets=None,
                 sample_keep_mask=None, modality_keep_mask=None):
@@ -281,6 +375,8 @@ class SDTCOLDLoss(nn.Module):
                 for name in MODALITIES) / len(MODALITIES)
         weighted_hyp = self.lambda_hyp * hyp
         wheel_proto = zero
+        wheel_proto_by_modality = {name: zero for name in MODALITIES}
+        prototype_modality_weights = self.current_prototype_modality_weights()
         wheel_cpcc = zero
         wheel_ready = bool(
             tical_output is not None
@@ -289,11 +385,18 @@ class SDTCOLDLoss(nn.Module):
         )
         if wheel_ready:
             valid_targets = labels[valid]
-            wheel_proto = sum(
-                F.cross_entropy(
+            wheel_proto_by_modality = {
+                name: F.cross_entropy(
                     tical_output["wheel_logits"][name], valid_targets)
                 for name in MODALITIES
-            ) / len(MODALITIES)
+            }
+            prototype_modality_weights = (
+                self.current_prototype_modality_weights(
+                    wheel_proto_by_modality))
+            wheel_proto = sum(
+                prototype_modality_weights[index]
+                * wheel_proto_by_modality[name]
+                for index, name in enumerate(MODALITIES))
             class_distances = tical_output["wheel_class_distances"]
             wheel_cpcc = sum(
                 hyp_cpcc_loss(
@@ -483,6 +586,18 @@ class SDTCOLDLoss(nn.Module):
                  "weighted_hyp": weighted_hyp, **cold_parts,
                  "wheel_proto": wheel_proto,
                  "weighted_wheel_proto": weighted_wheel_proto,
+                 **{
+                     "wheel_proto_{}".format(name):
+                     wheel_proto_by_modality[name]
+                     for name in MODALITIES
+                 },
+                 **{
+                     "wheel_proto_weight_{}".format(name):
+                     prototype_modality_weights[index]
+                     for index, name in enumerate(MODALITIES)
+                 },
+                 "prototype_modality_weight_progress": (
+                     zero + self.prototype_modality_weight_progress()),
                  "wheel_cpcc": wheel_cpcc,
                  "weighted_wheel_cpcc": weighted_wheel_cpcc,
                  "data_prototype": data_prototype,

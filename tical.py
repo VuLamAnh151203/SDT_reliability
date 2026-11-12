@@ -26,8 +26,10 @@ WHEEL_PROTOTYPE_RADIUS_MODES = (
     "per-class-regularized",
 )
 WHEEL_PROTOTYPE_LAYOUTS = (
-    "fixed-wheel", "free", "modality-specific", "shared-private")
-WHEEL_PROTOTYPE_STRUCTURE_MODES = ("pairwise-mse", "ordinal")
+    "fixed-wheel", "free", "modality-specific", "shared-private",
+    "angular-residual")
+WHEEL_PROTOTYPE_STRUCTURE_MODES = (
+    "pairwise-mse", "ordinal", "relational-kl")
 WHEEL_FREE_PROTOTYPE_INITS = ("wheel", "random")
 DATA_PROTOTYPE_LAYOUTS = ("shared", "modality-specific")
 DATA_PROTOTYPE_INITS = ("centroid", "random")
@@ -372,7 +374,11 @@ class TiCALModule(nn.Module):
                  replace_fixed_wheel_prototypes=False,
                  data_prototype_warmup_epochs=5,
                  data_prototype_ramp_epochs=10,
-                 data_prototype_temperature=1.0):
+                 data_prototype_temperature=1.0,
+                 wheel_angular_residual_scale=1.0,
+                 wheel_angular_residual_init_std=0.02,
+                 wheel_relation_target_temperature=1.0,
+                 wheel_relation_prototype_temperature=1.0):
         super().__init__()
         values = (anchor_conf_threshold, hyp_eps, typicality_eps,
                   consistency_t, consistency_k)
@@ -447,6 +453,29 @@ class TiCALModule(nn.Module):
         self.wheel_free_prototype_init = wheel_free_prototype_init
         self.wheel_private_residual_init_std = float(
             wheel_private_residual_init_std)
+        angular_values = (
+            wheel_angular_residual_scale,
+            wheel_angular_residual_init_std,
+            wheel_relation_target_temperature,
+            wheel_relation_prototype_temperature,
+        )
+        if any(not math.isfinite(value) for value in angular_values):
+            raise ValueError("angular-residual settings must be finite")
+        if wheel_angular_residual_scale < 0:
+            raise ValueError("angular residual scale must be nonnegative")
+        if wheel_angular_residual_init_std < 0:
+            raise ValueError("angular residual init std must be nonnegative")
+        if (wheel_relation_target_temperature <= 0
+                or wheel_relation_prototype_temperature <= 0):
+            raise ValueError("relational temperatures must be positive")
+        self.wheel_angular_residual_scale = float(
+            wheel_angular_residual_scale)
+        self.wheel_angular_residual_init_std = float(
+            wheel_angular_residual_init_std)
+        self.wheel_relation_target_temperature = float(
+            wheel_relation_target_temperature)
+        self.wheel_relation_prototype_temperature = float(
+            wheel_relation_prototype_temperature)
         if (data_prototype_warmup_epochs < 0
                 or data_prototype_ramp_epochs < 0):
             raise ValueError("data prototype schedule must be nonnegative")
@@ -507,6 +536,8 @@ class TiCALModule(nn.Module):
         self.register_parameter("wheel_prototype_radius_logits", None)
         self.register_parameter("wheel_free_prototype_tangent", None)
         self.register_parameter("wheel_shared_center_tangent", None)
+        self.register_parameter("wheel_angular_subspace", None)
+        self.register_parameter("wheel_angular_residual", None)
         self.wheel_modality_prototype_tangents = nn.ParameterDict()
         self.wheel_modality_private_tangents = nn.ParameterDict()
         self.register_parameter("data_prototype_tangent", None)
@@ -553,12 +584,14 @@ class TiCALModule(nn.Module):
                 raise ValueError(
                     "free prototype maximum radius must be in (0, 1-eps)")
             if (self.wheel_prototype_layout in (
-                    "free", "modality-specific", "shared-private")
+                    "free", "modality-specific", "shared-private",
+                    "angular-residual")
                     and self.wheel_geometry != "poincare"):
                 raise ValueError(
                     "free Wheel prototype layouts require Poincare geometry")
             if (self.wheel_prototype_layout in (
-                    "free", "modality-specific", "shared-private")
+                    "free", "modality-specific", "shared-private",
+                    "angular-residual")
                     and self.wheel_prototype_radius_mode != "fixed-shared"):
                 raise ValueError(
                     "free Wheel prototype layouts are incompatible with learned radius modes")
@@ -621,6 +654,17 @@ class TiCALModule(nn.Module):
                 # wheel exactly, but every coordinate is subsequently free.
                 self.wheel_free_prototype_tangent = nn.Parameter(
                     initial_tangent.clone())
+            elif self.wheel_prototype_layout == "angular-residual":
+                # U is optimized in R^{D x 2}; a reduced QR factorization in
+                # every forward pass enforces U^T U = I exactly.  The raw
+                # class residuals are projected onto span(U)^perp before use.
+                subspace = torch.zeros(hyperbolic_dim, 2)
+                subspace[:2, :2] = torch.eye(2)
+                self.wheel_angular_subspace = nn.Parameter(subspace)
+                residual = self.wheel_angular_residual_init_std * torch.randn(
+                    n_classes, hyperbolic_dim)
+                residual[:, :2] = 0.0
+                self.wheel_angular_residual = nn.Parameter(residual)
             elif self.wheel_prototype_layout == "modality-specific":
                 # q_c: the shared semantic centers constrained by the Wheel.
                 self.wheel_shared_center_tangent = nn.Parameter(
@@ -770,12 +814,56 @@ class TiCALModule(nn.Module):
                  / prototype_norm.clamp_min(self.hyp_eps)).clamp(max=1.0)
         return prototypes * scale
 
+    def current_wheel_angular_subspace(self):
+        """Return the learnable orthonormal D x 2 angular embedding."""
+        if self.wheel_prototype_layout != "angular-residual":
+            return None
+        basis, triangular = torch.linalg.qr(
+            self.wheel_angular_subspace, mode="reduced")
+        # Fix the otherwise arbitrary QR column signs.  Detaching the sign
+        # leaves the useful QR gradient unchanged and avoids sign-flip noise.
+        diagonal = torch.diagonal(triangular)
+        signs = torch.where(
+            diagonal >= 0, torch.ones_like(diagonal),
+            -torch.ones_like(diagonal)).detach()
+        return basis * signs.unsqueeze(0)
+
+    def current_wheel_angular_residuals(self):
+        """Project class residuals onto the complement of span(U)."""
+        if self.wheel_prototype_layout != "angular-residual":
+            return None
+        subspace = self.current_wheel_angular_subspace()
+        in_plane = (self.wheel_angular_residual @ subspace) @ subspace.T
+        return self.wheel_angular_residual - in_plane
+
+    def current_wheel_angular_tangents(self):
+        """Construct U q_c + alpha r_c^perp in the tangent space at zero."""
+        if self.wheel_prototype_layout != "angular-residual":
+            return None
+        subspace = self.current_wheel_angular_subspace()
+        reference_radius = math.atanh(self.wheel_prototype_radius)
+        references = reference_radius * torch.stack((
+            torch.cos(self.wheel_angles), torch.sin(self.wheel_angles)),
+            dim=-1)
+        anchors = references @ subspace.T
+        return (anchors + self.wheel_angular_residual_scale
+                * self.current_wheel_angular_residuals())
+
+    def wheel_anchor_regularization(self):
+        """Penalize only the orthogonal residual of angular prototypes."""
+        residuals = self.current_wheel_angular_residuals()
+        if residuals is None:
+            if self.use_emotion_wheel:
+                return self.wheel_prototypes.sum() * 0.0
+            return torch.tensor(0.0)
+        return residuals.square().sum(dim=-1).mean()
+
     def current_wheel_prototype_radii(self, modality=None):
         """Return the bounded Euclidean ball radius of every class prototype."""
         if not self.use_emotion_wheel:
             return None
         if self.wheel_prototype_layout in (
-                "modality-specific", "shared-private"):
+                "modality-specific", "shared-private", "angular-residual"):
             return self.current_wheel_prototypes(modality).norm(p=2, dim=-1)
         if self.wheel_free_prototype_tangent is not None:
             return self.current_wheel_prototypes().norm(p=2, dim=-1)
@@ -799,6 +887,9 @@ class TiCALModule(nn.Module):
         """
         if not self.use_emotion_wheel:
             return None
+        if self.wheel_prototype_layout == "angular-residual":
+            return self._exp_map_free_prototypes(
+                self.current_wheel_angular_tangents())
         if self.wheel_prototype_layout == "modality-specific":
             if modality is None:
                 tangent = self.wheel_shared_center_tangent
@@ -913,7 +1004,8 @@ class TiCALModule(nn.Module):
         """
         if (not self.use_emotion_wheel
                 or self.wheel_prototype_layout not in (
-                    "free", "modality-specific", "shared-private")):
+                    "free", "modality-specific", "shared-private",
+                    "angular-residual")):
             if self.use_emotion_wheel:
                 return self.wheel_prototypes.sum() * 0.0
             return torch.tensor(0.0)
@@ -922,6 +1014,26 @@ class TiCALModule(nn.Module):
             prototypes[:, None, :], prototypes[None, :, :],
             "poincare", self.hyp_eps)
         target_matrix = self.wheel_class_distances.type_as(learned_matrix)
+        if self.wheel_prototype_structure_mode == "relational-kl":
+            count = prototypes.size(0)
+            diagonal = torch.eye(
+                count, device=prototypes.device, dtype=torch.bool)
+            target_logits = (
+                -target_matrix / self.wheel_relation_target_temperature
+            ).masked_fill(diagonal, float("-inf"))
+            learned_logits = (
+                -learned_matrix / self.wheel_relation_prototype_temperature
+            ).masked_fill(diagonal, float("-inf"))
+            target_probability = torch.softmax(target_logits, dim=-1)
+            learned_log_probability = torch.log_softmax(
+                learned_logits, dim=-1)
+            off_diagonal = ~diagonal
+            target_off = target_probability[off_diagonal]
+            learned_log_off = learned_log_probability[off_diagonal]
+            target_log_off = target_off.clamp_min(
+                self.typicality_eps).log()
+            return (target_off * (
+                target_log_off - learned_log_off)).sum() / count
         if self.wheel_prototype_structure_mode == "ordinal":
             count = prototypes.size(0)
             class_index = torch.arange(count, device=prototypes.device)
@@ -987,7 +1099,8 @@ class TiCALModule(nn.Module):
         """Softly keep free prototypes away from the unstable ball boundary."""
         if (not self.use_emotion_wheel
                 or self.wheel_prototype_layout not in (
-                    "free", "modality-specific", "shared-private")):
+                    "free", "modality-specific", "shared-private",
+                    "angular-residual")):
             if self.use_emotion_wheel:
                 return self.wheel_prototypes.sum() * 0.0
             return torch.tensor(0.0)
@@ -996,6 +1109,8 @@ class TiCALModule(nn.Module):
         # prototype has already moved close to radius one.
         if self.wheel_prototype_layout == "free":
             tangents = [self.wheel_free_prototype_tangent]
+        elif self.wheel_prototype_layout == "angular-residual":
+            tangents = [self.current_wheel_angular_tangents()]
         elif self.wheel_prototype_layout == "modality-specific":
             tangents = [self.wheel_shared_center_tangent]
             tangents.extend(
@@ -1055,6 +1170,16 @@ class TiCALModule(nn.Module):
                       self.wheel_prototype_alignment_loss()),
                   "wheel_private_residual": (
                       self.wheel_private_residual_regularization()),
+                  "wheel_anchor_regularization": (
+                      self.wheel_anchor_regularization()),
+                  "wheel_angular_residual_scale": (
+                      self.wheel_angular_residual_scale),
+                  "wheel_relation_target_temperature": (
+                      self.wheel_relation_target_temperature),
+                  "wheel_relation_prototype_temperature": (
+                      self.wheel_relation_prototype_temperature),
+                  "wheel_angular_subspace": (
+                      self.current_wheel_angular_subspace()),
                   "wheel_free_prototype_init": (
                       self.wheel_free_prototype_init),
                   "wheel_prototype_diversity": (

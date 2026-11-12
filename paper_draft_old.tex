@@ -1,0 +1,400 @@
+\documentclass[letterpaper,journal]{IEEEtran}
+% Archived fixed Emotion-Wheel draft before the RGRPL-Base revision.
+
+\usepackage{amsmath}
+\usepackage{amsfonts}
+
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+\begin{document}
+
+\title{Poincar\'e Emotion-Wheel Regularization for Multimodal Emotion Recognition in Conversation}
+\author{}
+\maketitle
+
+\begin{abstract}
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+\section{Related Work}
+\label{sec:related_work}
+
+\section{Problem Definition and Proposed Method}
+\label{sec:problem_and_method}
+
+\subsection{Problem Definition}
+\label{subsec:problem_definition}
+
+\subsubsection{Multimodal Emotion Recognition in Conversation}
+
+Let a conversational dataset be denoted by
+\(\mathcal{D}=\{\mathcal{C}_{n}\}_{n=1}^{N}\), where the \(n\)-th
+conversation contains an ordered sequence of utterances
+\(\mathcal{C}_{n}=\{u_{n,t}\}_{t=1}^{L_n}\).
+Each utterance is associated with aligned textual, acoustic, and visual
+observations,
+\begin{equation}
+    x_{n,t}=\left(x_{n,t}^{T},x_{n,t}^{A},x_{n,t}^{V}\right),
+    \qquad
+    y_{n,t}\in\mathcal{Y}=\{1,\ldots,C\},
+    \label{eq:problem_input}
+\end{equation}
+where \(y_{n,t}\) is the ground-truth emotion class and
+\(C=|\mathcal{Y}|\). The modality set is denoted by
+\(\mathcal{M}=\{T,A,V\}\). The objective is to learn a contextual classifier
+\(f_{\Theta}\) that predicts the emotion of every valid utterance while
+exploiting both conversational context and complementary cross-modal evidence:
+\begin{equation}
+    \hat{y}_{n,t}
+    =\underset{c\in\mathcal{Y}}{\arg\max}\;
+    p_{\Theta}\!\left(c\mid
+    x_{n,1:L_n}^{T},x_{n,1:L_n}^{A},x_{n,1:L_n}^{V}\right).
+    \label{eq:problem_prediction}
+\end{equation}
+Padding utterances introduced by mini-batching are excluded from all losses
+and pairwise statistics through a binary validity mask.
+
+The standard categorical objective treats the emotion classes as independent
+symbols. This assumption is restrictive for emotion recognition: confusing
+two semantically adjacent emotions should not be considered geometrically
+equivalent to confusing two emotions located at opposite ends of an affective
+continuum. We therefore seek a model that satisfies two requirements
+simultaneously. First, it must retain the discriminative and contextual
+modeling ability of the original SDT architecture. Second, its modality-level
+representations should respect a known circular organization of emotion
+classes. The latter requirement is introduced as an auxiliary geometric prior,
+rather than as a replacement for the task classifier.
+
+\subsubsection{SDT Prediction and Training Objective}
+
+For every valid utterance, the SDT backbone produces a pure self-modal
+representation and an interaction-enhanced representation for each modality:
+\begin{equation}
+    h_{n,t}^{m}\in\mathbb{R}^{d_h},
+    \qquad
+    \widetilde{h}_{n,t}^{m}\in\mathbb{R}^{d_h},
+    \qquad m\in\mathcal{M}.
+    \label{eq:sdt_representations}
+\end{equation}
+In the implementation, the pure representations correspond to
+\(H_{TT},H_{AA},H_{VV}\), whereas
+\(\widetilde{h}^{T},\widetilde{h}^{A},\widetilde{h}^{V}\) correspond to
+\(H'_{T},H'_{A},H'_{V}\). The enhanced features are combined by the learned
+SDT fusion gate to obtain a multimodal representation
+\(\widetilde{h}_{n,t}\). Specifically, the shared fusion layer produces a
+feature-wise score
+\(a_{n,t}^{m}=G\widetilde{h}_{n,t}^{m}\in\mathbb{R}^{d_h}\), followed by a
+softmax across modalities at each feature coordinate:
+\begin{align}
+    [\alpha_{n,t}^{m}]_k
+    &=\frac{\exp([a_{n,t}^{m}]_k)}
+    {\sum_{q\in\mathcal{M}}\exp([a_{n,t}^{q}]_k)},
+    \label{eq:sdt_fusion_weights}\\
+    \widetilde{h}_{n,t}
+    &=\sum_{m\in\mathcal{M}}
+    \alpha_{n,t}^{m}\odot\widetilde{h}_{n,t}^{m},
+    \label{eq:sdt_fusion}\\
+    p_{n,t}
+    &=\operatorname{softmax}\!\left(W_o\widetilde{h}_{n,t}+b_o\right).
+    \label{eq:sdt_output}
+\end{align}
+Here, \(k\in\{1,\ldots,d_h\}\), and \(\odot\) denotes element-wise
+multiplication. Each modality additionally has a student classifier producing
+\(p_{n,t}^{m}\). The original SDT objective is
+\begin{equation}
+    \mathcal{L}_{\mathrm{SDT}}
+    =\gamma_1\mathcal{L}_{\mathrm{task}}
+    +\gamma_2\mathcal{L}_{\mathrm{student}}
+    +\gamma_3\mathcal{L}_{\mathrm{KD}},
+    \label{eq:sdt_objective}
+\end{equation}
+where \(\mathcal{L}_{\mathrm{task}}\) is the class-weighted negative
+log-likelihood of the fused prediction. Defining
+\(Z_{\mathcal{I}}=\sum_{i\in\mathcal{I}}\omega_{y_i}\), it is written as
+\begin{equation}
+    \mathcal{L}_{\mathrm{task}}
+    =-\frac{1}{Z_{\mathcal{I}}}
+    \sum_{i\in\mathcal{I}}\omega_{y_i}\log p_i[y_i],
+    \label{eq:sdt_task_loss}
+\end{equation}
+where \(\mathcal{I}\) is the set of valid utterances in the mini-batch.
+The unimodal supervision term is
+\begin{equation}
+    \mathcal{L}_{\mathrm{student}}
+    =-\sum_{m\in\mathcal{M}}
+    \frac{1}{Z_{\mathcal{I}}}
+    \sum_{i\in\mathcal{I}}
+    \omega_{y_i}\log p_i^{m}[y_i].
+    \label{eq:sdt_student_loss}
+\end{equation}
+Finally, \(\mathcal{L}_{\mathrm{KD}}\) distills the fused prediction into the
+three modality-specific students:
+\begin{equation}
+    \mathcal{L}_{\mathrm{KD}}
+    =\sum_{m\in\mathcal{M}}
+    \frac{1}{|\mathcal{I}|}
+    \sum_{i\in\mathcal{I}}
+    D_{\mathrm{KL}}\!\left(
+    p_i^{(\tau_s)}\,\Vert\,p_i^{m,(\tau_s)}\right),
+    \label{eq:sdt_kd_loss}
+\end{equation}
+where \(\tau_s\) is the SDT distillation temperature. We retain this prediction
+path and augment only its training objective with the structured emotion prior
+described next.
+
+\subsection{Proposed Method}
+\label{subsec:proposed_method}
+
+\subsubsection{Method Overview}
+
+We propose a fixed Poincar\'e Emotion-Wheel regularization framework for SDT.
+The method attaches a geometry-aware auxiliary branch to the pure
+modality-specific representations in \eqref{eq:sdt_representations}, while the
+enhanced representations continue to drive the original SDT fusion and final
+classifier. The auxiliary branch consists of three components: 1) a learned
+projector for each modality, mapping Euclidean features into a common
+\(D\)-dimensional Poincar\'e ball; 2) a shared bank of fixed class prototypes
+whose angular arrangement follows the Emotion Wheel; and 3) two complementary
+objectives that impose point-to-prototype discrimination and pairwise
+structure preservation, respectively.
+
+This separation is deliberate. The Emotion Wheel acts as a semantic
+regularizer during optimization, but its distance-based logits are not fused
+with the SDT logits. Consequently, the proposed method can shape the learned
+representation without forcing an imperfect unimodal geometric classifier to
+directly alter the multimodal decision at inference time.
+
+\subsubsection{Modality-Specific Projection into the Poincar\'e Ball}
+
+We use the unit-curvature Poincar\'e ball
+\begin{equation}
+    \mathbb{D}^{D}
+    =\left\{z\in\mathbb{R}^{D}:\lVert z\rVert_2<1\right\},
+    \label{eq:poincare_ball}
+\end{equation}
+whose constant sectional curvature is \(-1\). For each modality
+\(m\in\mathcal{M}\), a learned affine projector first maps a pure SDT feature
+to the tangent space at the origin:
+\begin{equation}
+    v_i^{m}=W_m h_i^{m}+b_m,
+    \qquad v_i^{m}\in T_{0}\mathbb{D}^{D}\simeq\mathbb{R}^{D}.
+    \label{eq:tangent_projection}
+\end{equation}
+The tangent vector is then mapped into the ball through the exponential map at
+the origin:
+\begin{equation}
+    z_i^{m}=\operatorname{Exp}_{0}(v_i^{m})
+    =\tanh\!\left(\lVert v_i^{m}\rVert_2\right)
+    \frac{v_i^{m}}{\lVert v_i^{m}\rVert_2},
+    \label{eq:poincare_expmap}
+\end{equation}
+with the zero-vector case defined by continuity. This parameterization
+guarantees \(z_i^{m}\in\mathbb{D}^{D}\). Importantly, the radius of each sample
+is learned freely; no normalization forces all utterances onto a common
+hypersphere. Thus, the representation may encode information jointly in its
+angular direction and radial magnitude.
+
+For \(x,y\in\mathbb{D}^{D}\), their geodesic distance is
+\begin{equation}
+    d_{\mathbb{D}}(x,y)
+    =\operatorname{arcosh}\!\left(
+    1+2\frac{\lVert x-y\rVert_2^2}
+    {(1-\lVert x\rVert_2^2)(1-\lVert y\rVert_2^2)}
+    \right).
+    \label{eq:poincare_distance}
+\end{equation}
+Unlike Euclidean distance, \eqref{eq:poincare_distance} expands rapidly near
+the boundary of the ball, providing a geometry in which angular class
+organization and sample-dependent radial variation can coexist.
+
+\subsubsection{Fixed Emotion-Wheel Prototype Bank}
+
+Let \(\pi=(\pi_0,\ldots,\pi_{C-1})\) denote the cyclic ordering of emotion
+classes supplied by the Emotion Wheel. We assign uniformly spaced angles
+according to
+\begin{equation}
+    \theta_{\pi_k}=\frac{2\pi k}{C},
+    \qquad k=0,\ldots,C-1.
+    \label{eq:wheel_angles}
+\end{equation}
+For IEMOCAP, the adopted cyclic order is
+\begin{equation}
+\begin{aligned}
+    \textit{happy}&\rightarrow\textit{excited}\rightarrow
+    \textit{angry}\rightarrow\textit{frustrated}\\
+    &\rightarrow\textit{sad}\rightarrow\textit{neutral}
+    \rightarrow\textit{happy}.
+\end{aligned}
+    \label{eq:iemocap_wheel_order}
+\end{equation}
+Each emotion class \(c\) is represented by a prototype at a common radius
+\(r\in(0,1)\):
+\begin{equation}
+    q_c=
+    \left[r\cos\theta_c,\;r\sin\theta_c,\;
+    \underbrace{0,\ldots,0}_{D-2}\right]^{\top}
+    \in\mathbb{D}^{D}.
+    \label{eq:fixed_wheel_prototype}
+\end{equation}
+The bank \(\mathcal{Q}=\{q_c\}_{c=1}^{C}\) is shared by text, audio, and
+visual modalities. Its coordinates are fixed throughout training; only the SDT
+encoder and the modality projectors are optimized. The shared bank therefore
+provides a stationary semantic reference frame and prevents the three
+modality-specific projectors from defining mutually inconsistent class
+geometries.
+
+Although the prototypes occupy a two-dimensional semantic plane, the sample
+representations \(z_i^{m}\) remain fully \(D\)-dimensional. In particular, the
+coordinates from 3 to \(D\) are not truncated. They contribute to both
+\eqref{eq:poincare_distance} and the pairwise loss introduced below, and hence
+receive gradients during training. The construction should therefore be
+interpreted as a \(D\)-dimensional feature space regularized by a shared
+two-dimensional semantic plane, rather than as a purely two-dimensional
+embedding.
+
+\subsubsection{Wheel Prototype Classification Objective}
+
+The first auxiliary objective imposes an absolute class reference. For a
+sample \(i\), modality \(m\), and class \(c\), we define the prototype score as
+the negative Poincar\'e distance scaled by temperature \(\tau_w>0\):
+\begin{equation}
+    s_{i,c}^{m}
+    =-\frac{d_{\mathbb{D}}(z_i^{m},q_c)}{\tau_w}.
+    \label{eq:prototype_score}
+\end{equation}
+The resulting prototype probability is
+\begin{equation}
+    \rho_{i,c}^{m}
+    =\frac{\exp(s_{i,c}^{m})}
+    {\sum_{k=1}^{C}\exp(s_{i,k}^{m})}.
+    \label{eq:prototype_probability}
+\end{equation}
+We then minimize the mean cross-entropy over all modalities and valid
+utterances:
+\begin{equation}
+    \mathcal{L}_{\mathrm{proto}}
+    =-\frac{1}{|\mathcal{M}|\,|\mathcal{I}|}
+    \sum_{m\in\mathcal{M}}
+    \sum_{i\in\mathcal{I}}
+    \log\rho_{i,y_i}^{m}.
+    \label{eq:prototype_ce}
+\end{equation}
+This objective attracts each projected representation to the prototype of its
+ground-truth emotion and simultaneously separates it from competing class
+prototypes through the softmax normalization. Since the same prototype bank is
+used for all modalities, \(\mathcal{L}_{\mathrm{proto}}\) also serves as a
+weak cross-modal semantic alignment constraint without requiring paired
+feature matching.
+
+\subsubsection{Wheel-Structured CPCC Objective}
+
+The prototype objective in \eqref{eq:prototype_ce} is pointwise: it encourages
+correct classification but does not explicitly require the global arrangement
+of utterances to preserve the relative distances between emotions. We address
+this limitation with a cophenetic correlation coefficient (CPCC) objective.
+
+The normalized shortest circular distance between classes \(a\) and \(b\) is
+defined as
+\begin{equation}
+    \delta_{W}(a,b)
+    =\frac{\arccos\!\left[
+    \cos(\theta_a-\theta_b)\right]}{\pi}
+    \in[0,1].
+    \label{eq:wheel_class_distance}
+\end{equation}
+This target distinguishes adjacent, intermediate, and opposite emotions on the
+Wheel instead of reducing every pair to the binary relation of same versus
+different class.
+
+Let
+\(\mathcal{P}=\{(i,j):i,j\in\mathcal{I},\ i<j\}\)
+be the set of distinct valid utterance pairs in the current mini-batch. For
+each modality, we form a vector of geometric distances and a shared vector of
+Wheel distances:
+\begin{equation}
+    g_{ij}^{m}=d_{\mathbb{D}}(z_i^{m},z_j^{m}),
+    \qquad
+    w_{ij}=\delta_W(y_i,y_j),
+    \qquad(i,j)\in\mathcal{P}.
+    \label{eq:cpcc_pair_distances}
+\end{equation}
+Denoting the corresponding pairwise means by
+\(\bar{g}^{m}\) and \(\bar{w}\), let
+\(\widetilde{g}_{ij}^{m}=g_{ij}^{m}-\bar{g}^{m}\) and
+\(\widetilde{w}_{ij}=w_{ij}-\bar{w}\). Their Pearson correlation is
+\begin{equation}
+    \operatorname{corr}(g^{m},w)
+    =
+    \frac{\sum_{(i,j)\in\mathcal{P}}
+    \widetilde{g}_{ij}^{m}\widetilde{w}_{ij}}
+    {\max\!\left(
+    \lVert\widetilde{g}^{m}\rVert_2
+    \lVert\widetilde{w}\rVert_2,\epsilon\right)}.
+    \label{eq:cpcc_correlation}
+\end{equation}
+The feature-level Wheel CPCC loss is
+\begin{equation}
+    \mathcal{L}_{\mathrm{CPCC}}
+    =\frac{1}{|\mathcal{M}|}
+    \sum_{m\in\mathcal{M}}
+    \left[1-\operatorname{corr}(g^{m},w)\right].
+    \label{eq:wheel_cpcc}
+\end{equation}
+When a mini-batch does not contain sufficient pairwise variation, the
+corresponding term is set to zero for numerical stability. Minimizing
+\eqref{eq:wheel_cpcc} encourages hyperbolic distances between utterances to
+increase monotonically with their semantic separation on the Emotion Wheel.
+Unlike a prototype-structure loss, this objective is applied directly to the
+projected sample representations; the fixed prototypes themselves require no
+additional structural regularization.
+
+\subsubsection{Joint Optimization and Inference}
+
+The complete training objective combines the original SDT loss with the two
+geometry-aware regularizers:
+\begin{equation}
+    \boxed{
+    \mathcal{L}
+    =\mathcal{L}_{\mathrm{SDT}}
+    +\lambda_p\mathcal{L}_{\mathrm{proto}}
+    +\lambda_c\mathcal{L}_{\mathrm{CPCC}}}
+    .
+    \label{eq:complete_objective}
+\end{equation}
+The reference configuration uses
+\(D=16\), \(r=0.75\), \(\tau_w=1\),
+\(\lambda_p=0.1\), \(\lambda_c=0.05\), and
+\(\gamma_1=\gamma_2=\gamma_3=1\). Both Wheel losses are active from the
+first training epoch. Gradients from
+\(\mathcal{L}_{\mathrm{proto}}\) and
+\(\mathcal{L}_{\mathrm{CPCC}}\) update the modality projectors and propagate
+into the SDT encoders; the fixed prototypes \(q_c\) receive no gradients.
+
+The method is operated in an observation-only mode. In particular, the
+historical anchor-bank typicality, consistency score, generic hyperbolic CPCC,
+and prototype-logit fusion mechanisms do not modify either the SDT
+distillation or the multimodal fusion weights. The prediction rule at test time
+therefore remains
+\begin{equation}
+    \hat{y}_i
+    =\underset{c\in\mathcal{Y}}{\arg\max}\;p_i[c],
+    \label{eq:method_inference}
+\end{equation}
+where \(p_i\) is the original fused SDT distribution from
+\eqref{eq:sdt_output}. This design makes the proposed branch an exclusively
+training-time inductive bias: the prototype classifier can improve the
+organization of modality representations without directly overriding the
+stronger contextual multimodal classifier.
+
+\section{Experimental Setup}
+\label{sec:experimental_setup}
+
+\section{Experimental Results}
+\label{sec:experimental_results}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+\end{document}

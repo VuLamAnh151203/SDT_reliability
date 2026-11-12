@@ -308,6 +308,53 @@ class TiCALTests(unittest.TestCase):
         self.assertIsNotNone(gradient)
         self.assertGreater(gradient.abs().sum().item(), 0.0)
 
+    def test_angular_residual_prototypes_are_orthogonal_and_train_end_to_end(self):
+        model = Transformer_Based_Model(
+            **self.config, use_tical=True, tical_mode="observe",
+            hyperbolic_dim=16, use_emotion_wheel=True,
+            wheel_prototype_layout="angular-residual",
+            wheel_prototype_structure_mode="relational-kl",
+            wheel_angular_residual_scale=1.0,
+            wheel_angular_residual_init_std=0.02,
+            wheel_relation_target_temperature=0.5,
+            wheel_relation_prototype_temperature=0.5)
+        subspace = model.tical.current_wheel_angular_subspace()
+        torch.testing.assert_close(
+            subspace.T @ subspace, torch.eye(2), atol=1e-6, rtol=1e-6)
+        residuals = model.tical.current_wheel_angular_residuals()
+        torch.testing.assert_close(
+            residuals @ subspace, torch.zeros(6, 2),
+            atol=1e-6, rtol=1e-6)
+        prototypes = model.tical.current_wheel_prototypes()
+        self.assertEqual(prototypes.shape, (6, 16))
+        self.assertTrue((prototypes.norm(dim=-1) < 1.0).all())
+        self.assertGreater(prototypes[:, 2:].abs().sum().item(), 0.0)
+
+        relation = model.tical.wheel_prototype_structure_loss()
+        anchor = model.tical.wheel_anchor_regularization()
+        self.assertTrue(torch.isfinite(relation))
+        self.assertGreaterEqual(relation.item(), 0.0)
+        self.assertGreater(anchor.item(), 0.0)
+
+        output = model(*self.inputs)
+        labels = torch.tensor([[0, 4, 3], [5, 1, 0]])
+        criterion = SDTCOLDLoss(
+            gamma_1=0, gamma_2=0, gamma_3=0,
+            lambda_co=0, lambda_reg=0, tical_mode="observe",
+            lambda_wheel_proto=1.0, lambda_wheel_structure=0.1,
+            lambda_wheel_anchor=0.1)
+        loss, parts, _ = criterion(output, labels, self.mask.bool())
+        self.assertGreater(parts["wheel_proto"].item(), 0.0)
+        self.assertGreaterEqual(parts["wheel_structure"].item(), 0.0)
+        self.assertGreater(parts["wheel_anchor"].item(), 0.0)
+        loss.backward()
+        self.assertIsNotNone(model.tical.wheel_angular_subspace.grad)
+        self.assertIsNotNone(model.tical.wheel_angular_residual.grad)
+        self.assertGreater(
+            model.tical.wheel_angular_subspace.grad.abs().sum().item(), 0.0)
+        self.assertGreater(
+            model.tical.wheel_angular_residual.grad.abs().sum().item(), 0.0)
+
     def test_shared_private_prototypes_center_residuals_and_backpropagate(self):
         model = Transformer_Based_Model(
             **self.config, use_tical=True, tical_mode="observe",

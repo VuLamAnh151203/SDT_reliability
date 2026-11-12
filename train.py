@@ -102,6 +102,18 @@ def build_parser():
     parser.add_argument(
         "--wheel-private-residual-init-std", type=float, default=0.02,
         help="initial tangent-space std for shared/private modality residuals")
+    parser.add_argument(
+        "--wheel-angular-residual-scale", type=float, default=1.0,
+        help="alpha multiplying the orthogonal class residual")
+    parser.add_argument(
+        "--wheel-angular-residual-init-std", type=float, default=0.02,
+        help="initial std of raw class residuals for angular-residual layout")
+    parser.add_argument(
+        "--wheel-relation-target-temperature", type=float, default=1.0,
+        help="temperature tau_W of the angular target distribution")
+    parser.add_argument(
+        "--wheel-relation-prototype-temperature", type=float, default=1.0,
+        help="temperature tau_P of the learned prototype distribution")
     parser.add_argument("--wheel-geometry", choices=GEOMETRIES, default="poincare",
                         help="controlled wheel geometry ablation")
     parser.add_argument("--wheel-radius-mode", choices=RADIUS_MODES,
@@ -120,6 +132,8 @@ def build_parser():
                         help="keep learned per-class prototype radii near their initial value")
     parser.add_argument("--lambda-wheel-structure", type=float, default=0.0,
                         help="match free-prototype relative distances to the emotion wheel")
+    parser.add_argument("--lambda-wheel-anchor", type=float, default=0.0,
+                        help="L2 penalty on angular-residual r_c^perp")
     parser.add_argument("--lambda-wheel-boundary", type=float, default=0.0,
                         help="keep free prototypes away from the Poincare boundary")
     parser.add_argument("--lambda-wheel-alignment", type=float, default=0.0,
@@ -326,6 +340,14 @@ def make_model_config(args, dataset):
             "wheel_ordinal_margin": args.wheel_ordinal_margin,
             "wheel_private_residual_init_std": (
                 args.wheel_private_residual_init_std),
+            "wheel_angular_residual_scale": (
+                args.wheel_angular_residual_scale),
+            "wheel_angular_residual_init_std": (
+                args.wheel_angular_residual_init_std),
+            "wheel_relation_target_temperature": (
+                args.wheel_relation_target_temperature),
+            "wheel_relation_prototype_temperature": (
+                args.wheel_relation_prototype_temperature),
             "wheel_prototypes_per_class": args.wheel_prototypes_per_class,
             "wheel_multi_prototype_temperature": (
                 args.wheel_multi_prototype_temperature),
@@ -392,6 +414,7 @@ def make_criterion(args, device):
                        args.lambda_wheel_uncertainty,
                        args.lambda_wheel_radius,
                        args.lambda_wheel_structure,
+                       args.lambda_wheel_anchor,
                        args.lambda_wheel_boundary,
                        args.lambda_wheel_alignment,
                        args.lambda_wheel_diversity,
@@ -421,8 +444,15 @@ def _collect_tical_batch(storage, output, labels, prediction, valid):
                 tical["wheel_pseudo_labels"][name].eq(valid_labels).detach().cpu())
             storage["geometry_norm_" + name].append(
                 projected.norm(dim=-1).detach().cpu())
+            angular_subspace = tical.get("wheel_angular_subspace")
+            if angular_subspace is None:
+                off_plane = projected[..., 2:]
+            else:
+                in_plane = ((projected @ angular_subspace)
+                            @ angular_subspace.T)
+                off_plane = projected - in_plane
             storage["off_plane_norm_" + name].append(
-                projected[..., 2:].norm(dim=-1).detach().cpu())
+                off_plane.norm(dim=-1).detach().cpu())
             storage["prototype_distance_" + name].append(
                 correct_distance.detach().cpu())
             storage["prototype_margin_" + name].append(
@@ -1047,6 +1077,7 @@ def main(argv=None):
             or args.lambda_wheel_cpcc < 0
             or args.lambda_wheel_radius < 0
             or args.lambda_wheel_structure < 0
+            or args.lambda_wheel_anchor < 0
             or args.lambda_wheel_boundary < 0
             or args.lambda_wheel_alignment < 0
             or args.lambda_wheel_private_residual < 0
@@ -1070,8 +1101,13 @@ def main(argv=None):
             or args.prototype_evidence_entropy_strength < 0):
         raise ValueError("invalid nonnegative TiCAL setting")
     if (args.wheel_ordinal_margin < 0
-            or args.wheel_private_residual_init_std < 0):
-        raise ValueError("ordinal margin/private residual init must be nonnegative")
+            or args.wheel_private_residual_init_std < 0
+            or args.wheel_angular_residual_scale < 0
+            or args.wheel_angular_residual_init_std < 0):
+        raise ValueError("prototype margins/scales/init std must be nonnegative")
+    if (args.wheel_relation_target_temperature <= 0
+            or args.wheel_relation_prototype_temperature <= 0):
+        raise ValueError("relational temperatures must be positive")
     if args.data_prototype_temperature <= 0:
         raise ValueError("--data-prototype-temperature must be positive")
     if not 0 < args.data_prototype_initial_radius < 1 - args.hyp_eps:
@@ -1109,6 +1145,7 @@ def main(argv=None):
             args.lambda_wheel_proto > 0 or args.lambda_wheel_cpcc > 0
             or args.lambda_wheel_radius > 0
             or args.lambda_wheel_structure > 0
+            or args.lambda_wheel_anchor > 0
             or args.lambda_wheel_boundary > 0
             or args.lambda_wheel_alignment > 0
             or args.lambda_wheel_private_residual > 0
@@ -1213,7 +1250,8 @@ def main(argv=None):
             raise ValueError(
                 "learnable prototype radii require --wheel-geometry poincare")
         if args.wheel_prototype_layout in (
-                "free", "modality-specific", "shared-private"):
+                "free", "modality-specific", "shared-private",
+                "angular-residual"):
             if args.wheel_geometry != "poincare":
                 raise ValueError(
                     "free prototype layouts require --wheel-geometry poincare")
@@ -1223,7 +1261,8 @@ def main(argv=None):
         elif (args.lambda_wheel_structure != 0
               or args.lambda_wheel_boundary != 0
               or args.lambda_wheel_alignment != 0
-              or args.lambda_wheel_private_residual != 0):
+              or args.lambda_wheel_private_residual != 0
+              or args.lambda_wheel_anchor != 0):
             raise ValueError(
                 "structure/boundary/alignment/private losses require a free prototype layout")
         if (args.wheel_prototype_layout != "modality-specific"
@@ -1234,6 +1273,14 @@ def main(argv=None):
                 and args.lambda_wheel_private_residual != 0):
             raise ValueError(
                 "--lambda-wheel-private-residual requires shared-private prototypes")
+        if (args.wheel_prototype_layout != "angular-residual"
+                and args.lambda_wheel_anchor != 0):
+            raise ValueError(
+                "--lambda-wheel-anchor requires angular-residual prototypes")
+        if (args.wheel_prototype_structure_mode == "relational-kl"
+                and args.wheel_prototype_layout != "angular-residual"):
+            raise ValueError(
+                "relational-kl structure requires angular-residual prototypes")
         if (args.wheel_prototypes_per_class > 1
                 and args.wheel_prototype_layout != "modality-specific"):
             raise ValueError(
@@ -1298,6 +1345,10 @@ def main(argv=None):
                       "wheel_prototype_structure_mode",
                       "wheel_ordinal_margin",
                       "wheel_private_residual_init_std",
+                      "wheel_angular_residual_scale",
+                      "wheel_angular_residual_init_std",
+                      "wheel_relation_target_temperature",
+                      "wheel_relation_prototype_temperature",
                      "wheel_prototypes_per_class",
                      "wheel_multi_prototype_temperature",
                      "wheel_multi_prototype_init_std",
@@ -1353,6 +1404,7 @@ def main(argv=None):
                      "wheel_anchor_mix", "lambda_wheel_proto",
                      "lambda_wheel_cpcc", "lambda_wheel_radius",
                       "lambda_wheel_structure", "lambda_wheel_boundary",
+                      "lambda_wheel_anchor",
                       "lambda_wheel_alignment",
                       "lambda_wheel_private_residual",
                      "lambda_data_prototype",
@@ -1467,6 +1519,8 @@ def main(argv=None):
             method_tag += "_modalityproto"
         elif prototype_layout == "shared-private":
             method_tag += "_sharedprivateproto"
+        elif prototype_layout == "angular-residual":
+            method_tag += "_angularresidual"
         if model_config.get("wheel_free_prototype_init", "wheel") == "random":
             method_tag += "_randominit"
         if (args.lambda_wheel_structure > 0
@@ -1474,6 +1528,11 @@ def main(argv=None):
                     "wheel_prototype_structure_mode", "pairwise-mse")
                 == "ordinal"):
             method_tag += "_ordinal"
+        if (args.lambda_wheel_structure > 0
+                and model_config.get(
+                    "wheel_prototype_structure_mode", "pairwise-mse")
+                == "relational-kl"):
+            method_tag += "_relkl"
         if prototype_radius_mode != "fixed-shared":
             method_tag += "_proto_{}".format(
                 prototype_radius_mode.replace("-", "_"))
@@ -1595,8 +1654,8 @@ def main(argv=None):
         if args.use_tical:
             print("Epoch {:03d} train loss={:.4f} F1={:.2f}; {} F1={:.2f}; "
                   "KL(original/CA)={:.4f}/{:.4f} hyp={:.4f}; "
-                  "wheel(proto/cpcc/radius/structure/align/private/boundary/div/use/progress)="
-                  "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.2f}; "
+                  "wheel(proto/cpcc/radius/structure/anchor/align/private/boundary/div/use/progress)="
+                  "{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.2f}; "
                   "data_proto(ce/cpcc/progress)={:.4f}/{:.4f}/{:.2f}; "
                   "unc={:.4f} progress={:.2f} weights(T/A/V)={:.3f}/{:.3f}/{:.3f}; "
                   "protofusion(progress/max/alpha/T/A/V)={:.2f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}/{:.3f}; "
@@ -1608,6 +1667,7 @@ def main(argv=None):
                 train_metrics["weighted_wheel_cpcc"],
                 train_metrics.get("weighted_wheel_radius", 0.0),
                 train_metrics.get("weighted_wheel_structure", 0.0),
+                train_metrics.get("weighted_wheel_anchor", 0.0),
                 train_metrics.get("weighted_wheel_alignment", 0.0),
                 train_metrics.get("weighted_wheel_private_residual", 0.0),
                 train_metrics.get("weighted_wheel_boundary", 0.0),
@@ -1671,6 +1731,8 @@ def main(argv=None):
     learned_modality_radii = None
     learned_modality_prototypes = None
     learned_private_residuals = None
+    learned_angular_subspace = None
+    learned_angular_residuals = None
     learned_data_prototypes = None
     data_prototype_counts = None
     if model_config.get("use_emotion_wheel"):
@@ -1697,6 +1759,13 @@ def main(argv=None):
                 name: private_residuals[name].detach().cpu().tolist()
                 for name in MODALITIES
             }
+        if model_config.get("wheel_prototype_layout") == "angular-residual":
+            learned_angular_subspace = (
+                model.tical.current_wheel_angular_subspace()
+                .detach().cpu().tolist())
+            learned_angular_residuals = (
+                model.tical.current_wheel_angular_residuals()
+                .detach().cpu().tolist())
         if model_config.get("use_data_prototypes", False):
             if (model_config.get("data_prototype_layout", "shared")
                     == "modality-specific"):
@@ -1748,6 +1817,8 @@ def main(argv=None):
         "learned_modality_prototype_radii": learned_modality_radii,
         "learned_modality_prototypes": learned_modality_prototypes,
         "learned_private_tangent_residuals": learned_private_residuals,
+        "learned_angular_subspace": learned_angular_subspace,
+        "learned_orthogonal_class_residuals": learned_angular_residuals,
         "use_data_prototypes": model_config.get(
             "use_data_prototypes", False),
         "data_prototype_layout": model_config.get(

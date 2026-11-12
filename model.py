@@ -208,7 +208,11 @@ class Transformer_Based_Model(SDTBackbone):
                  replace_fixed_wheel_prototypes=False,
                  data_prototype_warmup_epochs=5,
                  data_prototype_ramp_epochs=10,
-                 data_prototype_temperature=1.0):
+                 data_prototype_temperature=1.0,
+                 wheel_angular_residual_scale=1.0,
+                 wheel_angular_residual_init_std=0.02,
+                 wheel_relation_target_temperature=1.0,
+                 wheel_relation_prototype_temperature=1.0):
         if fusion_variant not in FUSION_VARIANTS:
             raise ValueError("unknown fusion_variant: {}".format(fusion_variant))
         if fusion_feature_source not in FUSION_FEATURE_SOURCES:
@@ -369,7 +373,11 @@ class Transformer_Based_Model(SDTBackbone):
                  replace_fixed_wheel_prototypes,
                  data_prototype_warmup_epochs,
                  data_prototype_ramp_epochs,
-                 data_prototype_temperature)
+                 data_prototype_temperature,
+                 wheel_angular_residual_scale,
+                 wheel_angular_residual_init_std,
+                 wheel_relation_target_temperature,
+                 wheel_relation_prototype_temperature)
         if wheel_uncertainty_mode != "none":
             self.wheel_uncertainty_heads = nn.ModuleDict({
                 name: WheelUncertaintyHead(

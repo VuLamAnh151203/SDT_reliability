@@ -1,0 +1,382 @@
+\documentclass[letterpaper,journal]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{amsfonts}
+
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+\begin{document}
+
+\title{Learnable Full-Dimensional Emotion Prototypes with Angular Relational Learning for Multimodal Emotion Recognition in Conversation}
+\author{}
+\maketitle
+
+\begin{abstract}
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+\section{Related Work}
+\label{sec:related_work}
+
+\section{Problem Definition and Proposed Method}
+\label{sec:problem_and_method}
+
+\subsection{Problem Definition}
+\label{subsec:problem_definition}
+
+\subsubsection{Multimodal Emotion Recognition in Conversation}
+
+Let a conversational dataset be denoted by
+\(\mathcal{D}=\{\mathcal{C}_{n}\}_{n=1}^{N}\), where conversation
+\(\mathcal{C}_{n}=\{u_{n,t}\}_{t=1}^{L_n}\) contains an ordered sequence of
+utterances. Each utterance is associated with aligned textual, acoustic, and
+visual observations,
+\begin{equation}
+    x_{n,t}=\left(x_{n,t}^{T},x_{n,t}^{A},x_{n,t}^{V}\right),
+    \qquad
+    y_{n,t}\in\mathcal{Y}=\{1,\ldots,C\},
+    \label{eq:rgrpl_problem_input}
+\end{equation}
+where \(y_{n,t}\) is its categorical emotion label. The modality set is
+\(\mathcal{M}=\{T,A,V\}\). The objective is to learn a contextual classifier
+\(f_{\Theta}\) that predicts the emotion of every valid utterance by exploiting
+both conversational context and complementary multimodal evidence:
+\begin{equation}
+    \hat y_{n,t}
+    =\underset{c\in\mathcal{Y}}{\arg\max}\;
+    p_{\Theta}\!\left(
+    c\mid x_{n,1:L_n}^{T},x_{n,1:L_n}^{A},x_{n,1:L_n}^{V}\right).
+    \label{eq:rgrpl_problem_prediction}
+\end{equation}
+Padding utterances introduced by mini-batching are excluded from every
+utterance-level loss using a binary validity mask.
+
+\subsubsection{SDT Backbone and Learning Objective}
+
+For each valid utterance \(i\), the SDT backbone produces a pure self-modal
+representation \(h_i^m\in\mathbb{R}^{d_h}\) and an
+interaction-enhanced representation
+\(\widetilde h_i^m\in\mathbb{R}^{d_h}\) for every
+\(m\in\mathcal{M}\). A feature-wise SDT gate fuses the enhanced
+representations:
+\begin{align}
+    a_i^m &= G\widetilde h_i^m,
+    \label{eq:rgrpl_sdt_gate_score}\\
+    [\beta_i^m]_k
+    &=\frac{\exp([a_i^m]_k)}
+    {\sum_{q\in\mathcal{M}}\exp([a_i^q]_k)},
+    \label{eq:rgrpl_sdt_gate}\\
+    \widetilde h_i
+    &=\sum_{m\in\mathcal{M}}\beta_i^m\odot\widetilde h_i^m,
+    \label{eq:rgrpl_sdt_fusion}\\
+    p_i^{\mathrm{SDT}}
+    &=\operatorname{softmax}(W_o\widetilde h_i+b_o),
+    \label{eq:rgrpl_sdt_output}
+\end{align}
+where \(k\in\{1,\ldots,d_h\}\) indexes feature dimensions and \(\odot\)
+denotes element-wise multiplication.
+
+The SDT training objective combines the class-weighted loss of the fused
+classifier, three unimodal student losses, and self-distillation from the
+fused prediction to the modality students:
+\begin{equation}
+    \mathcal{L}_{\mathrm{SDT}}
+    =\gamma_1\mathcal{L}_{\mathrm{task}}
+    +\gamma_2\mathcal{L}_{\mathrm{student}}
+    +\gamma_3\mathcal{L}_{\mathrm{KD}}.
+    \label{eq:rgrpl_sdt_objective}
+\end{equation}
+For a set \(\mathcal{I}\) of valid utterances in a mini-batch and class
+weights \(\omega_c\), the first two terms are
+\begin{align}
+    \mathcal{L}_{\mathrm{task}}
+    &=-\frac{1}{Z_{\mathcal{I}}}
+    \sum_{i\in\mathcal{I}}\omega_{y_i}
+    \log p_i^{\mathrm{SDT}}[y_i],
+    \label{eq:rgrpl_task_loss}\\
+    \mathcal{L}_{\mathrm{student}}
+    &=-\sum_{m\in\mathcal{M}}\frac{1}{Z_{\mathcal{I}}}
+    \sum_{i\in\mathcal{I}}\omega_{y_i}\log p_i^m[y_i],
+    \label{eq:rgrpl_student_loss}
+\end{align}
+where
+\(Z_{\mathcal{I}}=\sum_{i\in\mathcal{I}}\omega_{y_i}\).
+The distillation term is
+\begin{equation}
+    \mathcal{L}_{\mathrm{KD}}
+    =\frac{1}{|\mathcal{I}|}
+    \sum_{m\in\mathcal{M}}\sum_{i\in\mathcal{I}}
+    D_{\mathrm{KL}}\!\left(
+    p_i^{\mathrm{SDT},(\tau_s)}
+    \,\Vert\,p_i^{m,(\tau_s)}\right),
+    \label{eq:rgrpl_kd_loss}
+\end{equation}
+where \(\tau_s\) is the distillation temperature. The proposed method
+preserves the SDT encoder, enhanced-feature fusion, self-distillation, and
+final classifier, while introducing prototype-based geometric supervision
+over the pure modality representations.
+
+\subsection{Learnable Full-Dimensional Prototype Learning}
+\label{subsec:rgrpl}
+
+\subsubsection{Overview}
+
+The proposed framework augments SDT with a shared bank of learnable emotion
+prototypes in a complete \(D\)-dimensional space. Three modality-specific
+projectors map pure text, audio, and visual features into a Poincar\'e ball,
+where \(D=16\). Each class prototype combines an angular Emotion-Wheel
+reference with a learnable residual orthogonal to the reference plane.
+Prototype cross-entropy supplies discriminative supervision. Anchor
+regularization limits prototype drift, while an angular relational loss
+transfers the neighborhood structure of the Emotion Wheel to the learned
+hyperbolic space.
+
+The prototype branch provides an auxiliary geometric learning signal, while
+the SDT classifier remains responsible for the final categorical prediction.
+
+\subsubsection{Poincar\'e Projection of Modality Features}
+
+We employ the curvature-\(-1\) Poincar\'e ball
+\begin{equation}
+    \mathbb{D}^{D}
+    =\{z\in\mathbb{R}^{D}:\lVert z\rVert_2<1\}.
+    \label{eq:rgrpl_poincare_ball}
+\end{equation}
+For modality \(m\), an affine map projects a pure feature into the tangent
+space at the origin:
+\begin{equation}
+    v_i^m=W_m h_i^m+b_m,
+    \qquad v_i^m\in T_0\mathbb{D}^{D}\simeq\mathbb{R}^{D}.
+    \label{eq:rgrpl_feature_tangent}
+\end{equation}
+The exponential map produces the hyperbolic utterance representation
+\begin{equation}
+    z_i^m=\operatorname{Exp}_0(v_i^m)
+    =\tanh(\lVert v_i^m\rVert_2)
+    \frac{v_i^m}{\lVert v_i^m\rVert_2}
+    \in\mathbb{D}^{D},
+    \label{eq:rgrpl_feature_expmap}
+\end{equation}
+with the value at \(v_i^m=0\) defined by continuity. Sample radii are not
+fixed, allowing the model to use both angular and radial information. The
+geodesic distance between \(x,y\in\mathbb{D}^{D}\) is
+\begin{equation}
+    d_{\mathbb{D}}(x,y)
+    =\operatorname{arcosh}\!\left(
+    1+2\frac{\lVert x-y\rVert_2^2}
+    {(1-\lVert x\rVert_2^2)(1-\lVert y\rVert_2^2)}
+    \right).
+    \label{eq:rgrpl_poincare_distance}
+\end{equation}
+
+\subsubsection{Angular Emotion References}
+
+Each emotion class \(c\) is assigned an angular position \(\theta_c\) on the
+Emotion Wheel. Its two-dimensional reference is
+\begin{equation}
+    q_c=r_0
+    \begin{bmatrix}
+        \cos\theta_c & \sin\theta_c
+    \end{bmatrix}^{\top}
+    \in\mathbb{R}^{2},
+    \label{eq:rgrpl_angular_reference}
+\end{equation}
+where \(r_0>0\) determines the reference scale in the tangent space. Rather
+than padding \(q_c\) with zeros, we introduce a learnable orthonormal map
+\begin{equation}
+    U\in\mathbb{R}^{D\times 2},
+    \qquad U^\top U=I_2,
+    \label{eq:rgrpl_psychological_subspace}
+\end{equation}
+which embeds the angular reference into a two-dimensional subspace of
+\(T_0\mathbb{D}^{D}\). The matrix \(U\) is learned jointly with the network
+subject to the orthonormality constraint. Consequently, the reference plane
+can orient itself according to the multimodal representations, while the
+angular inner products and distances among \(\{q_c\}_{c=1}^{C}\) are
+preserved by the isometry. The embedded tangent-space anchor is
+\begin{equation}
+    \bar u_c=Uq_c.
+    \label{eq:rgrpl_tangent_anchor}
+\end{equation}
+
+\subsubsection{Learnable Full-Dimensional Emotion Prototypes}
+
+For each class, we introduce a learnable vector
+\(r_c\in\mathbb{R}^{D}\). Its component within the angular reference subspace
+is removed:
+\begin{equation}
+    r_c^\perp=(I_D-UU^\top)r_c.
+    \label{eq:rgrpl_orthogonal_residual}
+\end{equation}
+The resulting prototype is obtained by mapping the combined tangent vector to
+the Poincar\'e ball:
+\begin{equation}
+    \boxed{
+    p_c=\operatorname{Exp}_0\!\left(Uq_c+\alpha r_c^\perp\right)}
+    \in\mathbb{D}^{D}.
+    \label{eq:rgrpl_learned_prototype}
+\end{equation}
+where \(\alpha\geq 0\) controls the degree of data-driven adaptation. The
+term \(\bar u_c\) preserves the angular Emotion-Wheel reference, while
+\(r_c^\perp\) provides \(D-2\) directions for learning discriminative class
+structure that is not specified by the two-dimensional angular prior. A single
+prototype bank \(\mathcal{P}=\{p_c\}_{c=1}^{C}\) is shared by all three
+modalities, preventing independently drifting modality-specific class
+geometries.
+
+The construction separates two complementary roles. Learning \(U\) changes
+the orientation of the angular reference plane but does not turn its
+two-dimensional structure into \(D\) independent directions. The residuals
+\(\{r_c^\perp\}\) provide the additional degrees of freedom that allow the
+class prototypes to occupy the full ambient space. The orthogonality
+constraint prevents those residuals from overwriting the angular coordinates
+within \(\operatorname{span}(U)\).
+
+\subsubsection{Anchor-Preserving Regularization}
+
+Unconstrained residuals could dominate the angular component and cause
+the prototypes to lose their intended interpretation. We therefore penalize
+their squared norm:
+\begin{equation}
+    \mathcal{L}_{\mathrm{anchor}}
+    =\frac{1}{C}\sum_{c=1}^{C}
+    \lVert r_c^\perp\rVert_2^2.
+    \label{eq:rgrpl_anchor_loss}
+\end{equation}
+This term regulates, rather than eliminates, adaptation. An excessively large
+weight would shrink every residual toward zero and collapse the prototype
+bank back to an embedded two-dimensional angular prior.
+
+\subsubsection{Prototype Classification Objective}
+
+For utterance \(i\), modality \(m\), and class \(c\), the prototype score is
+the negative Poincar\'e distance:
+\begin{equation}
+    s_{i,c}^{m}
+    =-\frac{d_{\mathbb{D}}(z_i^m,p_c)}{\tau_p},
+    \label{eq:rgrpl_prototype_score}
+\end{equation}
+where \(\tau_p>0\) is the prototype temperature. Defining
+\begin{equation}
+    \rho_{i,c}^{m}
+    =\frac{\exp(s_{i,c}^{m})}
+    {\sum_{k=1}^{C}\exp(s_{i,k}^{m})},
+    \label{eq:rgrpl_prototype_probability}
+\end{equation}
+the prototype cross-entropy is
+\begin{equation}
+    \mathcal{L}_{\mathrm{ProtoCE}}
+    =-\frac{1}{|\mathcal{M}|\,|\mathcal{I}|}
+    \sum_{m\in\mathcal{M}}\sum_{i\in\mathcal{I}}
+    \log\rho_{i,y_i}^{m}.
+    \label{eq:rgrpl_prototype_ce}
+\end{equation}
+This objective jointly updates the modality projectors, the relevant SDT
+encoder features, and the learnable prototype residuals. Sharing the
+prototypes across modalities also supplies a common class-level semantic
+reference without requiring direct equality between heterogeneous modality
+features.
+
+\subsubsection{Angular Relational Learning in the Full-Dimensional Space}
+
+Prototype classification alone does not specify how emotion classes should be
+organized relative to one another. We therefore transfer the angular geometry
+used by CPCC on the Emotion Wheel to the learned prototype bank.
+For classes \(i\neq j\), the normalized shortest angular distance is
+\begin{equation}
+    D_{ij}^{W}
+    =\frac{\arccos\!\left(\cos(\theta_i-\theta_j)\right)}{\pi},
+    \qquad D_{ij}^{W}\in[0,1].
+    \label{eq:rgrpl_wheel_distance}
+\end{equation}
+For every anchor class \(i\), these distances define a target relational
+distribution over all other classes:
+\begin{equation}
+    Q_{ij}
+    =\frac{\exp(-D_{ij}^{W}/\tau_W)}
+    {\sum_{k\neq i}\exp(-D_{ik}^{W}/\tau_W)},
+    \qquad j\neq i,
+    \label{eq:rgrpl_wheel_neighbors}
+\end{equation}
+where \(\tau_W>0\) controls the concentration of the angular neighborhood.
+
+The corresponding relations in the learned space are derived from the
+Poincar\'e distances between full-dimensional prototypes:
+\begin{align}
+    D_{ij}^{P}
+    &=d_{\mathbb{D}}(p_i,p_j),
+    \label{eq:rgrpl_prototype_distance}\\
+    P_{ij}
+    &=\frac{\exp(-D_{ij}^{P}/\tau_P)}
+    {\sum_{k\neq i}\exp(-D_{ik}^{P}/\tau_P)},
+    \qquad j\neq i,
+    \label{eq:rgrpl_prototype_neighbors}
+\end{align}
+where \(\tau_P>0\) controls the concentration of the learned prototype
+neighborhood. Self-relations are masked in both \(Q\) and \(P\). Their
+discrepancy is minimized through
+\begin{equation}
+    \boxed{
+    \mathcal{L}_{\mathrm{relation}}
+    =\frac{1}{C}\sum_{i=1}^{C}
+    D_{\mathrm{KL}}\!\left(
+    Q_{i,\neg i}\,\Vert\,P_{i,\neg i}\right)}.
+    \label{eq:rgrpl_relation_loss}
+\end{equation}
+This objective preserves relative angular neighborhoods. It neither confines
+the prototypes to a two-dimensional circle nor forces hyperbolic distances to
+equal angular distances. Its influence is controlled by \(\lambda_r\); an
+excessive weight can keep the learned geometry unnecessarily close to the
+original wheel and leave the additional residual directions underused.
+
+\subsubsection{Overall Learning Objective}
+
+The complete learning objective is
+\begin{equation}
+    \boxed{\begin{aligned}
+    \mathcal{L}_{\mathrm{total}}
+    ={}&\mathcal{L}_{\mathrm{SDT}}
+    +\lambda_p\mathcal{L}_{\mathrm{ProtoCE}}\\
+    &+\lambda_r\mathcal{L}_{\mathrm{relation}}
+    +\lambda_a\mathcal{L}_{\mathrm{anchor}}
+    \end{aligned}}.
+    \label{eq:rgrpl_objective}
+\end{equation}
+Here, \(\lambda_p\), \(\lambda_r\), and \(\lambda_a\) balance class-level
+prototype discrimination, angular relational preservation, and
+anchor-preserving regularization, respectively. The resulting objective
+jointly shapes modality representations and class prototypes while retaining
+the SDT categorical decision function
+\begin{equation}
+    \hat y_i
+    =\underset{c\in\mathcal{Y}}{\arg\max}\;
+    p_i^{\mathrm{SDT}}[c],
+    \label{eq:rgrpl_prediction}
+\end{equation}
+for the final emotion prediction.
+
+\subsubsection{Geometric Interpretation}
+
+The angular prior remains two-dimensional even though its embedding matrix
+\(U\) is learnable. The \(D\)-dimensional Poincar\'e ball is the learned
+representation space, not a collection of \(D\) independent angular axes.
+The plane \(\operatorname{span}(U)\) carries the original wheel references,
+whereas its orthogonal complement supplies class-specific directions through
+\(r_c^\perp\). Consequently, the high-dimensional capacity arises from the
+learnable residuals rather than from rotating the reference plane alone. The
+angular relational objective constrains only relative neighborhoods, leaving
+the residual space available to encode discriminative structure supported by
+the multimodal data.
+
+\section{Experimental Setup}
+\label{sec:experimental_setup}
+
+\section{Experimental Results}
+\label{sec:experimental_results}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+\end{document}

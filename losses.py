@@ -150,6 +150,7 @@ class SDTCOLDLoss(nn.Module):
                  lambda_wheel_uncertainty=0.0,
                  lambda_wheel_radius=0.0,
                  lambda_wheel_structure=0.0,
+                 lambda_wheel_anchor=0.0,
                  lambda_wheel_boundary=0.0,
                  lambda_wheel_alignment=0.0,
                  lambda_wheel_diversity=0.0,
@@ -164,6 +165,7 @@ class SDTCOLDLoss(nn.Module):
                    lambda_reliability, lambda_hyp, lambda_wheel_proto,
                    lambda_wheel_cpcc, lambda_wheel_uncertainty,
                    lambda_wheel_radius, lambda_wheel_structure,
+                   lambda_wheel_anchor,
                    lambda_wheel_boundary, lambda_wheel_alignment,
                    lambda_wheel_diversity, lambda_wheel_utilization,
                    lambda_prototype_selector,
@@ -182,6 +184,7 @@ class SDTCOLDLoss(nn.Module):
         self.lambda_wheel_cpcc = lambda_wheel_cpcc
         self.lambda_wheel_radius = lambda_wheel_radius
         self.lambda_wheel_structure = lambda_wheel_structure
+        self.lambda_wheel_anchor = lambda_wheel_anchor
         self.lambda_wheel_boundary = lambda_wheel_boundary
         self.lambda_wheel_alignment = lambda_wheel_alignment
         self.lambda_wheel_diversity = lambda_wheel_diversity
@@ -335,6 +338,7 @@ class SDTCOLDLoss(nn.Module):
         weighted_wheel_radius = (
             self.lambda_wheel_radius * prototype_loss_progress * wheel_radius)
         wheel_structure = zero
+        wheel_anchor = zero
         wheel_alignment = zero
         wheel_boundary = zero
         wheel_diversity = zero
@@ -343,6 +347,8 @@ class SDTCOLDLoss(nn.Module):
         if wheel_ready:
             wheel_structure = tical_output.get(
                 "wheel_prototype_structure", zero)
+            wheel_anchor = tical_output.get(
+                "wheel_anchor_regularization", zero)
             wheel_alignment = tical_output.get(
                 "wheel_prototype_alignment", zero)
             wheel_boundary = tical_output.get(
@@ -378,6 +384,9 @@ class SDTCOLDLoss(nn.Module):
         weighted_wheel_structure = (
             self.lambda_wheel_structure * prototype_loss_progress
             * wheel_structure)
+        weighted_wheel_anchor = (
+            self.lambda_wheel_anchor * prototype_loss_progress
+            * wheel_anchor)
         weighted_wheel_boundary = (
             self.lambda_wheel_boundary * prototype_loss_progress
             * wheel_boundary)
@@ -456,7 +465,8 @@ class SDTCOLDLoss(nn.Module):
                  + weighted_data_prototype
                  + weighted_data_prototype_cpcc
                  + weighted_wheel_radius
-                 + weighted_wheel_structure + weighted_wheel_alignment
+                 + weighted_wheel_structure + weighted_wheel_anchor
+                 + weighted_wheel_alignment
                  + weighted_wheel_boundary
                  + weighted_wheel_diversity
                  + weighted_wheel_utilization
@@ -486,6 +496,8 @@ class SDTCOLDLoss(nn.Module):
                  "weighted_wheel_radius": weighted_wheel_radius,
                   "wheel_structure": wheel_structure,
                   "weighted_wheel_structure": weighted_wheel_structure,
+                  "wheel_anchor": wheel_anchor,
+                  "weighted_wheel_anchor": weighted_wheel_anchor,
                   "wheel_alignment": wheel_alignment,
                   "weighted_wheel_alignment": weighted_wheel_alignment,
                   "wheel_boundary": wheel_boundary,
